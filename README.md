@@ -320,6 +320,27 @@ src/
     └── key_package.rs    # key package generation
 ```
 
+## Sigil vs. Davey
+
+[Davey](https://github.com/Snazzah/davey) is another excellent pure-Rust implementation of the DAVE protocol by Discord community developers. It powers the official `@discordjs/voice` package. 
+
+Here's a quick comparison to help you choose:
+
+| Feature | Sigil | Davey |
+|---------|-------|-------|
+| **Primary Use Case** | Direct Rust bot integration (e.g. Songbird/Serenity) | Multi-language SDK (Rust core + Node.js/Python via NAPI/PyO3) |
+| **Architecture** | Highly modular (separate `crypto`, `mls`, `frame`, `gateway` layers) | Monolithic `session.rs` handling all logic |
+| **API Surface** | High-level `SigilSession` facade | Granular, configurable `DaveSession` |
+| **Integrations** | Built-in `voice-gateway` feature for Songbird/Serenity | Official Node.js/Python bindings |
+| **Gateway Opcodes**| Includes raw payload structs and dispatcher for opcodes 21–31 | Focuses entirely on crypto/MLS logic |
+| **AES-GCM Base** | Uses the standard high-level `aes-gcm` crate | Custom raw implementation using `aes` + `ghash` for low-level exactness |
+| **Maturity** | Early-stage, structured codebase | Battle-tested, multi-contributor, adopted by `discord.js` |
+
+**Which one should I use?**
+Use **Sigil** if you are building a Rust-native Discord bot (using Serenity/Songbird/Twilight) and want a drop-in component that manages both the gateway E2EE lifecycle and the encryption in a clean, segregated way.
+
+Use **Davey** if you need Node.js/Python bindings, require strict DAVE protocol edge-cases (like privacy validation codes, passthrough modes, re-init support), or prefer a battle-tested library that mirrors Discord's JS architecture.
+
 ## Contributing
 
 PRs welcome. If you break `cargo clippy` or `cargo fmt --check`, your PR gets sent to the shadow realm.
