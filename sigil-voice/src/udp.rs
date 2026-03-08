@@ -58,44 +58,61 @@ pub fn build_rtp_header(seq: u16, timestamp: u32, ssrc: u32) -> [u8; 12] {
 }
 
 use aes_gcm::{
+    aead::{Aead, KeyInit, Payload},
     Aes256Gcm, Key, Nonce,
-    aead::{Aead, KeyInit},
 };
 
 /// Encrypts an RTP block using `aead_aes256_gcm_rtpsize` mode.
-/// - Nonce: The 12-byte RTP header.
-/// - Plaintext: The inner payload (which in DAVE is the DAVE ciphertext).
-/// - Output: [12-byte RTP Header] + [Encrypted Payload + 16-byte MAC Tag]
+/// - Nonce: A 32-bit incrementing integer (padded to 96 bits with leading zeroes).
+/// - AAD: The 12-byte RTP header.
+/// - Output: [12-byte RTP Header] + [Encrypted Payload + 16-byte MAC Tag] + [4-byte Nonce]
 pub fn transport_encrypt_rtpsize(
     key: &[u8],
     rtp_header: &[u8; 12],
     payload: &[u8],
+    nonce_counter: u32,
 ) -> Result<Vec<u8>, aes_gcm::Error> {
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
-    let nonce = Nonce::from_slice(rtp_header);
+    
+    // Nonce is 4 bytes padded with 8 leading zero bytes
+    let mut nonce_bytes = [0u8; 12];
+    nonce_bytes[8..12].copy_from_slice(&nonce_counter.to_be_bytes());
+    let nonce = Nonce::from_slice(&nonce_bytes);
 
-    // In rtpsize mode, the header is NOT AAD, it's just the nonce.
-    // The payload is encrypted outright.
-    let ciphertext = cipher.encrypt(nonce, payload)?;
+    let aead_payload = Payload {
+        msg: payload,
+        aad: rtp_header,
+    };
 
-    let mut out = Vec::with_capacity(12 + ciphertext.len());
+    let ciphertext = cipher.encrypt(nonce, aead_payload)?;
+
+    let mut out = Vec::with_capacity(12 + ciphertext.len() + 4);
     out.extend_from_slice(rtp_header);
     out.extend_from_slice(&ciphertext);
+    out.extend_from_slice(&nonce_counter.to_be_bytes());
     Ok(out)
 }
 
 /// Decrypts an RTP block using `aead_aes256_gcm_rtpsize` mode.
-/// Returns the decrypted inner payload.
 pub fn transport_decrypt_rtpsize(key: &[u8], packet: &[u8]) -> Result<Vec<u8>, aes_gcm::Error> {
-    if packet.len() < 12 + 16 {
-        return Err(aes_gcm::Error); // Too short to contain Header + Tag
+    if packet.len() < 12 + 16 + 4 {
+        return Err(aes_gcm::Error); // Too short
     }
 
     let rtp_header = &packet[0..12];
-    let encrypted_payload = &packet[12..];
+    let nonce_bytes_suffix = &packet[packet.len() - 4..];
+    let encrypted_payload = &packet[12..packet.len() - 4];
 
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
-    let nonce = Nonce::from_slice(rtp_header);
+    
+    let mut nonce_bytes = [0u8; 12];
+    nonce_bytes[8..12].copy_from_slice(nonce_bytes_suffix);
+    let nonce = Nonce::from_slice(&nonce_bytes);
 
-    cipher.decrypt(nonce, encrypted_payload)
+    let aead_payload = Payload {
+        msg: encrypted_payload,
+        aad: rtp_header,
+    };
+
+    cipher.decrypt(nonce, aead_payload)
 }

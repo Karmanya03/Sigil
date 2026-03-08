@@ -9,6 +9,15 @@ pub struct VoicePacket {
     pub s: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub t: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seq_ack: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Speaking {
+    pub speaking: u8,
+    pub delay: u32,
+    pub ssrc: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -18,6 +27,13 @@ pub struct Identify {
     pub session_id: String,
     pub token: String,
     pub max_dave_protocol_version: Option<u8>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Resume {
+    pub server_id: String,
+    pub session_id: String,
+    pub token: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -52,6 +68,11 @@ pub struct Hello {
     pub heartbeat_interval: f64,
 }
 
+pub enum WsMessage {
+    Text(VoicePacket),
+    Binary(Vec<u8>),
+}
+
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
@@ -71,22 +92,25 @@ impl VoiceGatewayClient {
         Ok(Self { ws })
     }
 
-    /// Read the next parsed JSON VoicePacket from the WebSocket
+    /// Read the next parsed JSON VoicePacket or Binary payload from the WebSocket
     pub async fn recv_packet(
         &mut self,
-    ) -> Result<Option<VoicePacket>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Option<WsMessage>, Box<dyn std::error::Error + Send + Sync>> {
         while let Some(msg) = self.ws.next().await {
             let msg = msg?;
             match msg {
                 Message::Text(text) => {
                     let packet: VoicePacket = serde_json::from_str(&text)?;
-                    return Ok(Some(packet));
+                    return Ok(Some(WsMessage::Text(packet)));
+                }
+                Message::Binary(bin) => {
+                    return Ok(Some(WsMessage::Binary(bin.to_vec())));
                 }
                 Message::Close(_) => {
                     warn!("Voice WS closed");
                     return Ok(None);
                 }
-                _ => {} // Ignore binary/ping/pong for now
+                _ => {} // Ignore ping/pong for now
             }
         }
         Ok(None)
@@ -103,6 +127,7 @@ impl VoiceGatewayClient {
             d: Some(serde_json::to_value(data)?),
             s: None,
             t: None,
+            seq_ack: None,
         };
         let text = serde_json::to_string(&packet)?;
         self.ws.send(Message::Text(text.into())).await?;
@@ -119,10 +144,16 @@ impl VoiceGatewayClient {
         token: &str,
     ) -> Result<(Ready, f64), Box<dyn std::error::Error + Send + Sync>> {
         // 1. Wait for Hello (OP 8)
-        let hello_packet = self
+        let hello_msg = self
             .recv_packet()
             .await?
             .ok_or("Connection closed before Hello")?;
+        
+        let hello_packet = match hello_msg {
+            WsMessage::Text(p) => p,
+            _ => return Err("Expected Hello text packet".into()),
+        };
+
         if hello_packet.op != 8 {
             return Err(format!("Expected Hello (8), got {}", hello_packet.op).into());
         }
@@ -144,10 +175,16 @@ impl VoiceGatewayClient {
         info!("Sent Identify");
 
         // 3. Wait for Ready (OP 2)
-        let ready_packet = self
+        let ready_msg = self
             .recv_packet()
             .await?
             .ok_or("Connection closed before Ready")?;
+        
+        let ready_packet = match ready_msg {
+            WsMessage::Text(p) => p,
+            _ => return Err("Expected Ready text packet".into()),
+        };
+
         if ready_packet.op != 2 {
             return Err(format!("Expected Ready (2), got {}", ready_packet.op).into());
         }
