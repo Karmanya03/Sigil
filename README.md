@@ -1,17 +1,59 @@
-# 🜏 Sigil
+<div align="center">
+  <img src="assets/SIGIL-logo.png" alt="Sigil Logo" width="400" />
 
-> End-to-end encryption for Discord voice & video. No backdoors, no compromises, no C dependencies.
+  # Sigil
 
-Sigil is a pure-Rust implementation of Discord's [DAVE protocol](https://daveprotocol.com/) — the encryption layer that keeps your voice and video calls private. It handles everything from MLS key exchange to frame-level AES-128-GCM encryption, so you can plug E2EE into your Discord bot without losing sleep over key management.
+  **Pure-Rust Discord DAVE (Audio/Video E2EE) Protocol Framework.**<br>
+  Keep your voice traffic off the books.
+
+  <br>
+
+  [![crates.io](https://img.shields.io/crates/v/sigil?style=flat-square&color=c7102a)](https://crates.io/crates/sigil)
+  [![license](https://img.shields.io/crates/l/sigil?style=flat-square&color=c7102a)](#license)
+  [![written in](https://img.shields.io/badge/written%20in-Rust-c7102a?style=flat-square)](#)
+  [![target](https://img.shields.io/badge/target-Discord%20Voice-c7102a?style=flat-square)](#)
+
+  <br>
+
+  [![E2EE](https://img.shields.io/badge/encryption-AES--128--GCM-9710c7?style=flat-square)](#)
+  [![MLS](https://img.shields.io/badge/key%20exchange-MLS%20RFC%209420-9710c7?style=flat-square)](#)
+  [![Ratchets](https://img.shields.io/badge/ratchet-HKDF--Expand-9710c7?style=flat-square)](#)
+  [![Codecs](https://img.shields.io/badge/codecs-VP8%20%7C%20VP9%20%7C%20H264%20%7C%20H265%20%7C%20AV1%20%7C%20Opus-9710c7?style=flat-square)](#)
+
+  <br>
+
+  [![Dependencies](https://img.shields.io/badge/C%20dependencies-0-10c756?style=flat-square)](#)
+  [![Integrations](https://img.shields.io/badge/integrations-Serenity%20%7C%20Songbird-10c756?style=flat-square)](#)
+
+  <br>
+
+  [**Quick Start**](#quick-start) &nbsp;·&nbsp;
+  [**Integration Guide**](#integration-guide) &nbsp;·&nbsp;
+  [**Architecture**](#architecture) &nbsp;·&nbsp;
+  [**Sigil vs Davey**](#sigil-vs-davey) &nbsp;·&nbsp;
+  [**Protocol Details**](#dave-protocol-details)
+  
+  <hr>
+</div>
+
+> *End-to-end encryption for Discord voice & video. No backdoors, no compromises, no C dependencies.*
+
+**What is this?**<br>
+Sigil is a pure-Rust implementation of Discord's [DAVE protocol](https://daveprotocol.com/) — the end-to-end encryption layer that ensures only your friends (and definitely not your ISP) can hear you screaming when you botch a raid. 
+
+Discord recently rolled out DAVE so Voice & Video calls are completely protected. But actually implementing the math behind it? Absolute nightmare fuel. 
+
+Sigil does all the heavy cryptographical lifting so you don't have to. You can just plug E2EE straight into your Discord bot without losing a single night of sleep over "MLS key epochs", "nonce expansions", or "truncated authentication tags." 
 
 ## Why Sigil?
 
-Because your bot's voice traffic doesn't need to be an open book. Sigil gives you:
+Because your bot's voice traffic isn't a public podcast. Here is what Sigil brings to the table:
 
-- **One struct to rule them all** — `SigilSession` wraps MLS, key derivation, frame crypto, and gateway events into a single cohesive API. No PhD required.
-- **Codec-aware encryption** — VP8, VP9, H.264, H.265, AV1, Opus. Each codec has byte ranges that *must* stay unencrypted for WebRTC to function. Sigil handles all of it.
-- **Protocol v1.1 compliant** — ciphersuite 2, truncated 8-byte tags, `0xFAFA` magic markers, HKDF ratchets, the whole nine yards.
-- **Zero C dependencies** — no CMake, no OpenSSL, no `audiopus_sys`. Just `cargo build` and go.
+- **One struct to rule them all** — `SigilSession` handles all the MLS handshakes, key ratcheting, and Gateway events behind a single clean API. No PhD in cryptography required.
+- **Codec magic** — VP8, VP9, H.264, H.265, AV1, Opus. WebRTC gets violently angry if you encrypt *everything*. Sigil automatically knows exactly which bytes to leave unencrypted so WebRTC doesn't crash and burn.
+- **100% Protocol v1.1 compliant** — HKDF ratchets, ciphersuite 2, `0xFAFA` magic markers... the whole nine yards. It flawlessly speaks the exact language Discord's official clients expect.
+- **Zero C dependencies** — no CMake, no OpenSSL, no `audiopus_sys` required for the core library. Just run `cargo build` and go touch grass.
+
 
 ## Architecture
 
