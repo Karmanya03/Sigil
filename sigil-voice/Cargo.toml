@@ -22,5 +22,4 @@ aes-gcm = "0.10"
 
 # Discord Framework Integration
 serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "model", "rustls_backend"] }
-audiopus = "=0.3.0-rc.0"
 
