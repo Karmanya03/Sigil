@@ -7,8 +7,8 @@
 //! Use [`SigilSession`] for a batteries-included integration experience:
 //!
 //! ```rust,no_run
-//! use sigil::SigilSession;
-//! use sigil::crypto::codec::Codec;
+//! use sigil_discord::SigilSession;
+//! use sigil_discord::crypto::codec::Codec;
 //! ```
 //!
 //! ## Modules

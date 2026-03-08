@@ -1,4 +1,4 @@
-use sigil::crypto::uleb128;
+use sigil_discord::crypto::uleb128;
 
 #[test]
 fn roundtrip_small() {

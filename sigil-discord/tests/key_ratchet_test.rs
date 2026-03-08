@@ -1,4 +1,4 @@
-use sigil::crypto::key_ratchet::KeyRatchet;
+use sigil_discord::crypto::key_ratchet::KeyRatchet;
 
 #[test]
 fn generation_zero_returns_base() {

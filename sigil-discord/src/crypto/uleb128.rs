@@ -9,7 +9,7 @@ use crate::error::SigilError;
 ///
 /// # Examples
 /// ```
-/// # use sigil::crypto::uleb128;
+/// # use sigil_discord::crypto::uleb128;
 /// assert_eq!(uleb128::encode(0), vec![0]);
 /// assert_eq!(uleb128::encode(42), vec![42]);
 /// assert_eq!(uleb128::encode(300), vec![0xAC, 0x02]);

@@ -1,6 +1,7 @@
-use sigil::crypto::codec::UnencryptedRange;
-use sigil::frame::payload::{build_footer, parse_footer};
-use sigil::types::*;
+use sigil_discord::crypto::codec::UnencryptedRange;
+use sigil_discord::frame::payload::{build_footer, parse_footer};
+use sigil_discord::types::*;
+use sigil_discord::TRUNCATED_TAG_LENGTH;
 
 #[test]
 fn footer_roundtrip_no_ranges() {

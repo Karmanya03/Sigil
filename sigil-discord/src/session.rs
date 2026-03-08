@@ -7,8 +7,8 @@
 //! # Example
 //!
 //! ```rust,no_run
-//! use sigil::session::SigilSession;
-//! use sigil::crypto::codec::Codec;
+//! use sigil_discord::session::SigilSession;
+//! use sigil_discord::crypto::codec::Codec;
 //!
 //! // Create a session for your bot's user ID
 //! let mut session = SigilSession::new(123456789012345678).unwrap();
