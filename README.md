@@ -8,8 +8,8 @@
 
   <br>
 
-  [![crates.io](https://img.shields.io/crates/v/sigil-rs?style=flat-square&color=c7102a)](https://crates.io/crates/sigil-rs)
-  [![license](https://img.shields.io/crates/l/sigil-rs?style=flat-square&color=c7102a)](#license)
+  [![crates.io](https://img.shields.io/crates/v/sigil-discord?style=flat-square&color=c7102a)](https://crates.io/crates/sigil-discord)
+  [![license](https://img.shields.io/crates/l/sigil-discord?style=flat-square&color=c7102a)](#license)
   [![written in](https://img.shields.io/badge/written%20in-Rust-c7102a?style=flat-square)](#)
   [![target](https://img.shields.io/badge/target-Discord%20Voice-c7102a?style=flat-square)](#)
 
