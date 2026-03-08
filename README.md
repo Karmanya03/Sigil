@@ -215,124 +215,68 @@ cargo bench          # benchmark frame encryption
 
 The core library (`cargo build`) compiles without any native dependencies. The `voice-gateway` feature is opt-in for when you want direct Songbird/Serenity interop.
 
-### Serenity + Songbird Integration (Music Bots)
+### Sigil-Voice Custom Driver
 
-If you're building a music bot with [Serenity](https://github.com/serenity-rs/serenity) and [Songbird](https://github.com/serenity-rs/songbird), you'll need the `voice-gateway` feature. This pulls in Songbird's audio driver, which depends on **Opus** (via `audiopus_sys`), which requires **CMake** to compile.
+Why use Songbird when you can pipe audio directly through Sigil?
 
-#### Prerequisites
+We've built `sigil-voice`—a completely standalone Discord Voice v8 async driver that seamlessly handles WebSocket handshakes, UDP Hole Punching, Audio Pipeline routing (PCM -> Opus -> DAVE -> UDP AES-GCM), and native `yt-dlp` music streaming. 
 
-**Windows:**
-```powershell
-# Option 1: winget
-winget install Kitware.CMake
+**It 100% replaces Songbird.**
 
-# Option 2: choco
-choco install cmake --installargs 'ADD_CMAKE_TO_PATH=System'
-
-# Option 3: scoop
-scoop install cmake
-
-# After installing, restart your terminal and verify:
-cmake --version
-```
-
-**macOS:**
-```bash
-brew install cmake
-```
-
-**Linux (Debian/Ubuntu):**
-```bash
-sudo apt install cmake build-essential pkg-config libopus-dev
-```
-
-**Linux (Arch):**
-```bash
-sudo pacman -S cmake base-devel opus
-```
+If you're building a music bot with [Serenity](https://github.com/serenity-rs/serenity), simply add `sigil-voice` instead:
 
 #### Cargo Setup
 
-In your **bot's** `Cargo.toml` (not Sigil's):
-
 ```toml
 [dependencies]
-sigil-rs = { git = "https://github.com/Karmanya03/Sigil", features = ["voice-gateway"] }
-serenity = { version = "0.12", features = ["voice", "gateway"] }
-songbird = { version = "0.4", features = ["driver", "gateway"] }
+sigil-discord = { git = "https://github.com/Karmanya03/Sigil" }
+sigil-voice = { git = "https://github.com/Karmanya03/Sigil" }
+serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "model", "rustls_backend"] }
 tokio = { version = "1", features = ["full"] }
 ```
 
-#### Bot Skeleton
+#### Bot Skeleton using `yt-dlp`
 
-Here's a minimal example wiring Sigil into a Serenity + Songbird bot:
+Here is exactly how you stream a YouTube video directly into a Voice Channel using `sigil-voice`. Make sure you have `yt-dlp` and `ffmpeg` installed on your system.
 
 ```rust
-use std::sync::Arc;
-use serenity::prelude::*;
-use songbird::SerenityInit;
-use sigil::{SigilSession, SigilError};
-use sigil::crypto::codec::Codec;
+use sigil_voice::driver::CoreDriver;
+use sigil_voice::source::YtDlpSource;
 
-struct Handler;
+async fn play_youtube_audio(
+    endpoint: &str,
+    server_id: &str,
+    user_id: &str,
+    session_id: &str,
+    token: &str,
+    youtube_url: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // 1. Connect the core Sigil voice driver
+    // This perfectly handles the WS handshake, UDP Hole Punching, and DAVE setup!
+    let mut driver = CoreDriver::connect(endpoint, server_id, user_id, session_id, token).await?;
 
-#[serenity::async_trait]
-impl EventHandler for Handler {
-    async fn ready(&self, _ctx: Context, ready: serenity::model::gateway::Ready) {
-        println!("{} is connected!", ready.user.name);
-    }
-}
+    // 2. Resolve the YouTube URL to a direct audio stream via `yt-dlp`
+    let direct_url = YtDlpSource::get_direct_url(youtube_url).await?;
 
-#[tokio::main]
-async fn main() {
-    let token = std::env::var("DISCORD_TOKEN").expect("DISCORD_TOKEN not set");
+    // 3. Create a channel to catch the raw PCM 16-bit audio
+    let (pcm_tx, pcm_rx) = tokio::sync::mpsc::channel(100);
 
-    let mut client = Client::builder(&token, GatewayIntents::non_privileged())
-        .event_handler(Handler)
-        .register_songbird()     // ← register Songbird
-        .await
-        .expect("Error creating client");
+    // 4. Spawn `ffmpeg` in the background to download and decode the stream
+    YtDlpSource::spawn_ffmpeg_stream(&direct_url, pcm_tx).await?;
 
-    client.start().await.unwrap();
-}
-
-// When joining a voice channel:
-async fn join_and_encrypt(ctx: &Context, guild_id: u64, channel_id: u64) -> Result<(), SigilError> {
-    let bot_user_id: u64 = 123456789012345678; // your bot's user ID
-
-    // 1. Create a Sigil session
-    let mut session = SigilSession::new(bot_user_id)?;
-
-    // 2. Generate key package for DAVE enrollment
-    let key_package = session.generate_key_package()?;
-    // → send key_package to Discord via voice gateway opcode 22
-
-    // 3. After receiving Welcome from gateway:
-    // session.join_group(&welcome_bytes)?;
-    // session.export_sender_keys(&participant_ids)?;
-
-    // 4. Encrypt outgoing audio frames before sending
-    let raw_opus_frame = vec![0u8; 960]; // your encoded audio
-    let encrypted = session.encrypt_own_frame(&raw_opus_frame, Codec::Opus)?;
-
-    // 5. Decrypt incoming audio frames after receiving
-    let sender_id: u64 = 987654321098765432;
-    let decrypted = session.decrypt_from_sender(sender_id, &encrypted)?;
+    // 5. Pipe the PCM into the driver where it is automatically encoded to Opus, 
+    //    encrypted via DAVE (SigilSession), wrapped in RTP, and broadcasted!
+    let my_ssrc = 12345; // Retrieve from driver.gateway Ready event
+    let target_ip = "1.2.3.4"; // Retrieve from driver.gateway Ready event
+    let target_port = 50000;
+    
+    driver.play_pcm_stream(pcm_rx, my_ssrc, target_ip, target_port).await?;
 
     Ok(())
 }
 ```
 
-#### Troubleshooting CMake
-
-| Problem | Fix |
-|---------|-----|
-| `cmake not found` | Install CMake and restart your terminal |
-| `Could not find Opus` | Install `libopus-dev` (Linux) or let audiopus build it from source |
-| `LINK : fatal error LNK1181` (Windows) | Make sure Visual Studio Build Tools are installed with C++ workload |
-| `cc: error: unrecognized option '-m64'` (macOS ARM) | Run `rustup target add aarch64-apple-darwin` and build with `--target aarch64-apple-darwin` |
-
-> **Don't need voice?** Skip `voice-gateway` entirely. The core Sigil library handles all E2EE logic without CMake, Opus, or any native dependencies. You'd wire it into your own voice transport layer instead.
+> **Requirements:** The `sigil-voice` audio pipeline relies on `audiopus` which requires `CMake` installed to compile the C-bindings for Opus. If you hit a CMake error on Windows, make sure Visual Studio Build Tools (C++ workload) is installed, or `libopus-dev` on Linux.
 
 ## Project Structure
 
