@@ -171,7 +171,126 @@ cargo bench          # benchmark frame encryption
 |---------|----------------|-------|
 | `voice-gateway` | Songbird + Serenity integration | CMake (for audiopus) |
 
-The core library compiles without any native dependencies. The `voice-gateway` feature is opt-in for when you want direct Songbird/Serenity interop.
+The core library (`cargo build`) compiles without any native dependencies. The `voice-gateway` feature is opt-in for when you want direct Songbird/Serenity interop.
+
+### Serenity + Songbird Integration (Music Bots)
+
+If you're building a music bot with [Serenity](https://github.com/serenity-rs/serenity) and [Songbird](https://github.com/serenity-rs/songbird), you'll need the `voice-gateway` feature. This pulls in Songbird's audio driver, which depends on **Opus** (via `audiopus_sys`), which requires **CMake** to compile.
+
+#### Prerequisites
+
+**Windows:**
+```powershell
+# Option 1: winget
+winget install Kitware.CMake
+
+# Option 2: choco
+choco install cmake --installargs 'ADD_CMAKE_TO_PATH=System'
+
+# Option 3: scoop
+scoop install cmake
+
+# After installing, restart your terminal and verify:
+cmake --version
+```
+
+**macOS:**
+```bash
+brew install cmake
+```
+
+**Linux (Debian/Ubuntu):**
+```bash
+sudo apt install cmake build-essential pkg-config libopus-dev
+```
+
+**Linux (Arch):**
+```bash
+sudo pacman -S cmake base-devel opus
+```
+
+#### Cargo Setup
+
+In your **bot's** `Cargo.toml` (not Sigil's):
+
+```toml
+[dependencies]
+sigil = { git = "https://github.com/Karmanya03/Sigil", features = ["voice-gateway"] }
+serenity = { version = "0.12", features = ["voice", "gateway"] }
+songbird = { version = "0.4", features = ["driver", "gateway"] }
+tokio = { version = "1", features = ["full"] }
+```
+
+#### Bot Skeleton
+
+Here's a minimal example wiring Sigil into a Serenity + Songbird bot:
+
+```rust
+use std::sync::Arc;
+use serenity::prelude::*;
+use songbird::SerenityInit;
+use sigil::{SigilSession, SigilError};
+use sigil::crypto::codec::Codec;
+
+struct Handler;
+
+#[serenity::async_trait]
+impl EventHandler for Handler {
+    async fn ready(&self, _ctx: Context, ready: serenity::model::gateway::Ready) {
+        println!("{} is connected!", ready.user.name);
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    let token = std::env::var("DISCORD_TOKEN").expect("DISCORD_TOKEN not set");
+
+    let mut client = Client::builder(&token, GatewayIntents::non_privileged())
+        .event_handler(Handler)
+        .register_songbird()     // ← register Songbird
+        .await
+        .expect("Error creating client");
+
+    client.start().await.unwrap();
+}
+
+// When joining a voice channel:
+async fn join_and_encrypt(ctx: &Context, guild_id: u64, channel_id: u64) -> Result<(), SigilError> {
+    let bot_user_id: u64 = 123456789012345678; // your bot's user ID
+
+    // 1. Create a Sigil session
+    let mut session = SigilSession::new(bot_user_id)?;
+
+    // 2. Generate key package for DAVE enrollment
+    let key_package = session.generate_key_package()?;
+    // → send key_package to Discord via voice gateway opcode 22
+
+    // 3. After receiving Welcome from gateway:
+    // session.join_group(&welcome_bytes)?;
+    // session.export_sender_keys(&participant_ids)?;
+
+    // 4. Encrypt outgoing audio frames before sending
+    let raw_opus_frame = vec![0u8; 960]; // your encoded audio
+    let encrypted = session.encrypt_own_frame(&raw_opus_frame, Codec::Opus)?;
+
+    // 5. Decrypt incoming audio frames after receiving
+    let sender_id: u64 = 987654321098765432;
+    let decrypted = session.decrypt_from_sender(sender_id, &encrypted)?;
+
+    Ok(())
+}
+```
+
+#### Troubleshooting CMake
+
+| Problem | Fix |
+|---------|-----|
+| `cmake not found` | Install CMake and restart your terminal |
+| `Could not find Opus` | Install `libopus-dev` (Linux) or let audiopus build it from source |
+| `LINK : fatal error LNK1181` (Windows) | Make sure Visual Studio Build Tools are installed with C++ workload |
+| `cc: error: unrecognized option '-m64'` (macOS ARM) | Run `rustup target add aarch64-apple-darwin` and build with `--target aarch64-apple-darwin` |
+
+> **Don't need voice?** Skip `voice-gateway` entirely. The core Sigil library handles all E2EE logic without CMake, Opus, or any native dependencies. You'd wire it into your own voice transport layer instead.
 
 ## Project Structure
 
