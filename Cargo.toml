@@ -1,8 +1,8 @@
 [package]
-name = "sigil"
+name = "sigil-rs"
 version = "0.1.0"
 edition = "2024"
-authors = ["Karmanya Ravindra <karmanya03@proton.me>"]
+authors = ["Karmanya03 <karmanya03@proton.me>"]
 description = "Sigil — Pure-Rust Discord DAVE (Audio/Video E2EE) protocol implementation"
 license = "MIT"
 repository = "https://github.com/Karmanya03/Sigil"

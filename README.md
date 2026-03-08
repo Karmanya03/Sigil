@@ -8,8 +8,8 @@
 
   <br>
 
-  [![crates.io](https://img.shields.io/crates/v/sigil?style=flat-square&color=c7102a)](https://crates.io/crates/sigil)
-  [![license](https://img.shields.io/crates/l/sigil?style=flat-square&color=c7102a)](#license)
+  [![crates.io](https://img.shields.io/crates/v/sigil-rs?style=flat-square&color=c7102a)](https://crates.io/crates/sigil-rs)
+  [![license](https://img.shields.io/crates/l/sigil-rs?style=flat-square&color=c7102a)](#license)
   [![written in](https://img.shields.io/badge/written%20in-Rust-c7102a?style=flat-square)](#)
   [![target](https://img.shields.io/badge/target-Discord%20Voice-c7102a?style=flat-square)](#)
 
@@ -79,7 +79,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-sigil = { git = "https://github.com/Karmanya03/Sigil" }
+sigil-rs = { git = "https://github.com/Karmanya03/Sigil" }
 ```
 
 ### Basic Usage
@@ -257,7 +257,7 @@ In your **bot's** `Cargo.toml` (not Sigil's):
 
 ```toml
 [dependencies]
-sigil = { git = "https://github.com/Karmanya03/Sigil", features = ["voice-gateway"] }
+sigil-rs = { git = "https://github.com/Karmanya03/Sigil", features = ["voice-gateway"] }
 serenity = { version = "0.12", features = ["voice", "gateway"] }
 songbird = { version = "0.4", features = ["driver", "gateway"] }
 tokio = { version = "1", features = ["full"] }
