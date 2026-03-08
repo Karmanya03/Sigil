@@ -1,0 +1,14 @@
+/target
+Cargo.lock
+*.swp
+*.swo
+.env
+.DS_Store
+*.log
+*.txt
+!README.md
+.agent/
+.agents/
+_agent/
+_agents/
+.gemini/
