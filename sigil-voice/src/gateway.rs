@@ -54,7 +54,7 @@ pub struct Hello {
 
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::TcpStream;
-use tokio_tungstenite::{connect_async, MaybeTlsStream, tungstenite::Message, WebSocketStream};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 use tracing::{info, warn};
 
 pub struct VoiceGatewayClient {
@@ -66,13 +66,15 @@ impl VoiceGatewayClient {
     pub async fn connect(endpoint: &str) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let url = format!("wss://{}/?v=8", endpoint.trim_end_matches(":80"));
         info!("Connecting to Voice Gateway: {}", url);
-        
+
         let (ws, _) = connect_async(&url).await?;
         Ok(Self { ws })
     }
 
     /// Read the next parsed JSON VoicePacket from the WebSocket
-    pub async fn recv_packet(&mut self) -> Result<Option<VoicePacket>, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn recv_packet(
+        &mut self,
+    ) -> Result<Option<VoicePacket>, Box<dyn std::error::Error + Send + Sync>> {
         while let Some(msg) = self.ws.next().await {
             let msg = msg?;
             match msg {
@@ -91,7 +93,11 @@ impl VoiceGatewayClient {
     }
 
     /// Serialize and send a VoicePacket to the WebSocket
-    pub async fn send_packet(&mut self, op: u8, data: impl Serialize) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn send_packet(
+        &mut self,
+        op: u8,
+        data: impl Serialize,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let packet = VoicePacket {
             op,
             d: Some(serde_json::to_value(data)?),
@@ -113,12 +119,18 @@ impl VoiceGatewayClient {
         token: &str,
     ) -> Result<(Ready, f64), Box<dyn std::error::Error + Send + Sync>> {
         // 1. Wait for Hello (OP 8)
-        let hello_packet = self.recv_packet().await?.ok_or("Connection closed before Hello")?;
+        let hello_packet = self
+            .recv_packet()
+            .await?
+            .ok_or("Connection closed before Hello")?;
         if hello_packet.op != 8 {
             return Err(format!("Expected Hello (8), got {}", hello_packet.op).into());
         }
         let hello: Hello = serde_json::from_value(hello_packet.d.unwrap())?;
-        info!("Received Hello, heartbeat interval: {}ms", hello.heartbeat_interval);
+        info!(
+            "Received Hello, heartbeat interval: {}ms",
+            hello.heartbeat_interval
+        );
 
         // 2. Send Identify (OP 0)
         let identify = Identify {
@@ -132,14 +144,19 @@ impl VoiceGatewayClient {
         info!("Sent Identify");
 
         // 3. Wait for Ready (OP 2)
-        let ready_packet = self.recv_packet().await?.ok_or("Connection closed before Ready")?;
+        let ready_packet = self
+            .recv_packet()
+            .await?
+            .ok_or("Connection closed before Ready")?;
         if ready_packet.op != 2 {
             return Err(format!("Expected Ready (2), got {}", ready_packet.op).into());
         }
         let ready: Ready = serde_json::from_value(ready_packet.d.unwrap())?;
-        info!("Received Ready: IP={} Port={} SSRC={}", ready.ip, ready.port, ready.ssrc);
+        info!(
+            "Received Ready: IP={} Port={} SSRC={}",
+            ready.ip, ready.port, ready.ssrc
+        );
 
         Ok((ready, hello.heartbeat_interval))
     }
 }
-

@@ -1,5 +1,5 @@
 use tokio::net::UdpSocket;
-use tracing::{debug, error};
+use tracing::debug;
 
 /// Sends the 74-byte IP Discovery packet to Discord's UDP socket.
 /// Format:
@@ -7,12 +7,17 @@ use tracing::{debug, error};
 /// - 2 bytes: Length (70)
 /// - 4 bytes: SSRC
 /// - 66 bytes: 0-padding
-pub async fn send_ip_discovery(socket: &UdpSocket, server_ip: &str, server_port: u16, ssrc: u32) -> Result<(), std::io::Error> {
+pub async fn send_ip_discovery(
+    socket: &UdpSocket,
+    server_ip: &str,
+    server_port: u16,
+    ssrc: u32,
+) -> Result<(), std::io::Error> {
     let mut packet = [0u8; 74];
     packet[0] = 0x00;
     packet[1] = 0x01; // Type = 1 (Request)
     packet[2] = 0x00;
-    packet[3] = 70;   // Length = 70 bytes of data after header
+    packet[3] = 70; // Length = 70 bytes of data after header
     packet[4..8].copy_from_slice(&ssrc.to_be_bytes());
 
     let target = format!("{}:{}", server_ip, server_port);
@@ -53,18 +58,22 @@ pub fn build_rtp_header(seq: u16, timestamp: u32, ssrc: u32) -> [u8; 12] {
 }
 
 use aes_gcm::{
+    Aes256Gcm, Key, Nonce,
     aead::{Aead, KeyInit},
-    Aes256Gcm, Nonce, Key,
 };
 
 /// Encrypts an RTP block using `aead_aes256_gcm_rtpsize` mode.
 /// - Nonce: The 12-byte RTP header.
 /// - Plaintext: The inner payload (which in DAVE is the DAVE ciphertext).
 /// - Output: [12-byte RTP Header] + [Encrypted Payload + 16-byte MAC Tag]
-pub fn transport_encrypt_rtpsize(key: &[u8], rtp_header: &[u8; 12], payload: &[u8]) -> Result<Vec<u8>, aes_gcm::Error> {
+pub fn transport_encrypt_rtpsize(
+    key: &[u8],
+    rtp_header: &[u8; 12],
+    payload: &[u8],
+) -> Result<Vec<u8>, aes_gcm::Error> {
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
     let nonce = Nonce::from_slice(rtp_header);
-    
+
     // In rtpsize mode, the header is NOT AAD, it's just the nonce.
     // The payload is encrypted outright.
     let ciphertext = cipher.encrypt(nonce, payload)?;

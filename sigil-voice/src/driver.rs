@@ -1,7 +1,6 @@
-use std::net::SocketAddr;
-use tokio::net::UdpSocket;
-use tracing::{info, warn};
 use sigil_discord::SigilSession;
+use tokio::net::UdpSocket;
+use tracing::info;
 
 use crate::gateway::{ProtocolData, SelectProtocol, SessionDescription, VoiceGatewayClient};
 use crate::udp::{receive_ip_discovery, send_ip_discovery};
@@ -16,7 +15,7 @@ pub struct CoreDriver {
 }
 
 impl CoreDriver {
-    /// Connects to Discord Voice, performs the WS handshake, completes UDP Hole Punching, 
+    /// Connects to Discord Voice, performs the WS handshake, completes UDP Hole Punching,
     /// and establishes the final transport session keys.
     pub async fn connect(
         endpoint: &str,
@@ -30,16 +29,18 @@ impl CoreDriver {
 
         // 2. Connect to WS and Handshake
         let mut gateway = VoiceGatewayClient::connect(endpoint).await?;
-        let (ready, heartbeat_interval) = gateway.handshake(server_id, user_id, session_id, token).await?;
+        let (ready, heartbeat_interval) = gateway
+            .handshake(server_id, user_id, session_id, token)
+            .await?;
 
         // 3. Bind local UDP socket
         let udp = UdpSocket::bind("0.0.0.0:0").await?;
-        
+
         // 4. Perform IP Discovery
         info!("Starting IP discovery towards {}:{}", ready.ip, ready.port);
         send_ip_discovery(&udp, &ready.ip, ready.port, ready.ssrc).await?;
         let (external_ip, external_port) = receive_ip_discovery(&udp).await?;
-        
+
         // 5. Select Protocol based on UDP discovery
         let select_protocol = SelectProtocol {
             protocol: "udp".to_string(),
@@ -56,10 +57,16 @@ impl CoreDriver {
         let mode;
         let secret_key;
         loop {
-            let packet = gateway.recv_packet().await?.ok_or("Connection closed before SessionDescription")?;
+            let packet = gateway
+                .recv_packet()
+                .await?
+                .ok_or("Connection closed before SessionDescription")?;
             if packet.op == 4 {
                 let session_desc: SessionDescription = serde_json::from_value(packet.d.unwrap())?;
-                info!("Received SessionDescription from Voice Gateway. Mode: {}", session_desc.mode);
+                info!(
+                    "Received SessionDescription from Voice Gateway. Mode: {}",
+                    session_desc.mode
+                );
                 mode = Some(session_desc.mode);
                 secret_key = Some(session_desc.secret_key);
                 break;
@@ -76,8 +83,8 @@ impl CoreDriver {
         })
     }
 
-    /// Continuously reads 20ms PCM audio frames from the channel, 
-    /// processes them via the Audio Pipeline (Opus -> DAVE -> RTP -> Transport), 
+    /// Continuously reads 20ms PCM audio frames from the channel,
+    /// processes them via the Audio Pipeline (Opus -> DAVE -> RTP -> Transport),
     /// and dispatches via UDP to the Voice server.
     pub async fn play_pcm_stream(
         &mut self,
@@ -101,13 +108,16 @@ impl CoreDriver {
             let opus_data = &opus_buf[..opus_len];
 
             // 2. Encrypt Opus via DAVE (SigilSession)
-            let dave_ciphertext = self.sigil.encrypt_own_frame(opus_data, sigil_discord::crypto::codec::Codec::Opus)?;
+            let dave_ciphertext = self
+                .sigil
+                .encrypt_own_frame(opus_data, sigil_discord::crypto::codec::Codec::Opus)?;
 
             // 3. Build RTP Header
             let rtp_header = crate::udp::build_rtp_header(seq, timestamp, ssrc);
 
             // 4. Transport Encrypt via RTPSIZE AES-256-GCM
-            let udp_payload = crate::udp::transport_encrypt_rtpsize(&secret_key, &rtp_header, &dave_ciphertext)?;
+            let udp_payload = crate::udp::transport_encrypt_rtpsize(&secret_key, &rtp_header, &dave_ciphertext)
+                .map_err(|_| "AES-GCM transport encryption failed")?;
 
             // 5. Send to Discord Voice Server
             self.udp.send_to(&udp_payload, &target).await?;
@@ -119,4 +129,3 @@ impl CoreDriver {
         Ok(())
     }
 }
-
