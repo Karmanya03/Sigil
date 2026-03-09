@@ -256,24 +256,39 @@ impl CoreDriver {
     }
 
 
-    /// The primary audio engine loop. 
-    /// It wakes up every 20ms, polls all active tracks, mixes their PCM data,
-    /// encodes to Opus, encrypts via DAVE, and ships via UDP.
+    /// The primary audio engine loop.
+    /// Runs every 20ms: poll tracks → mix PCM → Opus encode → DAVE encrypt → UDP send.
+    /// The loop NEVER exits on per-frame errors — it logs and skips to keep the connection alive.
     pub async fn start_mixing(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        // Send OP 5 Speaking Before Audio Payload Dispatch
-        let speaking = crate::gateway::Speaking { speaking: 1, delay: 0, ssrc: self.ssrc, user_id: None };
-        self.ws_tx_channel.send(crate::gateway::WsMessage::Text(VoicePacket {
-            op: 5,
-            d: Some(serde_json::to_value(speaking)?),
-            s: None, t: None, seq_ack: None,
-        })).await?;
+        let secret_key = match self.secret_key.clone() {
+            Some(k) => k,
+            None => {
+                tracing::error!("start_mixing: No secret_key — cannot start mixing loop");
+                return Err("No secret key".into());
+            }
+        };
 
-        let mut encoder = crate::audio::AudioEncoder::new()?;
+        // Create the Opus encoder
+        let mut encoder = match crate::audio::AudioEncoder::new() {
+            Ok(e) => e,
+            Err(e) => {
+                tracing::error!("start_mixing: Failed to create AudioEncoder: {:?}", e);
+                return Err(e);
+            }
+        };
+
+        // Send OP 5 Speaking — non-fatal if it fails
+        let speaking = crate::gateway::Speaking { speaking: 1, delay: 0, ssrc: self.ssrc, user_id: None };
+        if let Ok(d) = serde_json::to_value(speaking) {
+            let _ = self.ws_tx_channel.send(crate::gateway::WsMessage::Text(VoicePacket {
+                op: 5, d: Some(d), s: None, t: None, seq_ack: None,
+            })).await;
+        }
+        tracing::info!("🎙️ Mixing loop started for SSRC={}", self.ssrc);
+
         let mut seq = 0u16;
         let mut timestamp = 0u32;
         let mut nonce_counter = 0u32;
-        let secret_key = self.secret_key.clone().ok_or("No secret key negotiated")?;
-        
         let mut opus_buf = [0u8; 4000];
         let mut ticker = tokio::time::interval(std::time::Duration::from_millis(20));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -281,76 +296,92 @@ impl CoreDriver {
         loop {
             ticker.tick().await;
 
-            let mut mixed_pcm = vec![0i16; 1920]; // 20ms stereo at 48kHz
+            // --- 1. Poll all tracks and mix PCM ---
+            let mut mixed_pcm = vec![0i16; 1920];
             let mut active_any = false;
-
             {
                 let mut tracks = self.tracks.lock().await;
-                // Remove stopped or errored tracks
-                tracks.retain(|handle| {
+
+                // Drop finished tracks
+                tracks.retain(|h| {
                     use crate::track::PlayState;
-                    let state = handle.get_state_atomic();
-                    state == PlayState::Playing || state == PlayState::Paused
+                    matches!(h.get_state_atomic(), PlayState::Playing | PlayState::Paused)
                 });
 
                 for handle in tracks.iter() {
-                    let state = handle.get_state_atomic();
-                    if state != crate::track::PlayState::Playing {
+                    if handle.get_state_atomic() != crate::track::PlayState::Playing {
                         continue;
                     }
-
-                    // Try to lock the track for the duration of the frame read/mix
-                    // We use try_lock to avoid blocking the mixer if the user is currently modifying track props
                     if let Ok(mut t) = handle.inner().try_lock() {
-                        if let Some(frame) = t.source.read_frame() {
-                            active_any = true;
-                            // Mix frame into mixed_pcm with volume scaling
-                            for (i, &sample) in frame.iter().enumerate() {
-                                if i >= mixed_pcm.len() { break; }
-                                let scaled = (sample as f32 * t.volume) as i32;
-                                let current = mixed_pcm[i] as i32;
-                                mixed_pcm[i] = (current + scaled).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+                        match t.source.read_frame() {
+                            Some(frame) => {
+                                active_any = true;
+                                for (i, &s) in frame.iter().enumerate() {
+                                    if i >= mixed_pcm.len() { break; }
+                                    let scaled = (s as f32 * t.volume) as i32;
+                                    mixed_pcm[i] = (mixed_pcm[i] as i32 + scaled)
+                                        .clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+                                }
                             }
-                        } else {
-                            // Source exhausted
-                            t.state.store(crate::track::PlayState::Stopped as u8, std::sync::atomic::Ordering::SeqCst);
-                            if let Some(tx) = &t.event_tx {
-                                let _ = tx.send(crate::track::TrackEvent::End);
+                            None => {
+                                // Sender dropped — stream truly finished
+                                t.state.store(crate::track::PlayState::Stopped as u8,
+                                    std::sync::atomic::Ordering::SeqCst);
+                                if let Some(tx) = &t.event_tx {
+                                    let _ = tx.send(crate::track::TrackEvent::End);
+                                }
+                                tracing::info!("Track finished (source exhausted)");
                             }
                         }
                     } else {
-                        // Skip this frame for this track if locked, mixer must keep ticking
-                        active_any = true; 
+                        active_any = true; // locked by user, keep tick alive
                     }
                 }
             }
 
             if !active_any {
-                // To keep the connection alive and timing precise, we should still send silence?
-                // Or just wait for the next tick. Discord prefers continuous RTP for many reasons.
-                // We'll send silence if there was activity recently, but for now we skip to save CPU if idle.
-                continue;
+                continue; // nothing to encode this tick
             }
 
-            // 1. Encode mixed PCM to Opus
-            let opus_len = encoder.encode_pcm(&mixed_pcm, &mut opus_buf)?;
+            // --- 2. Encode to Opus ---
+            let opus_len = match encoder.encode_pcm(&mixed_pcm, &mut opus_buf) {
+                Ok(n) => n,
+                Err(e) => {
+                    tracing::warn!("Opus encode error (skipping frame): {:?}", e);
+                    continue;
+                }
+            };
             let opus_data = &opus_buf[..opus_len];
 
-            // 2. Encrypt Opus via DAVE (SigilSession)
+            // --- 3. DAVE encrypt (may fail if MLS group not ready yet) ---
             let dave_ciphertext = {
-                let mut sigil = self.sigil.lock().await;
-                sigil.encrypt_own_frame(opus_data, sigil_discord::crypto::codec::Codec::Opus)?
+                let mut sigil_guard = self.sigil.lock().await;
+                match sigil_guard.encrypt_own_frame(opus_data, sigil_discord::crypto::codec::Codec::Opus) {
+                    Ok(ct) => ct,
+                    Err(e) => {
+                        tracing::debug!("DAVE encrypt not ready yet (MLS pending?): {:?}", e);
+                        continue; // Skip this frame — DAVE key exchange still in progress
+                    }
+                }
             };
 
-            // 3. Build RTP Header
+            // --- 4. Transport encrypt (AES-256-GCM) ---
             let rtp_header = crate::udp::build_rtp_header(seq, timestamp, self.ssrc);
+            let udp_payload = match crate::udp::transport_encrypt_rtpsize(
+                &secret_key, &rtp_header, &dave_ciphertext, nonce_counter
+            ) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!("Transport encrypt failed (skipping frame): {:?}", e);
+                    continue;
+                }
+            };
 
-            // 4. Transport Encrypt via RTPSIZE AES-256-GCM
-            let udp_payload = crate::udp::transport_encrypt_rtpsize(&secret_key, &rtp_header, &dave_ciphertext, nonce_counter)
-                .map_err(|_| "AES-GCM transport encryption failed")?;
-
-            // 5. Send to Discord Voice Server
-            self.udp.send_to(&udp_payload, &self.target_addr).await?;
+            // --- 5. Send via UDP ---
+            if let Err(e) = self.udp.send_to(&udp_payload, &self.target_addr).await {
+                tracing::warn!("UDP send error (skipping frame): {:?}", e);
+                continue;
+            }
 
             seq = seq.wrapping_add(1);
             timestamp = timestamp.wrapping_add(960);
