@@ -9,7 +9,7 @@ audiopus = "0.3.0-rc.0"
 
 # Async & Networking
 tokio = { version = "1.0", features = ["full"] }
-tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
+tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
 url = "2.5"
 futures-util = "0.3"
 
