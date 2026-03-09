@@ -186,8 +186,8 @@ impl SigilSession {
     /// Export encryption keys for all known senders in the current epoch.
     ///
     /// Call this after the MLS group epoch advances (after processing a commit).
-    /// It uses MLS-Exporter with label `"Discord Secure Frames v0"` and
-    /// the sender's user ID as context.
+    /// It uses MLS-Exporter with label `"Discord Secure Frames v0"` (from types.rs)
+    /// and the sender's user ID as context.
     ///
     /// # Errors
     ///
@@ -371,6 +371,13 @@ impl SigilSession {
     /// Returns `true` if the MLS group is established.
     pub fn is_established(&self) -> bool {
         self.group.is_some()
+    }
+
+    /// Returns `true` if we have our own sender key cached (ready to encrypt).
+    ///
+    /// This is needed for `encrypt_own_frame` to succeed.
+    pub fn has_own_key(&self) -> bool {
+        self.own_key.is_some()
     }
 
     /// Returns the current MLS epoch, or `None` if no group is active.

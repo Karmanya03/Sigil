@@ -257,48 +257,148 @@ impl CoreDriver {
                                                     info!("DAVE: ExecuteTransition (ID: {})", e.transition_id);
                                                 }
                                                 DaveEvent::MlsExternalSender(ext) => {
+                                                    // First create the MLS group using the external sender credential
                                                     match s.set_external_sender(&ext.credential) {
-                                                        Ok(()) => info!("DAVE: Group created via External Sender"),
-                                                        Err(e) => error!("DAVE: set_external_sender FAILED: {:?}", e),
-                                                    }
+                                                        Ok(()) => {
+                                                            info!("DAVE: ✅ Group created via External Sender");
+                                                        }
+                                                        Err(e) => {
+                                                            error!("DAVE: ❌ set_external_sender FAILED: {:?}", e);
+                                                            continue;
+                                                        }
+                                                    };
+                                                    
+                                                    // Now export our own sender key so we can encrypt audio
                                                     let uid = s.user_id;
                                                     match s.export_sender_keys(&[uid]) {
-                                                        Ok(keys) => info!("DAVE: Exported sender keys for user {} ({} keys)", uid, keys.len()),
-                                                        Err(e) => error!("DAVE: export_sender_keys FAILED: {:?}", e),
+                                                        Ok(keys) => {
+                                                            if keys.contains_key(&uid) {
+                                                                info!("DAVE: ✅ Exported own sender key via External Sender (key: {:02x}...)", 
+                                                                    keys.get(&uid).unwrap()[0]);
+                                                            } else {
+                                                                error!("DAVE: ❌ export_sender_keys returned OK but missing own key!");
+                                                            }
+                                                        }
+                                                        Err(e) => {
+                                                            error!("DAVE: ❌ export_sender_keys FAILED: {:?}", e);
+                                                        }
                                                     }
                                                     info!("DAVE: Processed OP 25 External Sender");
                                                 }
                                                 DaveEvent::MlsProposals(prop) => {
-                                                    let _ = s.process_proposals(&[prop.data.clone()]);
-                                                    if let Ok((commit_bytes, opt_welcome)) = s.commit_and_welcome() {
-                                                        let uid = s.user_id;
-                                                        let _ = s.export_sender_keys(&[uid]);
-                                                        let mut payload = vec![0u8; 3];
-                                                        payload[0..2].copy_from_slice(&binary_seq.to_be_bytes());
-                                                        binary_seq = binary_seq.wrapping_add(1);
-                                                        payload[2] = 28;
-                                                        payload.extend_from_slice(&commit_bytes);
-                                                        if let Some(w) = opt_welcome {
-                                                            payload.extend_from_slice(&w);
+                                                    // Process incoming proposals
+                                                    if let Err(e) = s.process_proposals(&[prop.data.clone()]) {
+                                                        error!("DAVE: ❌ process_proposals FAILED: {:?}", e);
+                                                        continue;
+                                                    }
+                                                    
+                                                    // Create commit to resolve proposals
+                                                    match s.commit_and_welcome() {
+                                                        Ok((commit_bytes, opt_welcome)) => {
+                                                            // Export our own sender key so we can encrypt audio
+                                                            let uid = s.user_id;
+                                                            match s.export_sender_keys(&[uid]) {
+                                                                Ok(keys) => {
+                                                                    if keys.contains_key(&uid) {
+                                                                        info!("DAVE: ✅ Exported own sender key via Proposals (key: {:02x}...)", 
+                                                                            keys.get(&uid).unwrap()[0]);
+                                                                    }
+                                                                }
+                                                                Err(e) => {
+                                                                    error!("DAVE: ❌ export_sender_keys FAILED: {:?}", e);
+                                                                }
+                                                            }
+                                                            
+                                                            let mut payload = vec![0u8; 3];
+                                                            payload[0..2].copy_from_slice(&binary_seq.to_be_bytes());
+                                                            binary_seq = binary_seq.wrapping_add(1);
+                                                            payload[2] = 28;
+                                                            payload.extend_from_slice(&commit_bytes);
+                                                            if let Some(w) = opt_welcome {
+                                                                payload.extend_from_slice(&w);
+                                                            }
+                                                            let _ = ws_tx.send(tokio_tungstenite::tungstenite::Message::Binary(payload.into())).await;
+                                                            info!("DAVE: Sent OP 28 MlsCommitWelcome (Keys Exported)");
                                                         }
-                                                        let _ = ws_tx.send(tokio_tungstenite::tungstenite::Message::Binary(payload.into())).await;
-                                                        info!("DAVE: Sent OP 28 MlsCommitWelcome (Keys Exported)");
+                                                        Err(e) => {
+                                                            error!("DAVE: ❌ commit_and_welcome FAILED: {:?}", e);
+                                                        }
                                                     }
                                                 }
                                                 DaveEvent::MlsWelcome(w) => {
-                                                    let _ = s.join_group(&w.welcome_bytes);
+                                                    match s.join_group(&w.welcome_bytes) {
+                                                        Ok(()) => info!("DAVE: ✅ Group joined via Welcome"),
+                                                        Err(e) => {
+                                                            error!("DAVE: ❌ join_group FAILED: {:?}", e);
+                                                            continue;
+                                                        }
+                                                    }
+                                                    
+                                                    // Export our own sender key so we can encrypt audio
                                                     let uid = s.user_id;
-                                                    let _ = s.export_sender_keys(&[uid]);
+                                                    match s.export_sender_keys(&[uid]) {
+                                                        Ok(keys) => {
+                                                            if keys.contains_key(&uid) {
+                                                                info!("DAVE: ✅ Exported own sender key via Welcome (key: {:02x}...)", 
+                                                                    keys.get(&uid).unwrap()[0]);
+                                                            } else {
+                                                                error!("DAVE: ❌ export_sender_keys returned OK but missing own key!");
+                                                            }
+                                                        }
+                                                        Err(e) => {
+                                                            error!("DAVE: ❌ export_sender_keys FAILED: {:?}", e);
+                                                        }
+                                                    }
                                                     info!("DAVE: ✅ Group joined via Welcome! (Keys Exported)");
                                                 }
                                                 DaveEvent::MlsAnnounceCommitTransition(c) => {
-                                                    let _ = s.process_commit(&c.commit_bytes);
+                                                    // Process the commit and advance the epoch
+                                                    match s.process_commit(&c.commit_bytes) {
+                                                        Ok(_) => info!("DAVE: ✅ Processed commit, epoch advanced"),
+                                                        Err(e) => {
+                                                            error!("DAVE: ❌ process_commit FAILED: {:?}", e);
+                                                            continue;
+                                                        }
+                                                    }
+                                                    
+                                                    // Export our own sender key for the new epoch
                                                     let uid = s.user_id;
-                                                    let _ = s.export_sender_keys(&[uid]);
+                                                    match s.export_sender_keys(&[uid]) {
+                                                        Ok(keys) => {
+                                                            if keys.contains_key(&uid) {
+                                                                info!("DAVE: ✅ Exported own sender key via Commit (key: {:02x}...)", 
+                                                                    keys.get(&uid).unwrap()[0]);
+                                                            } else {
+                                                                error!("DAVE: ❌ export_sender_keys returned OK but missing own key!");
+                                                            }
+                                                        }
+                                                        Err(e) => {
+                                                            error!("DAVE: ❌ export_sender_keys FAILED: {:?}", e);
+                                                        }
+                                                    }
                                                     info!("DAVE: Processed OP 29 Commit (Keys Exported)");
                                                 }
                                                 DaveEvent::PrepareEpoch(p) => {
                                                     info!("DAVE: PrepareEpoch {}", p.epoch);
+                                                    
+                                                    // Export sender keys for ALL epochs, not just epoch 1
+                                                    // This ensures we have our own key cached for encryption
+                                                    let uid = s.user_id;
+                                                    match s.export_sender_keys(&[uid]) {
+                                                        Ok(keys) => {
+                                                            if let Some(key) = keys.get(&uid) {
+                                                                info!("DAVE: ✅ Exported own sender key for epoch {} (key: {:02x}...)", 
+                                                                    p.epoch, key[0]);
+                                                            } else {
+                                                                warn!("DAVE: export_sender_keys returned OK but no key for own user_id!");
+                                                            }
+                                                        }
+                                                        Err(e) => {
+                                                            error!("DAVE: ❌ export_sender_keys FAILED at PrepareEpoch {}: {:?}", p.epoch, e);
+                                                        }
+                                                    }
+                                                    
+                                                    // Send key package at epoch 1 (initial group creation)
                                                     if p.epoch == 1 {
                                                         if let Ok(kp) = s.generate_key_package() {
                                                             let mut payload = vec![0u8; 3];
