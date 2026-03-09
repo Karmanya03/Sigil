@@ -7,8 +7,6 @@ Cargo.lock
 *.log
 *.txt
 !README.md
-.agent/
-.agents/
-_agent/
-_agents/
-.gemini/
+!yt_dlp_out.json
+cookies.txt
+.env.*

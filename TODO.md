@@ -11,4 +11,5 @@
 - [x] 7. Fix driver.rs - Remove OP 12 sends (2 occurrences)
 - [x] 8. Fix gateway.rs - Speaking user_id already has skip_serializing_if
 - [x] 9. Run cargo check/build to verify
+- [x] 10. Fix FFmpeg 403 error - Added cookie support to FFmpeg in source.rs (env var & file support)
 
