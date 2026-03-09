@@ -304,7 +304,7 @@ async fn play(ctx: &Context, msg: &Message, mut args: Args) -> CommandResult {
         .and_then(|vs| vs.channel_id)
         .ok_or("You must be in a voice channel!")?;
 
-    let _ = guild_id.connect_rescription(ctx, channel_id).await;
+    let _ = guild_id.connect(&ctx, channel_id).await;
 
     // 2. Access the Sigil manager from your bot's data
     let data = ctx.data.read().await;
