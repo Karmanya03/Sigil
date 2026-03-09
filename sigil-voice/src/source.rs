@@ -79,4 +79,19 @@ impl YtDlpSource {
 
         Ok(())
     }
+
+    /// High-level helper: Resolves a URL, spawns ffmpeg, and returns a playable `Track`.
+    pub async fn create_track(youtube_url: &str) -> Result<crate::track::Track, Box<dyn std::error::Error + Send + Sync>> {
+        let direct_url = Self::get_direct_url(youtube_url).await?;
+        let (tx, rx) = tokio::sync::mpsc::channel(128);
+        Self::spawn_ffmpeg_stream(&direct_url, tx).await?;
+        
+        use crate::track::{Track, PlayState, ChannelSource};
+        Ok(Track {
+            source: Box::new(ChannelSource { receiver: rx }),
+            state: PlayState::Playing,
+            volume: 1.0,
+            loops: 1,
+        })
+    }
 }

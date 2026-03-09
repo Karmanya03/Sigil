@@ -3,6 +3,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use std::collections::HashMap;
 use crate::driver::CoreDriver;
+use crate::call::Call;
 
 #[derive(Default)]
 pub struct PendingConnection {
@@ -22,7 +23,7 @@ impl PendingConnection {
 pub struct SigilVoiceManager {
     user_id: u64,
     pending: Arc<Mutex<HashMap<GuildId, PendingConnection>>>,
-    pub drivers: Arc<Mutex<HashMap<GuildId, Arc<Mutex<CoreDriver>>>>>,
+    pub calls: Arc<Mutex<HashMap<GuildId, Arc<Call>>>>,
 }
 
 impl SigilVoiceManager {
@@ -31,14 +32,14 @@ impl SigilVoiceManager {
         Self {
             user_id,
             pending: Arc::new(Mutex::new(HashMap::new())),
-            drivers: Arc::new(Mutex::new(HashMap::new())),
+            calls: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
-    /// Retrieve an active CoreDriver for a specific Guild, if it exists.
-    pub async fn get_driver(&self, guild_id: GuildId) -> Option<Arc<Mutex<CoreDriver>>> {
-        let drivers = self.drivers.lock().await;
-        drivers.get(&guild_id).cloned()
+    /// Retrieve an active Call handle for a specific Guild, if it exists.
+    pub async fn get_call(&self, guild_id: GuildId) -> Option<Arc<Call>> {
+        let calls = self.calls.lock().await;
+        calls.get(&guild_id).cloned()
     }
 
     /// Trap incoming Voice State patches (e.g. tracking when the bot physically enters the VC)
@@ -87,15 +88,16 @@ impl SigilVoiceManager {
         let (endpoint, session_id, token) = args;
         let server_id_str = guild_id.get().to_string();
         let user_id_str = self.user_id.to_string();
-        let sigil_drivers = self.drivers.clone();
+        let sigil_calls = self.calls.clone();
 
         tokio::spawn(async move {
             tracing::info!("Initializing Sigil CoreDriver natively for {:?}", guild_id);
             match CoreDriver::connect(&endpoint, &server_id_str, &user_id_str, &session_id, &token).await {
                 Ok(driver) => {
                     tracing::info!("Sigil successfully attached to Voice VC {:?}", guild_id);
-                    let mut d = sigil_drivers.lock().await;
-                    d.insert(guild_id, Arc::new(Mutex::new(driver)));
+                    let call = Arc::new(Call::new(driver));
+                    let mut c = sigil_calls.lock().await;
+                    c.insert(guild_id, call);
                 }
                 Err(e) => {
                     tracing::error!("CoreDriver completely failed to bootstrap for {:?}: {:?}", guild_id, e);

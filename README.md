@@ -248,38 +248,29 @@ tokio = { version = "1", features = ["full"] }
 Here is exactly how you stream a YouTube video directly into a Voice Channel using `sigil-voice`. Make sure you have `yt-dlp` and `ffmpeg` installed on your system.
 
 ```rust
-use sigil_voice::driver::CoreDriver;
 use sigil_voice::source::YtDlpSource;
+use sigil_voice::driver::CoreDriver;
+use sigil_voice::call::Call;
 
 async fn play_youtube_audio(
-    endpoint: &str,
-    server_id: &str,
-    user_id: &str,
-    session_id: &str,
-    token: &str,
+    endpoint: &str, server_id: &str, user_id: &str, session_id: &str, token: &str,
     youtube_url: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // 1. Connect the core Sigil voice driver
-    // This perfectly handles the WS handshake, UDP Hole Punching, and DAVE setup!
-    let mut driver = CoreDriver::connect(endpoint, server_id, user_id, session_id, token).await?;
-
-    // 2. Resolve the YouTube URL to a direct audio stream via `yt-dlp`
-    let direct_url = YtDlpSource::get_direct_url(youtube_url).await?;
-
-    // 3. Create a channel to catch the raw PCM 16-bit audio
-    let (pcm_tx, pcm_rx) = tokio::sync::mpsc::channel(100);
-
-    // 4. Spawn `ffmpeg` in the background to download and decode the stream
-    YtDlpSource::spawn_ffmpeg_stream(&direct_url, pcm_tx).await?;
-
-    // 5. Pipe the PCM into the driver where it is automatically encoded to Opus, 
-    //    encrypted via DAVE (SigilSession), wrapped in RTP, and broadcasted!
-    let my_ssrc = 12345; // Retrieve from driver.gateway Ready event
-    let target_ip = "1.2.3.4"; // Retrieve from driver.gateway Ready event
-    let target_port = 50000;
+    // 1. Connect the core driver (WS + UDP + DAVE)
+    let driver = CoreDriver::connect(endpoint, server_id, user_id, session_id, token).await?;
     
-    driver.play_pcm_stream(pcm_rx, my_ssrc, target_ip, target_port).await?;
+    // 2. Wrap it in a Call (starts the background mixing loop)
+    let call = Call::new(driver);
 
+    // 3. Create a track from YouTube (auto-resolves and spawns ffmpeg)
+    let track = YtDlpSource::create_track(youtube_url).await?;
+
+    // 4. Play it!
+    let handle = call.play(track).await;
+    
+    // Optional: Control volume or pause
+    handle.set_volume(0.5).await;
+    
     Ok(())
 }
 ```
@@ -310,25 +301,18 @@ async fn play(ctx: &Context, msg: &Message, mut args: Args) -> CommandResult {
     let data = ctx.data.read().await;
     let manager = data.get::<SigilVoiceManager>().expect("SigilVoiceManager not initialized");
     
-    // 3. Retrieve the auto-initialized driver
-    // We wait a moment for the handshake (Ready + SessionDescription) to complete
-    let driver_lock = loop {
-        if let Some(d) = manager.get_driver(guild_id).await { break d; }
+    // 3. Retrieve the auto-initialized Call handle
+    let call = loop {
+        if let Some(c) = manager.get_call(guild_id).await { break c; }
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     };
 
-    // 4. Stream music!
-    let mut driver = driver_lock.lock().await;
-    let (pcm_tx, pcm_rx) = tokio::sync::mpsc::channel(128);
-    
-    // Resolve YouTube and spawn ffmpeg
-    let direct_url = YtDlpSource::get_direct_url(&url).await?;
-    YtDlpSource::spawn_ffmpeg_stream(&direct_url, pcm_tx).await?;
+    // 4. Create and play!
+    // Sigil handles Opus encoding, DAVE encryption, and 20ms rhythmic mixing.
+    let track = YtDlpSource::create_track(&url).await?;
+    let handle = call.play(track).await;
 
-    // Sigil handles Opus encoding, DAVE encryption, and 20ms rhythmic pacing.
-    // Note: SSRC/IP/Port are typically extracted from the Ready event.
-    driver.play_pcm_stream(pcm_rx, 12345, "127.0.0.1", 50000).await?;
-
+    msg.reply(ctx, "🎶 Now playing...").await?;
     Ok(())
 }
 
@@ -338,11 +322,9 @@ async fn stop(ctx: &Context, msg: &Message) -> CommandResult {
     let data = ctx.data.read().await;
     let manager = data.get::<SigilVoiceManager>().unwrap();
 
-    if let Some(driver_lock) = manager.get_driver(guild_id).await {
-        // Dropping the driver or stopping the stream channel will 
-        // trigger Sigil's automatic 5-frame Silence termination.
-        manager.drivers.lock().await.remove(&guild_id);
-        msg.reply(ctx, "⏹️ Sigil session terminated safely.").await?;
+    if let Some(call) = manager.get_call(guild_id).await {
+        call.stop().await;
+        msg.reply(ctx, "⏹️ Playback stopped.").await?;
     }
     Ok(())
 }

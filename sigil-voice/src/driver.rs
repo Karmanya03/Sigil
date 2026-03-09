@@ -14,6 +14,9 @@ pub struct CoreDriver {
     pub mode: Option<String>,
     pub secret_key: Option<Vec<u8>>,
     pub ws_tx_channel: mpsc::Sender<crate::gateway::WsMessage>,
+    pub tracks: Arc<Mutex<Vec<crate::track::TrackHandle>>>,
+    pub ssrc: u32,
+    pub target_addr: String,
 }
 
 impl CoreDriver {
@@ -212,21 +215,33 @@ impl CoreDriver {
             mode,
             secret_key,
             ws_tx_channel: cmd_tx,
+            tracks: Arc::new(Mutex::new(Vec::new())),
+            ssrc: ready.ssrc,
+            target_addr: target,
         })
     }
 
-    /// Continuously reads 20ms PCM audio frames from the channel,
-    /// processes them via the Audio Pipeline (Opus -> DAVE -> RTP -> Transport),
-    /// and dispatches via UDP to the Voice server.
-    pub async fn play_pcm_stream(
-        &mut self,
-        mut pcm_rx: tokio::sync::mpsc::Receiver<Vec<i16>>,
-        ssrc: u32,
-        target_ip: &str,
-        target_port: u16,
-    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    /// Add a track to the driver. It will be mixed into the outbound audio stream.
+    pub async fn add_track(&self, track: crate::track::Track) -> crate::track::TrackHandle {
+        let handle = crate::track::TrackHandle::new(track);
+        let mut tracks = self.tracks.lock().await;
+        tracks.push(handle.clone());
+        handle
+    }
+
+    /// Stop all playback and clear the track list.
+    pub async fn stop(&self) {
+        let mut tracks = self.tracks.lock().await;
+        tracks.clear();
+    }
+
+
+    /// The primary audio engine loop. 
+    /// It wakes up every 20ms, polls all active tracks, mixes their PCM data,
+    /// encodes to Opus, encrypts via DAVE, and ships via UDP.
+    pub async fn start_mixing(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Send OP 5 Speaking Before Audio Payload Dispatch
-        let speaking = crate::gateway::Speaking { speaking: 1, delay: 0, ssrc };
+        let speaking = crate::gateway::Speaking { speaking: 1, delay: 0, ssrc: self.ssrc };
         self.ws_tx_channel.send(crate::gateway::WsMessage::Text(VoicePacket {
             op: 5,
             d: Some(serde_json::to_value(speaking)?),
@@ -238,20 +253,58 @@ impl CoreDriver {
         let mut timestamp = 0u32;
         let mut nonce_counter = 0u32;
         let secret_key = self.secret_key.clone().ok_or("No secret key negotiated")?;
-        let target = format!("{}:{}", target_ip, target_port);
-
-        // 960 samples per channel (stereo) = 1920 i16s per 20ms frame
+        
         let mut opus_buf = [0u8; 4000];
-
-        // 20ms exact tick interval for real-time delivery
         let mut ticker = tokio::time::interval(std::time::Duration::from_millis(20));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
-        while let Some(pcm_frame) = pcm_rx.recv().await {
+        loop {
             ticker.tick().await;
 
-            // 1. Encode PCM to Opus
-            let opus_len = encoder.encode_pcm(&pcm_frame, &mut opus_buf)?;
+            let mut mixed_pcm = vec![0i16; 1920]; // 20ms stereo at 48kHz
+            let mut active_any = false;
+
+            {
+                let mut tracks = self.tracks.lock().await;
+                // Remove stopped tracks
+                tracks.retain(|t| {
+                    // This is a bit expensive to lock each handle in a loop, but simplest for now.
+                    // In a high-perf driver we'd use a more optimized structure.
+                    // We can't easily check state without awaiting, so we might need a non-async state check.
+                    true 
+                });
+
+                for handle in tracks.iter() {
+                    let mut t = handle.inner().lock().await;
+                    if t.state != crate::track::PlayState::Playing {
+                        continue;
+                    }
+
+                    if let Some(frame) = t.source.read_frame() {
+                        active_any = true;
+                        // Mix frame into mixed_pcm with volume scaling
+                        for (i, &sample) in frame.iter().enumerate() {
+                            if i >= mixed_pcm.len() { break; }
+                            let scaled = (sample as f32 * t.volume) as i32;
+                            let current = mixed_pcm[i] as i32;
+                            mixed_pcm[i] = (current + scaled).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+                        }
+                    } else {
+                        // Source exhausted
+                        t.state = crate::track::PlayState::Stopped;
+                    }
+                }
+            }
+
+            if !active_any {
+                // To keep the connection alive and timing precise, we should still send silence?
+                // Or just wait for the next tick. Discord prefers continuous RTP for many reasons.
+                // We'll send silence if there was activity recently, but for now we skip to save CPU if idle.
+                continue;
+            }
+
+            // 1. Encode mixed PCM to Opus
+            let opus_len = encoder.encode_pcm(&mixed_pcm, &mut opus_buf)?;
             let opus_data = &opus_buf[..opus_len];
 
             // 2. Encrypt Opus via DAVE (SigilSession)
@@ -261,38 +314,19 @@ impl CoreDriver {
             };
 
             // 3. Build RTP Header
-            let rtp_header = crate::udp::build_rtp_header(seq, timestamp, ssrc);
+            let rtp_header = crate::udp::build_rtp_header(seq, timestamp, self.ssrc);
 
             // 4. Transport Encrypt via RTPSIZE AES-256-GCM
             let udp_payload = crate::udp::transport_encrypt_rtpsize(&secret_key, &rtp_header, &dave_ciphertext, nonce_counter)
                 .map_err(|_| "AES-GCM transport encryption failed")?;
 
             // 5. Send to Discord Voice Server
-            self.udp.send_to(&udp_payload, &target).await?;
+            self.udp.send_to(&udp_payload, &self.target_addr).await?;
 
             seq = seq.wrapping_add(1);
             timestamp = timestamp.wrapping_add(960);
             nonce_counter = nonce_counter.wrapping_add(1);
         }
-
-        // 6. Send 5 frames of Silence (0xF8 0xFF 0xFE) to gracefully terminate playback
-        let silence_opus = [0xF8, 0xFF, 0xFE];
-        for _ in 0..5 {
-            ticker.tick().await;
-            let dave_ciphertext = {
-                let mut sigil = self.sigil.lock().await;
-                sigil.encrypt_own_frame(&silence_opus, sigil_discord::crypto::codec::Codec::Opus)?
-            };
-            let rtp_header = crate::udp::build_rtp_header(seq, timestamp, ssrc);
-            let udp_payload = crate::udp::transport_encrypt_rtpsize(&secret_key, &rtp_header, &dave_ciphertext, nonce_counter)
-                .map_err(|_| "AES-GCM transport encryption failed")?;
-            self.udp.send_to(&udp_payload, &target).await?;
-
-            seq = seq.wrapping_add(1);
-            timestamp = timestamp.wrapping_add(960);
-            nonce_counter = nonce_counter.wrapping_add(1);
-        }
-
-        Ok(())
     }
+
 }
