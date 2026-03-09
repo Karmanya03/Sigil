@@ -57,7 +57,7 @@ impl DaveSession {
         Self {
             state: SessionState::Disconnected,
             user_id,
-            protocol_version: 0,
+            protocol_version: crate::types::DAVE_PROTOCOL_VERSION,
             sender_ratchets: HashMap::new(),
             previous_ratchets: HashMap::new(),
             send_nonce: 0,

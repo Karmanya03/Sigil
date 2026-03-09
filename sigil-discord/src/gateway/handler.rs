@@ -67,8 +67,9 @@ pub fn dispatch(opcode: u8, payload: &[u8]) -> Result<DaveEvent, SigilError> {
         }
 
         DaveOpcode::MlsExternalSender => {
-            let data = if payload.len() > 3 {
-                &payload[3..]
+            // Binary: seq(2) + opcode(1) + transition_id(8) + credential
+            let data = if payload.len() > 11 {
+                &payload[11..]
             } else {
                 payload
             };
@@ -79,9 +80,9 @@ pub fn dispatch(opcode: u8, payload: &[u8]) -> Result<DaveEvent, SigilError> {
         }
 
         DaveOpcode::MlsProposals => {
-            // Binary payload: skip sequence_number(2) + opcode(1)
-            let data = if payload.len() > 3 {
-                &payload[3..]
+            // Binary: seq(2) + opcode(1) + transition_id(8) + type(1) + proposal
+            let data = if payload.len() > 11 {
+                &payload[11..]
             } else {
                 payload
             };
@@ -98,50 +99,38 @@ pub fn dispatch(opcode: u8, payload: &[u8]) -> Result<DaveEvent, SigilError> {
         }
 
         DaveOpcode::MlsAnnounceCommitTransition => {
-            // Binary: seq(2) + opcode(1) + transition_id(2) + commit
-            let data = if payload.len() > 3 {
-                &payload[3..]
+            // Binary: seq(2) + opcode(1) + transition_id(8) + commit
+            let (tid, data) = if payload.len() >= 11 {
+                let tid = u64::from_be_bytes([
+                    payload[3], payload[4], payload[5], payload[6],
+                    payload[7], payload[8], payload[9], payload[10],
+                ]);
+                (tid, &payload[11..])
             } else {
-                payload
-            };
-            let transition_id = if data.len() >= 2 {
-                u16::from_be_bytes([data[0], data[1]]) as u64
-            } else {
-                0
-            };
-            let commit_bytes = if data.len() > 2 {
-                data[2..].to_vec()
-            } else {
-                Vec::new()
+                (0, payload)
             };
             Ok(DaveEvent::MlsAnnounceCommitTransition(
                 MlsAnnounceCommitTransition {
-                    transition_id,
-                    commit_bytes,
+                    transition_id: tid,
+                    commit_bytes: data.to_vec(),
                 },
             ))
         }
 
         DaveOpcode::MlsWelcome => {
-            // Binary: seq(2) + opcode(1) + transition_id(2) + welcome
-            let data = if payload.len() > 3 {
-                &payload[3..]
+            // Binary: seq(2) + opcode(1) + transition_id(8) + welcome
+            let (tid, data) = if payload.len() >= 11 {
+                let tid = u64::from_be_bytes([
+                    payload[3], payload[4], payload[5], payload[6],
+                    payload[7], payload[8], payload[9], payload[10],
+                ]);
+                (tid, &payload[11..])
             } else {
-                payload
-            };
-            let transition_id = if data.len() >= 2 {
-                u16::from_be_bytes([data[0], data[1]]) as u64
-            } else {
-                0
-            };
-            let welcome_bytes = if data.len() > 2 {
-                data[2..].to_vec()
-            } else {
-                Vec::new()
+                (0, payload)
             };
             Ok(DaveEvent::MlsWelcome(MlsWelcomePayload {
-                transition_id,
-                welcome_bytes,
+                transition_id: tid,
+                welcome_bytes: data.to_vec(),
             }))
         }
 

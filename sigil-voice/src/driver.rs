@@ -150,11 +150,13 @@ impl CoreDriver {
         let ssrc_map = Arc::new(Mutex::new(std::collections::HashMap::new()));
         let ssrc_map_clone = ssrc_map.clone();
         let sigil_clone = sigil.clone();
+        let my_ssrc = ready.ssrc; // Correctly capture handshake SSRC
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(heartbeat_interval as u64));
             interval.tick().await; // skip first immediate tick
             let mut seq_ack: Option<u64> = None;
+            let mut binary_seq = 0u16;
             info!("🔄 Voice WS background task started (heartbeat={}ms)", heartbeat_interval);
 
             loop {
@@ -252,38 +254,82 @@ impl CoreDriver {
                                                     }
                                                 }
                                                 DaveEvent::ExecuteTransition(e) => {
-                                                    info!("DAVE: ExecuteTransition {:?}", e);
+                                                    info!("DAVE: ExecuteTransition (ID: {})", e.transition_id);
                                                 }
                                                 DaveEvent::MlsExternalSender(ext) => {
                                                     let _ = s.set_external_sender(&ext.credential);
-                                                    info!("DAVE: Processed OP 25 External Sender");
+                                                    let uid = s.user_id;
+                                                    let _ = s.export_sender_keys(&[uid]);
+                                                    info!("DAVE: Processed OP 25 External Sender (Group Created, Keys Exported)");
                                                 }
                                                 DaveEvent::MlsProposals(prop) => {
                                                     let _ = s.process_proposals(&[prop.data.clone()]);
                                                     if let Ok((commit_bytes, opt_welcome)) = s.commit_and_welcome() {
+                                                        let uid = s.user_id;
+                                                        let _ = s.export_sender_keys(&[uid]);
                                                         let mut payload = vec![0u8; 3];
+                                                        payload[0..2].copy_from_slice(&binary_seq.to_be_bytes());
+                                                        binary_seq = binary_seq.wrapping_add(1);
                                                         payload[2] = 28;
                                                         payload.extend_from_slice(&commit_bytes);
                                                         if let Some(w) = opt_welcome {
                                                             payload.extend_from_slice(&w);
                                                         }
                                                         let _ = ws_tx.send(tokio_tungstenite::tungstenite::Message::Binary(payload.into())).await;
-                                                        info!("DAVE: Sent OP 28 MlsCommitWelcome");
+                                                        info!("DAVE: Sent OP 28 MlsCommitWelcome (Keys Exported)");
+
+                                                        // Send OP 12 Encryption Ready
+                                                        let ready_packet = VoicePacket {
+                                                            op: 12,
+                                                            d: Some(serde_json::json!({
+                                                                "audio_ssrc": my_ssrc,
+                                                                                                "video_ssrc": 0,
+                                                                "rtx_ssrc": 0,
+                                                                "encryption_ready": true
+                                                            })),
+                                                            s: None, t: None, seq_ack: None,
+                                                        };
+                                                        if let Ok(text) = serde_json::to_string(&ready_packet) {
+                                                            let _ = ws_tx.send(tokio_tungstenite::tungstenite::Message::Text(text.into())).await;
+                                                            info!("DAVE: Sent OP 12 Encryption Ready (SSRC={})", my_ssrc);
+                                                        }
                                                     }
                                                 }
                                                 DaveEvent::MlsWelcome(w) => {
                                                     let _ = s.join_group(&w.welcome_bytes);
-                                                    info!("DAVE: ✅ Group joined via Welcome!");
+                                                    let uid = s.user_id;
+                                                    let _ = s.export_sender_keys(&[uid]);
+                                                    info!("DAVE: ✅ Group joined via Welcome! (Keys Exported)");
+
+                                                    // Send OP 12 Encryption Ready
+                                                    let ready_packet = VoicePacket {
+                                                        op: 12,
+                                                        d: Some(serde_json::json!({
+                                                            "audio_ssrc": my_ssrc,
+                                                            "video_ssrc": 0,
+                                                            "rtx_ssrc": 0,
+                                                            "encryption_ready": true
+                                                        })),
+                                                        s: None, t: None, seq_ack: None,
+                                                    };
+                                                    if let Ok(text) = serde_json::to_string(&ready_packet) {
+                                                        let _ = ws_tx.send(tokio_tungstenite::tungstenite::Message::Text(text.into())).await;
+                                                        info!("DAVE: Sent OP 12 Encryption Ready (SSRC={})", my_ssrc);
+                                                    }
                                                 }
                                                 DaveEvent::MlsAnnounceCommitTransition(c) => {
                                                     let _ = s.process_commit(&c.commit_bytes);
-                                                    info!("DAVE: Processed OP 29 Commit");
+                                                    let uid = s.user_id;
+                                                    let _ = s.export_sender_keys(&[uid]);
+                                                    info!("DAVE: Processed OP 29 Commit (Keys Exported)");
                                                 }
                                                 DaveEvent::PrepareEpoch(p) => {
                                                     info!("DAVE: PrepareEpoch {}", p.epoch);
                                                     if p.epoch == 1 {
                                                         if let Ok(kp) = s.generate_key_package() {
                                                             let mut payload = vec![0u8; 3];
+                                                            payload[0..2].copy_from_slice(&binary_seq.to_be_bytes());
+                                                            binary_seq = binary_seq.wrapping_add(1);
                                                             payload[2] = 26;
                                                             payload.extend_from_slice(&kp);
                                                             let _ = ws_tx.send(tokio_tungstenite::tungstenite::Message::Binary(payload.into())).await;
@@ -432,6 +478,13 @@ impl CoreDriver {
                 continue;
             }
 
+            // Log amplitude every 10 seconds
+            if frames_sent % 500 == 0 {
+                let sum: i64 = mixed_pcm.iter().map(|&s| s.abs() as i64).sum();
+                let avg = sum / mixed_pcm.len() as i64;
+                info!("🎙️ Mixed PCM Avg Amplitude: {} (frames_sent={})", avg, frames_sent);
+            }
+
             // --- 2. Encode to Opus ---
             let opus_len = match encoder.encode_pcm(&mixed_pcm, &mut opus_buf) {
                 Ok(n) => n,
@@ -448,16 +501,19 @@ impl CoreDriver {
                 match sigil_guard.encrypt_own_frame(opus_data, sigil_discord::crypto::codec::Codec::Opus) {
                     Ok(ct) => {
                         if dave_skip_count > 0 {
-                            info!("DAVE encryption now working (skipped {} frames while MLS was pending)", dave_skip_count);
+                            info!("🔊 DAVE encryption active! (skipped {} frames while MLS was pending)", dave_skip_count);
                             dave_skip_count = 0;
+                        }
+                        if frames_sent == 0 {
+                            info!("🔊 First DAVE-encrypted audio frame produced! Sending via UDP...");
                         }
                         ct
                     }
-                    Err(_) => {
+                    Err(e) => {
                         dave_skip_count += 1;
                         if dave_skip_count == 1 || dave_skip_count % 250 == 0 {
-                            // Log every 5 seconds (250 * 20ms)
-                            debug!("DAVE encrypt pending... (skipped {} frames so far)", dave_skip_count);
+                            info!("🔒 DAVE encrypt failed/pending: {:?} (dropped {} frames so far — established: {})", 
+                                e, dave_skip_count, sigil_guard.is_established());
                         }
                         continue;
                     }

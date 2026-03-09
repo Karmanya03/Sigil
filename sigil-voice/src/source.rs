@@ -1,6 +1,6 @@
 use std::process::Stdio;
 use tokio::process::Command;
-use tokio::io::{AsyncReadExt, BufReader};
+use tokio::io::{AsyncReadExt, AsyncBufReadExt, BufReader};
 use tracing::{info, error};
 use std::sync::Arc;
 
@@ -9,22 +9,29 @@ use std::sync::Arc;
 pub struct YtDlpSource;
 
 impl YtDlpSource {
-    /// Resolve a YouTube URL *or* a free-text search query into a direct media URL.
-    ///
-    /// Plain URLs are passed through unchanged.  Anything that doesn't start with `http`
-    /// is treated as a YouTube search and prefixed with `ytsearch1:`.
-    pub async fn get_direct_url(query: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        // If not a URL, treat as a YouTube search query
+    pub async fn get_direct_url_and_headers(query: &str) -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>> {
         let resolved_query = if query.starts_with("http://") || query.starts_with("https://") {
             query.to_string()
         } else {
             format!("ytsearch1:{}", query)
         };
 
-        let output = Command::new("yt-dlp")
-            .args(&["-f", "bestaudio", "-g", "--no-playlist", &resolved_query])
-            .output()
-            .await?;
+        let cookies_file = std::env::var("YOUTUBE_COOKIES").unwrap_or_else(|_| "cookies.txt".to_string());
+        
+        let mut cmd = Command::new("yt-dlp");
+        cmd.args(&[
+            "-f", "bestaudio", 
+            "--no-playlist", 
+            "-J", 
+        ]);
+        
+        if std::path::Path::new(&cookies_file).exists() {
+            cmd.arg("--cookies").arg(&cookies_file);
+        }
+        
+        cmd.arg(&resolved_query);
+
+        let output = cmd.output().await?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -32,48 +39,95 @@ impl YtDlpSource {
             return Err(format!("yt-dlp failed: {}", stderr.trim()).into());
         }
 
-        let link = String::from_utf8(output.stdout)?;
-        let url = link.trim().to_string();
+        let json_str = String::from_utf8(output.stdout)?;
+        let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
+        
+        let url = parsed.get("url")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+            
         if url.is_empty() {
-            return Err("yt-dlp returned an empty URL".into());
+            return Err("yt-dlp returned an empty URL in the JSON".into());
         }
+        
+        let mut header_str = String::new();
+        if let Some(headers) = parsed.get("http_headers").and_then(|v| v.as_object()) {
+            for (k, v) in headers {
+                if let Some(v_str) = v.as_str() {
+                    header_str.push_str(&format!("{}: {}\r\n", k, v_str));
+                }
+            }
+        }
+
         info!("Resolved direct URL (first 80 chars): {}", &url[..url.len().min(80)]);
-        Ok(url)
+        Ok((url, header_str))
     }
 
-    /// Spawn `ffmpeg` to stream PCM into a buffered channel.
-    /// This returns immediately; the streaming runs in a background task.
     pub async fn spawn_ffmpeg_stream(
         direct_url: &str,
+        headers: &str,
         pcm_tx: tokio::sync::mpsc::Sender<Vec<i16>>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let mut child = Command::new("ffmpeg")
-            // Flags for robust network stream reconnection
-            .args(&["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"])
-            .args(&["-i", direct_url])
-            .args(&["-f", "s16le", "-ar", "48000", "-ac", "2"]) // Raw PCM output
+        let mut cmd = Command::new("ffmpeg");
+        cmd.args(&["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"]);
+        
+        if !headers.is_empty() {
+            cmd.args(&["-headers", headers]);
+        }
+        
+        cmd.args(&["-i", direct_url])
+            .args(&["-f", "s16le", "-ar", "48000", "-ac", "2"])
             .arg("-")
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()?;
+            .stderr(Stdio::piped());
+            
+        let mut child = cmd.spawn()
+            .map_err(|e| {
+                error!("Failed to spawn ffmpeg: {}", e);
+                e
+            })?;
 
         let stdout = child.stdout.take().expect("Failed to open ffmpeg stdout");
-        let mut reader = BufReader::with_capacity(64 * 1024, stdout); // 64KB read buffer
+        let stderr = child.stderr.take().expect("Failed to open ffmpeg stderr");
 
-        // 20ms frame: 960 samples × 2 channels × 2 bytes = 3840 bytes
-        let mut chunk = vec![0u8; 3840];
+        // Atomic to signal when we have audio data
+        let got_audio = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let got_audio_clone = got_audio.clone();
 
         tokio::spawn(async move {
-            // Keep child alive for the duration of the stream
-            let _child = child;
+            let mut reader = BufReader::new(stderr);
+            let mut line = String::new();
+            while let Ok(n) = reader.read_line(&mut line).await {
+                if n == 0 { break; }
+                let l = line.trim();
+                if l.is_empty() { continue; }
+
+                // Log everything until we get frames, so we can see 403 or connection errors
+                if !got_audio_clone.load(std::sync::atomic::Ordering::SeqCst) {
+                    info!("FFmpeg Init: {}", l);
+                } else if l.to_lowercase().contains("error") || l.to_lowercase().contains("failed") {
+                    error!("FFmpeg Error: {}", l);
+                }
+                line.clear();
+            }
+        });
+
+        let mut reader = BufReader::with_capacity(64 * 1024, stdout);
+
+        tokio::spawn(async move {
+            let _child = child; // Guard
+
+            let mut chunk = vec![0u8; 3840];
+            let mut frames_produced: u64 = 0;
+
             loop {
                 let mut bytes_read = 0;
-                // Fill exactly one 20ms frame
                 while bytes_read < 3840 {
                     match reader.read(&mut chunk[bytes_read..]).await {
                         Ok(0) => {
-                            info!("ffmpeg PCM stream ended (EOF)");
-                            return; // EOF — drain complete
+                            info!("ffmpeg PCM stream ended (EOF) after {} frames", frames_produced);
+                            return;
                         }
                         Ok(n) => bytes_read += n,
                         Err(e) => {
@@ -83,15 +137,23 @@ impl YtDlpSource {
                     }
                 }
 
-                // Convert raw LE bytes to i16 samples
+                if frames_produced == 0 {
+                    got_audio.store(true, std::sync::atomic::Ordering::SeqCst);
+                    info!("🎞️ FFmpeg started producing PCM frames");
+                }
+
                 let pcm_frame: Vec<i16> = chunk
                     .chunks_exact(2)
                     .map(|b| i16::from_le_bytes([b[0], b[1]]))
                     .collect();
 
-                // Back-pressure: if the mixer is slow, we block here rather than drop frames
+                frames_produced += 1;
+                if frames_produced % 250 == 0 {
+                    info!("🎞️ Track Heartbeat: Produced {} frames (~{}s)", frames_produced, frames_produced / 50);
+                }
+
                 if pcm_tx.send(pcm_frame).await.is_err() {
-                    info!("PCM receiver dropped — stopping ffmpeg stream");
+                    info!("PCM receiver dropped — stopping stream");
                     break;
                 }
             }
@@ -100,13 +162,10 @@ impl YtDlpSource {
         Ok(())
     }
 
-    /// High-level helper: resolve a URL or search query → spawn ffmpeg → return a ready `Track`.
     pub async fn create_track(query: &str) -> Result<crate::track::Track, Box<dyn std::error::Error + Send + Sync>> {
-        let direct_url = Self::get_direct_url(query).await?;
-        // Channel capacity of 256 = ~5 seconds of buffer. Gives FFmpeg time to start up
-        // before the mixer needs the first frame, preventing a premature "track ended" signal.
+        let (direct_url, headers) = Self::get_direct_url_and_headers(query).await?;
         let (tx, rx) = tokio::sync::mpsc::channel(256);
-        Self::spawn_ffmpeg_stream(&direct_url, tx).await?;
+        Self::spawn_ffmpeg_stream(&direct_url, &headers, tx).await?;
 
         use crate::track::{Track, PlayState, ChannelSource};
         use std::sync::atomic::AtomicU8;
@@ -119,7 +178,6 @@ impl YtDlpSource {
         })
     }
 
-    /// Convenience: call `create_track` directly with a search query (alias for clarity).
     pub async fn search_and_play(query: &str) -> Result<crate::track::Track, Box<dyn std::error::Error + Send + Sync>> {
         Self::create_track(query).await
     }
