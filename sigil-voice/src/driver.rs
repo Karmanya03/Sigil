@@ -13,7 +13,7 @@ pub struct CoreDriver {
     pub sigil: Arc<Mutex<SigilSession>>,
     pub mode: Option<String>,
     pub secret_key: Option<Vec<u8>>,
-    pub ws_tx_channel: mpsc::Sender<VoicePacket>,
+    pub ws_tx_channel: mpsc::Sender<crate::gateway::WsMessage>,
 }
 
 impl CoreDriver {
@@ -79,7 +79,7 @@ impl CoreDriver {
 
         // 7. Spawn Background Task for WS (Heartbeats, DAVE Opcodes)
         let (mut ws_tx, mut ws_rx) = gateway.ws.split();
-        let (cmd_tx, mut cmd_rx) = mpsc::channel::<VoicePacket>(100);
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<crate::gateway::WsMessage>(100);
         let sigil_clone = sigil.clone();
 
         tokio::spawn(async move {
@@ -107,10 +107,20 @@ impl CoreDriver {
                     }
                     cmd_opt = cmd_rx.recv() => {
                         let Some(cmd) = cmd_opt else { break; };
-                        if let Ok(text) = serde_json::to_string(&cmd) {
-                            if ws_tx.send(tokio_tungstenite::tungstenite::Message::Text(text.into())).await.is_err() {
-                                break;
+                        let msg = match cmd {
+                            crate::gateway::WsMessage::Text(p) => {
+                                if let Ok(text) = serde_json::to_string(&p) {
+                                    tokio_tungstenite::tungstenite::Message::Text(text.into())
+                                } else {
+                                    continue;
+                                }
                             }
+                            crate::gateway::WsMessage::Binary(bin) => {
+                                tokio_tungstenite::tungstenite::Message::Binary(bin.into())
+                            }
+                        };
+                        if ws_tx.send(msg).await.is_err() {
+                            break;
                         }
                     }
                     msg_opt = ws_rx.next() => {
@@ -134,23 +144,49 @@ impl CoreDriver {
                                         use sigil_discord::gateway::handler::DaveEvent;
                                         match event {
                                             DaveEvent::PrepareTransition(p) => {
-                                                // Acknowledge transition with OP 23 ReadyForTransition
-                                                let payload = vec![0u8, 0u8, 23, 0u8, 0u8]; // Dummy OP 23 for stub processing
-                                                let _ = ws_tx.send(tokio_tungstenite::tungstenite::Message::Binary(payload.into())).await;
-                                                tracing::info!("Acknowledged Dave PrepareTransition {:?}", p);
+                                                let ready = sigil_discord::gateway::opcodes::ReadyForTransition {
+                                                    transition_id: p.transition_id,
+                                                };
+                                                let packet = VoicePacket {
+                                                    op: 23,
+                                                    d: Some(serde_json::to_value(ready).unwrap_or_default()),
+                                                    s: None, t: None, seq_ack: None,
+                                                };
+                                                if let Ok(text) = serde_json::to_string(&packet) {
+                                                    let _ = ws_tx.send(tokio_tungstenite::tungstenite::Message::Text(text.into())).await;
+                                                    tracing::info!("Sent OP 23 ReadyForTransition for {:?}", p.transition_id);
+                                                }
                                             }
                                             DaveEvent::ExecuteTransition(e) => {
                                                 tracing::info!("Executing Dave Transition {:?}", e);
                                             }
+                                            DaveEvent::MlsExternalSender(ext) => {
+                                                // ext.credential contains the full blended binary payload from OP 25
+                                                let _ = s.set_external_sender(&ext.credential);
+                                                tracing::info!("Processed DAVE OP 25 External Sender");
+                                            }
+                                            DaveEvent::MlsProposals(prop) => {
+                                                let _ = s.process_proposals(&[prop.data.clone()]);
+                                                if let Ok((commit_bytes, opt_welcome)) = s.commit_and_welcome() {
+                                                    let mut payload = vec![0u8; 3];
+                                                    payload[2] = 28; // OP 28 MlsCommitWelcome
+                                                    payload.extend_from_slice(&commit_bytes);
+                                                    if let Some(w) = opt_welcome {
+                                                        payload.extend_from_slice(&w);
+                                                    }
+                                                    let _ = ws_tx.send(tokio_tungstenite::tungstenite::Message::Binary(payload.into())).await;
+                                                }
+                                            }
                                             DaveEvent::MlsWelcome(w) => {
                                                 let _ = s.join_group(&w.welcome_bytes);
+                                                tracing::info!("DAVE Group successfully joined!");
                                             }
                                             DaveEvent::MlsAnnounceCommitTransition(c) => {
                                                 let _ = s.process_commit(&c.commit_bytes);
+                                                tracing::info!("DAVE Processed OP 29 Announce Commit");
                                             }
                                             DaveEvent::PrepareEpoch(p) => {
                                                 if p.epoch == 1 {
-                                                    // Send KeyPackage (OP 26)
                                                     if let Ok(kp) = s.generate_key_package() {
                                                         let mut payload = vec![0u8; 3];
                                                         payload[2] = 26; // OP 26 MlsKeyPackage
@@ -158,9 +194,6 @@ impl CoreDriver {
                                                         let _ = ws_tx.send(tokio_tungstenite::tungstenite::Message::Binary(payload.into())).await;
                                                     }
                                                 }
-                                            }
-                                            _ => {
-                                                tracing::debug!("Parsed DAVE opcode: {:?}", opcode);
                                             }
                                         }
                                     }
@@ -194,11 +227,11 @@ impl CoreDriver {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Send OP 5 Speaking Before Audio Payload Dispatch
         let speaking = crate::gateway::Speaking { speaking: 1, delay: 0, ssrc };
-        self.ws_tx_channel.send(VoicePacket {
+        self.ws_tx_channel.send(crate::gateway::WsMessage::Text(VoicePacket {
             op: 5,
             d: Some(serde_json::to_value(speaking)?),
             s: None, t: None, seq_ack: None,
-        }).await?;
+        })).await?;
 
         let mut encoder = crate::audio::AudioEncoder::new()?;
         let mut seq = 0u16;
@@ -210,7 +243,13 @@ impl CoreDriver {
         // 960 samples per channel (stereo) = 1920 i16s per 20ms frame
         let mut opus_buf = [0u8; 4000];
 
+        // 20ms exact tick interval for real-time delivery
+        let mut ticker = tokio::time::interval(std::time::Duration::from_millis(20));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
         while let Some(pcm_frame) = pcm_rx.recv().await {
+            ticker.tick().await;
+
             // 1. Encode PCM to Opus
             let opus_len = encoder.encode_pcm(&pcm_frame, &mut opus_buf)?;
             let opus_data = &opus_buf[..opus_len];
@@ -239,6 +278,7 @@ impl CoreDriver {
         // 6. Send 5 frames of Silence (0xF8 0xFF 0xFE) to gracefully terminate playback
         let silence_opus = [0xF8, 0xFF, 0xFE];
         for _ in 0..5 {
+            ticker.tick().await;
             let dave_ciphertext = {
                 let mut sigil = self.sigil.lock().await;
                 sigil.encrypt_own_frame(&silence_opus, sigil_discord::crypto::codec::Codec::Opus)?

@@ -284,6 +284,70 @@ async fn play_youtube_audio(
 }
 ```
 
+#### Modern Bot Integration (Serenity Commands)
+
+If you are using the `SigilVoiceManager` inside your `TypeMap`, your command handlers become extremely clean. Sigil handles all the DAVE transitions and Voice state synchronization in the background.
+
+```rust
+use sigil_voice::serenity_hook::SigilVoiceManager;
+use sigil_voice::source::YtDlpSource;
+
+#[command]
+async fn play(ctx: &Context, msg: &Message, mut args: Args) -> CommandResult {
+    let url = args.single::<String>()?;
+    let guild_id = msg.guild_id.ok_or("Must be in a guild")?;
+
+    // 1. Join the voice channel using Serenity's native connect
+    // This triggers the Discord events that SigilVoiceManager traps.
+    let channel_id = msg.guild(&ctx.cache).unwrap()
+        .voice_states.get(&msg.author.id)
+        .and_then(|vs| vs.channel_id)
+        .ok_or("You must be in a voice channel!")?;
+
+    let _ = guild_id.connect_rescription(ctx, channel_id).await;
+
+    // 2. Access the Sigil manager from your bot's data
+    let data = ctx.data.read().await;
+    let manager = data.get::<SigilVoiceManager>().expect("SigilVoiceManager not initialized");
+    
+    // 3. Retrieve the auto-initialized driver
+    // We wait a moment for the handshake (Ready + SessionDescription) to complete
+    let driver_lock = loop {
+        if let Some(d) = manager.get_driver(guild_id).await { break d; }
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    };
+
+    // 4. Stream music!
+    let mut driver = driver_lock.lock().await;
+    let (pcm_tx, pcm_rx) = tokio::sync::mpsc::channel(128);
+    
+    // Resolve YouTube and spawn ffmpeg
+    let direct_url = YtDlpSource::get_direct_url(&url).await?;
+    YtDlpSource::spawn_ffmpeg_stream(&direct_url, pcm_tx).await?;
+
+    // Sigil handles Opus encoding, DAVE encryption, and 20ms rhythmic pacing.
+    // Note: SSRC/IP/Port are typically extracted from the Ready event.
+    driver.play_pcm_stream(pcm_rx, 12345, "127.0.0.1", 50000).await?;
+
+    Ok(())
+}
+
+#[command]
+async fn stop(ctx: &Context, msg: &Message) -> CommandResult {
+    let guild_id = msg.guild_id.unwrap();
+    let data = ctx.data.read().await;
+    let manager = data.get::<SigilVoiceManager>().unwrap();
+
+    if let Some(driver_lock) = manager.get_driver(guild_id).await {
+        // Dropping the driver or stopping the stream channel will 
+        // trigger Sigil's automatic 5-frame Silence termination.
+        manager.drivers.lock().await.remove(&guild_id);
+        msg.reply(ctx, "⏹️ Sigil session terminated safely.").await?;
+    }
+    Ok(())
+}
+```
+
 > **Requirements:** The `sigil-voice` audio pipeline relies on `audiopus` which requires `CMake` installed to compile the C-bindings for Opus. If you hit a CMake error on Windows, make sure Visual Studio Build Tools (C++ workload) is installed, or `libopus-dev` on Linux.
 
 ## Project Structure

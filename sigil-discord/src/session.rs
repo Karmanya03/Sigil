@@ -136,6 +136,36 @@ impl SigilSession {
         Ok(())
     }
 
+    /// Set the external sender credentials received from the Voice Gateway.
+    pub fn set_external_sender(&mut self, payload: &[u8]) -> Result<(), SigilError> {
+        use openmls::prelude::tls_codec::Deserialize;
+        let mut cursor = std::io::Cursor::new(payload);
+        
+        let credential = Credential::tls_deserialize(&mut cursor)
+            .map_err(|e| SigilError::Mls(format!("credential deserialize: {}", e)))?;
+        
+        // The remaining bytes are the gateway's public signature key
+        let pos = cursor.position() as usize;
+        let signature_key = payload[pos..].to_vec();
+        
+        // Directly cache it as the group initializer parameters and create group.
+        self.create_group(credential, signature_key)
+    }
+
+    /// Process incoming OP 27 proposals (Append / Revoke) from the Voice server.
+    pub fn process_proposals(&mut self, operations: &[Vec<u8>]) -> Result<(), SigilError> {
+        let group = self.group.as_mut().ok_or(SigilError::GroupNotEstablished)?;
+        group.process_proposals(operations, &self.provider)?;
+        Ok(())
+    }
+
+    /// Resolve pending proposals by committing and issuing a Welcome buffer.
+    pub fn commit_and_welcome(&mut self) -> Result<(Vec<u8>, Option<Vec<u8>>), SigilError> {
+        let group = self.group.as_mut().ok_or(SigilError::GroupNotEstablished)?;
+        let signer = &self.identity.signature_keys;
+        group.commit_pending(&self.provider, signer)
+    }
+
     /// Generate a key package for other group members to add us.
     ///
     /// Send the returned bytes to the gateway so other members can

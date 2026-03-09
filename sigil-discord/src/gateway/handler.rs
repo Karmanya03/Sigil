@@ -67,17 +67,14 @@ pub fn dispatch(opcode: u8, payload: &[u8]) -> Result<DaveEvent, SigilError> {
         }
 
         DaveOpcode::MlsExternalSender => {
-            // Binary payload: skip sequence_number(2) + opcode(1) header
-            // then parse ExternalSender struct
-            // For now, store the raw bytes for the MLS layer to parse
             let data = if payload.len() > 3 {
                 &payload[3..]
             } else {
                 payload
             };
             Ok(DaveEvent::MlsExternalSender(MlsExternalSenderPayload {
-                credential: Vec::new(), // will be parsed by MLS layer
-                signature_key: data.to_vec(),
+                credential: data.to_vec(),
+                signature_key: Vec::new(),
             }))
         }
 
