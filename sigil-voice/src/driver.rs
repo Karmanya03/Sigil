@@ -133,6 +133,15 @@ impl CoreDriver {
                                     if let Ok(event) = s.handle_gateway_event(opcode, &bin) {
                                         use sigil_discord::gateway::handler::DaveEvent;
                                         match event {
+                                            DaveEvent::PrepareTransition(p) => {
+                                                // Acknowledge transition with OP 23 ReadyForTransition
+                                                let payload = vec![0u8, 0u8, 23, 0u8, 0u8]; // Dummy OP 23 for stub processing
+                                                let _ = ws_tx.send(tokio_tungstenite::tungstenite::Message::Binary(payload.into())).await;
+                                                tracing::info!("Acknowledged Dave PrepareTransition {:?}", p);
+                                            }
+                                            DaveEvent::ExecuteTransition(e) => {
+                                                tracing::info!("Executing Dave Transition {:?}", e);
+                                            }
                                             DaveEvent::MlsWelcome(w) => {
                                                 let _ = s.join_group(&w.welcome_bytes);
                                             }
