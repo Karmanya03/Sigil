@@ -2,6 +2,7 @@ use std::process::Stdio;
 use tokio::process::Command;
 use tokio::io::{AsyncReadExt, BufReader};
 use tracing::{info, error};
+use std::sync::Arc;
 
 /// A utility to spawn `yt-dlp` to resolve a URL into a direct playable audio stream,
 /// and then pipe it into `ffmpeg` to convert it to 48kHz, 16-bit, stereo PCM.

@@ -73,7 +73,7 @@ impl SigilVoiceManager {
     /// Once the triad completes, it fully connects the CoreDriver automatically!
     async fn check_and_connect(&self, guild_id: GuildId) {
         let args = {
-            let mut p = self.pending.lock().await;
+            let p = self.pending.lock().await;
             let Some(entry) = p.get(&guild_id) else { return };
             if !entry.is_ready() {
                 return;

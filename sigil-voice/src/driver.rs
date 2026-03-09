@@ -17,6 +17,9 @@ pub struct CoreDriver {
     pub tracks: Arc<Mutex<Vec<crate::track::TrackHandle>>>,
     pub ssrc: u32,
     pub target_addr: String,
+    pub ssrc_map: Arc<Mutex<std::collections::HashMap<u32, u64>>>,
+    pub receiver_tx: Option<mpsc::UnboundedSender<(u64, Vec<i16>)>>,
+    pub decoders: Arc<Mutex<std::collections::HashMap<u64, crate::audio::AudioDecoder>>>,
 }
 
 impl CoreDriver {
@@ -83,6 +86,8 @@ impl CoreDriver {
         // 7. Spawn Background Task for WS (Heartbeats, DAVE Opcodes)
         let (mut ws_tx, mut ws_rx) = gateway.ws.split();
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<crate::gateway::WsMessage>(100);
+        let ssrc_map = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let ssrc_map_clone = ssrc_map.clone();
         let sigil_clone = sigil.clone();
 
         tokio::spawn(async move {
@@ -136,6 +141,18 @@ impl CoreDriver {
                                     }
                                     if packet.op == 6 {
                                         tracing::debug!("Received Heartbeat ACK");
+                                    } else if packet.op == 5 {
+                                        if let Some(d) = packet.d {
+                                            if let Ok(spk) = serde_json::from_value::<crate::gateway::Speaking>(d) {
+                                                if let Some(uid_str) = spk.user_id {
+                                                    if let Ok(uid) = uid_str.parse::<u64>() {
+                                                        let mut map = ssrc_map_clone.lock().await;
+                                                        map.insert(spk.ssrc, uid);
+                                                        tracing::debug!("Mapped SSRC {} to UserId {}", spk.ssrc, uid);
+                                                    }
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }
@@ -217,7 +234,10 @@ impl CoreDriver {
             ws_tx_channel: cmd_tx,
             tracks: Arc::new(Mutex::new(Vec::new())),
             ssrc: ready.ssrc,
-            target_addr: target,
+            target_addr: ready.ip + ":" + &ready.port.to_string(),
+            ssrc_map,
+            receiver_tx: None,
+            decoders: Arc::new(Mutex::new(std::collections::HashMap::new())),
         })
     }
 
@@ -241,7 +261,7 @@ impl CoreDriver {
     /// encodes to Opus, encrypts via DAVE, and ships via UDP.
     pub async fn start_mixing(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // Send OP 5 Speaking Before Audio Payload Dispatch
-        let speaking = crate::gateway::Speaking { speaking: 1, delay: 0, ssrc: self.ssrc };
+        let speaking = crate::gateway::Speaking { speaking: 1, delay: 0, ssrc: self.ssrc, user_id: None };
         self.ws_tx_channel.send(crate::gateway::WsMessage::Text(VoicePacket {
             op: 5,
             d: Some(serde_json::to_value(speaking)?),
@@ -338,4 +358,71 @@ impl CoreDriver {
         }
     }
 
+    /// Start the background UDP receiver task to handle incoming audio.
+    pub async fn start_receiver(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let udp = self.udp.clone();
+        let sigil = self.sigil.clone();
+        let ssrc_map = self.ssrc_map.clone();
+        let decoders = self.decoders.clone();
+        let receiver_tx = self.receiver_tx.clone().ok_or("No receiver channel configured")?;
+        let secret_key = self.secret_key.clone().ok_or("No secret key negotiated")?;
+
+        tokio::spawn(async move {
+            let mut buf = [0u8; 4096];
+            let mut pcm_out = [0i16; 1920]; 
+
+            loop {
+                match udp.recv_from(&mut buf).await {
+                    Ok((n, _addr)) => {
+                        let packet = &buf[..n];
+                        if n < 12 { continue; } // Too short for RTP
+
+                        // 1. Extract RTP Header
+                        let ssrc = u32::from_be_bytes([packet[8], packet[9], packet[10], packet[11]]);
+                        
+                        // 2. Transport Decrypt
+                        let decrypted_rtp = match crate::udp::transport_decrypt_rtpsize(&secret_key, packet) {
+                            Ok(d) => d,
+                            Err(_) => continue,
+                        };
+
+                        // 3. Sigil DAVE Decrypt (requires UserId)
+                        let mut user_id = 0u64;
+                        {
+                            let map = ssrc_map.lock().await;
+                            if let Some(&uid) = map.get(&ssrc) {
+                                user_id = uid;
+                            }
+                        }
+
+                        if user_id == 0 { continue; } // Unknown sender
+
+                        let dave_decrypted = {
+                            let s = sigil.lock().await;
+                            match s.decrypt_from_sender(user_id, &decrypted_rtp) {
+                                Ok(d) => d,
+                                Err(_) => continue,
+                            }
+                        };
+
+                        // 4. Decode Opus to PCM
+                        let mut decs = decoders.lock().await;
+                        let decoder = decs.entry(user_id).or_insert_with(|| {
+                            crate::audio::AudioDecoder::new().expect("Failed to create decoder")
+                        });
+
+                        if let Ok(samples) = decoder.decode_opus(&dave_decrypted, &mut pcm_out) {
+                            let _ = receiver_tx.send((user_id, pcm_out[..samples].to_vec()));
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("UDP Receiver error: {:?}", e);
+                        break;
+                    }
+                }
+            }
+        });
+
+        Ok(())
+    }
 }

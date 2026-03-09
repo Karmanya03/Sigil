@@ -48,6 +48,16 @@ pub struct TrackHandle {
     pub event_rx: Option<tokio::sync::mpsc::UnboundedReceiver<TrackEvent>>,
 }
 
+impl Clone for TrackHandle {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            state: self.state.clone(),
+            event_rx: None, // Only the original handle can have the receiver
+        }
+    }
+}
+
 impl TrackHandle {
     pub fn new(mut track: Track) -> Self {
         let state = track.state.clone();
@@ -73,17 +83,17 @@ impl TrackHandle {
     }
 
     pub async fn play(&self) {
-        let mut t = self.inner.lock().await;
+        let t = self.inner.lock().await;
         t.state.store(PlayState::Playing as u8, Ordering::SeqCst);
     }
 
     pub async fn pause(&self) {
-        let mut t = self.inner.lock().await;
+        let t = self.inner.lock().await;
         t.state.store(PlayState::Paused as u8, Ordering::SeqCst);
     }
 
     pub async fn stop(&self) {
-        let mut t = self.inner.lock().await;
+        let t = self.inner.lock().await;
         t.state.store(PlayState::Stopped as u8, Ordering::SeqCst);
     }
 
@@ -93,7 +103,7 @@ impl TrackHandle {
     }
 
     pub async fn get_state(&self) -> PlayState {
-        self.inner.lock().await.state
+        PlayState::from(self.state.load(Ordering::Relaxed))
     }
 }
 

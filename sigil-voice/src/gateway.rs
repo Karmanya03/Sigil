@@ -18,6 +18,8 @@ pub struct Speaking {
     pub speaking: u8,
     pub delay: u32,
     pub ssrc: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
