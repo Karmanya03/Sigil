@@ -113,6 +113,15 @@ pub struct ChannelSource {
 
 impl AudioSource for ChannelSource {
     fn read_frame(&mut self) -> Option<Vec<i16>> {
-        self.receiver.try_recv().ok()
+        match self.receiver.try_recv() {
+            Ok(frame) => Some(frame),
+            // Buffer is momentarily empty but sender still alive (FFmpeg buffering up)
+            // Return silence rather than None so the mixer doesn't kill the track prematurely.
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => {
+                Some(vec![0i16; 1920]) // 20ms of silence (960 stereo samples)
+            }
+            // Sender dropped = stream is truly finished
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => None,
+        }
     }
 }
