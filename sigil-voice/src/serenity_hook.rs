@@ -1,201 +1,165 @@
-use crate::call::Call;
-use crate::driver::CoreDriver;
-use serenity::all::{ChannelId, GuildId, VoiceServerUpdateEvent, VoiceState};
-use serenity::gateway::ShardMessenger;
+/// Sigil Voice — Serenity Integration
+///
+/// Implements [`VoiceGatewayManager`] so Serenity automatically delivers all voice events
+/// (VOICE_STATE_UPDATE and VOICE_SERVER_UPDATE) directly to Sigil without the user having
+/// to manually route events in their `EventHandler`.
+///
+/// # Setup
+///
+/// ```rust,no_run
+/// use sigil_voice::serenity_hook::SigilVoiceManager;
+/// use std::sync::Arc;
+///
+/// #[tokio::main]
+/// async fn main() {
+///     let token = std::env::var("DISCORD_TOKEN").unwrap();
+///     let sigil = Arc::new(SigilVoiceManager::default());
+///
+///     let mut client = serenity::Client::builder(&token, GatewayIntents::non_privileged()
+///         | GatewayIntents::GUILD_VOICE_STATES)
+///         .event_handler(MyHandler)
+///         // This single line plugs Sigil into Serenity's gateway — no EventHandler required!
+///         .voice_manager_arc(sigil.clone())
+///         .await.unwrap();
+///
+///     // Also put the manager in TypeMap so commands can reach it
+///     client.data.write().await.insert::<SigilVoiceManagerKey>(sigil);
+///     client.start().await.unwrap();
+/// }
+/// ```
+///
+/// # Joining/Leaving
+///
+/// ```rust,no_run
+/// // In a command:
+/// let data = ctx.data.read().await;
+/// let mgr = data.get::<SigilVoiceManagerKey>().unwrap();
+/// mgr.join(&ctx.shard, guild_id, channel_id).await;
+/// ```
+use futures::channel::mpsc::UnboundedSender;
+use serenity::async_trait;
+use serenity::all::{ChannelId, GuildId, ShardRunnerMessage, UserId};
+use serenity::gateway::VoiceGatewayManager;
+use serenity::model::voice::VoiceState;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
+use tokio_tungstenite::tungstenite::Message as WsMessage;
+
+use crate::call::Call;
+use crate::driver::CoreDriver;
+
+// ──────────────────────────────────────────────────────────────────────────────
+// Pending connection state
+// ──────────────────────────────────────────────────────────────────────────────
 
 #[derive(Default)]
-pub struct PendingConnection {
-    pub session_id: Option<String>,
-    pub endpoint: Option<String>,
-    pub token: Option<String>,
+struct PendingConnection {
+    session_id: Option<String>,
+    endpoint:   Option<String>,
+    token:      Option<String>,
+    channel_id: Option<ChannelId>,
 }
 
 impl PendingConnection {
-    pub fn is_ready(&self) -> bool {
+    fn is_ready(&self) -> bool {
         self.session_id.is_some() && self.endpoint.is_some() && self.token.is_some()
     }
 }
 
-/// The main gateway state manager for routing Serenity Voice events to Sigil's driver.
-/// Acts as a drop-in replacement for the `Songbird` typemap instance.
+// ──────────────────────────────────────────────────────────────────────────────
+// SigilVoiceManager
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Drop-in replacement for Songbird. Register once with `.voice_manager_arc()` on the
+/// `ClientBuilder` and Serenity handles all the plumbing automatically.
 pub struct SigilVoiceManager {
-    user_id: u64,
-    pending: Arc<Mutex<HashMap<GuildId, PendingConnection>>>,
+    /// bot's own user_id — set by `initialise()`
+    user_id:  Mutex<u64>,
+    /// shard_id → UnboundedSender (for sending Gateway OP 4)
+    shards:   Mutex<HashMap<u32, UnboundedSender<ShardRunnerMessage>>>,
+    /// guild_id → pending session info
+    pending:  Arc<Mutex<HashMap<GuildId, PendingConnection>>>,
+    /// guild_id → active Call handle
     pub calls: Arc<Mutex<HashMap<GuildId, Arc<Call>>>>,
 }
 
-impl SigilVoiceManager {
-    /// Initialize a new Voice Manager tracking the host Bot's user ID.
-    pub fn new(user_id: u64) -> Self {
+impl Default for SigilVoiceManager {
+    fn default() -> Self {
         Self {
-            user_id,
+            user_id: Mutex::new(0),
+            shards:  Mutex::new(HashMap::new()),
             pending: Arc::new(Mutex::new(HashMap::new())),
-            calls: Arc::new(Mutex::new(HashMap::new())),
+            calls:   Arc::new(Mutex::new(HashMap::new())),
         }
     }
+}
 
-    /// **Primary API** — Send Gateway OP 4 (Voice State Update) through the Discord WebSocket
-    /// to physically move the bot into a voice channel.  Discord responds with the OP 4
-    /// `VoiceStateUpdate` and `VoiceServerUpdate` events that `SigilVoiceManager` traps in order
-    /// to bootstrap the `CoreDriver` automatically.
-    ///
-    /// # Example
-    /// ```rust,no_run
-    /// manager.join(&ctx.shard, guild_id, channel_id).await;
-    /// ```
-    pub async fn join(&self, shard: &ShardMessenger, guild_id: GuildId, channel_id: ChannelId) {
-        // Tear down any existing session for this guild first
-        {
-            let mut calls = self.calls.lock().await;
-            calls.remove(&guild_id);
-        }
-        {
-            let mut pending = self.pending.lock().await;
-            pending.remove(&guild_id);
-        }
+impl SigilVoiceManager {
+    // ── Public API ─────────────────────────────────────────────────────────
 
-        tracing::info!(
-            "Sending OP 4 VoiceStateUpdate to join guild={} channel={}",
-            guild_id,
-            channel_id
-        );
-
-        // Discord Gateway OP 4: Update Voice State
-        // https://discord.com/developers/docs/topics/gateway-events#update-voice-state
-        let payload = serde_json::json!({
-            "op": 4,
-            "d": {
-                "guild_id": guild_id.get().to_string(),
-                "channel_id": channel_id.get().to_string(),
-                "self_mute": false,
-                "self_deaf": false
-            }
-        });
-
-        match serde_json::to_string(&payload) {
-            Ok(json) => {
-                use serenity::all::ShardRunnerMessage;
-                shard.send_to_shard(ShardRunnerMessage::Message(
-                    tokio_tungstenite::tungstenite::Message::Text(json.into()),
-                ));
-            }
-            Err(e) => tracing::error!("Failed to serialize OP 4 join payload: {}", e),
-        }
+    /// Move the bot into `channel_id` in `guild_id`.
+    /// Sends Gateway OP 4 via the shard's messenger.
+    pub async fn join(&self, guild_id: GuildId, channel_id: ChannelId) {
+        self.update_voice_state(guild_id, Some(channel_id)).await;
     }
 
-    /// **Primary API** — Disconnect the bot from any voice channel in the given guild.
-    /// Sends Gateway OP 4 with `channel_id: null` and cleans up the local `CoreDriver` session.
-    ///
-    /// # Example
-    /// ```rust,no_run
-    /// manager.leave(&ctx.shard, guild_id).await;
-    /// ```
-    pub async fn leave(&self, shard: &ShardMessenger, guild_id: GuildId) {
-        tracing::info!("Sending OP 4 VoiceStateUpdate to leave guild={}", guild_id);
-
-        let payload = serde_json::json!({
-            "op": 4,
-            "d": {
-                "guild_id": guild_id.get().to_string(),
-                "channel_id": null,
-                "self_mute": false,
-                "self_deaf": false
-            }
-        });
-
-        match serde_json::to_string(&payload) {
-            Ok(json) => {
-                use serenity::all::ShardRunnerMessage;
-                shard.send_to_shard(ShardRunnerMessage::Message(
-                    tokio_tungstenite::tungstenite::Message::Text(json.into()),
-                ));
-            }
-            Err(e) => tracing::error!("Failed to serialize OP 4 leave payload: {}", e),
-        }
-
-        // Cleanup local state
-        let mut calls = self.calls.lock().await;
-        calls.remove(&guild_id);
-        drop(calls);
-        let mut pending = self.pending.lock().await;
-        pending.remove(&guild_id);
+    /// Disconnect the bot from voice in `guild_id`.
+    pub async fn leave(&self, guild_id: GuildId) {
+        self.update_voice_state(guild_id, None).await;
+        // Tear down the active Call
+        self.calls.lock().await.remove(&guild_id);
+        self.pending.lock().await.remove(&guild_id);
     }
 
-    /// Retrieve an active Call handle for a specific Guild, if it exists.
+    /// Retrieve the active `Call` for a guild, if one exists.
     pub async fn get_call(&self, guild_id: GuildId) -> Option<Arc<Call>> {
-        let calls = self.calls.lock().await;
-        calls.get(&guild_id).cloned()
+        self.calls.lock().await.get(&guild_id).cloned()
     }
 
-    /// Wire this into your Serenity `EventHandler::voice_state_update`.
-    /// Traps the bot's own VoiceStateUpdate so we get the session_id.
-    pub async fn handle_voice_state(&self, state: &VoiceState) {
-        if state.user_id.get() != self.user_id {
-            return;
+    // ── Internal helpers ────────────────────────────────────────────────────
+
+    /// Send Gateway OP 4 (Voice State Update) to Discord via shards map.
+    async fn update_voice_state(&self, guild_id: GuildId, channel_id: Option<ChannelId>) {
+        let channel_val = match channel_id {
+            Some(c) => serde_json::Value::String(c.get().to_string()),
+            None    => serde_json::Value::Null,
+        };
+        let payload = serde_json::json!({
+            "op": 4,
+            "d": {
+                "guild_id":  guild_id.get().to_string(),
+                "channel_id": channel_val,
+                "self_mute": false,
+                "self_deaf": false
+            }
+        });
+        let json = match serde_json::to_string(&payload) {
+            Ok(j) => j,
+            Err(e) => {
+                tracing::error!("Failed to serialize OP 4: {:?}", e);
+                return;
+            }
+        };
+
+        let shards = self.shards.lock().await;
+        for (shard_id, sender) in shards.iter() {
+            tracing::info!(
+                "Sending OP 4 to shard {} [guild={}, channel={:?}]",
+                shard_id, guild_id, channel_id
+            );
+            let msg = ShardRunnerMessage::Message(WsMessage::Text(json.clone().into()));
+            if sender.unbounded_send(msg).is_err() {
+                tracing::warn!("Shard {} sender is closed", shard_id);
+            }
         }
-
-        let Some(guild_id) = state.guild_id else {
-            return;
-        };
-
-        // Bot left voice — leave() already cleaned up, nothing more to do
-        if state.channel_id.is_none() {
-            tracing::info!("Bot left voice in guild {}", guild_id);
-            return;
-        }
-
-        tracing::info!(
-            "Bot joined channel {:?} in guild {}, session_id={}",
-            state.channel_id,
-            guild_id,
-            state.session_id
-        );
-
-        let mut p = self.pending.lock().await;
-        let entry = p.entry(guild_id).or_default();
-        entry.session_id = Some(state.session_id.clone());
-        drop(p);
-
-        self.check_and_connect(guild_id).await;
     }
 
-    /// Wire this into your Serenity `EventHandler::voice_server_update`.
-    /// Traps the server endpoint and token so we can open the voice WS connection.
-    pub async fn handle_voice_server(&self, server: &VoiceServerUpdateEvent) {
-        let Some(guild_id) = server.guild_id else {
-            return;
-        };
-
-        let Some(endpoint) = &server.endpoint else {
-            tracing::warn!("VoiceServerUpdate with no endpoint for guild {}", guild_id);
-            return;
-        };
-
-        tracing::info!(
-            "Got VoiceServerUpdate for guild {}: endpoint={}",
-            guild_id,
-            endpoint
-        );
-
-        let mut p = self.pending.lock().await;
-        let entry = p.entry(guild_id).or_default();
-        entry.endpoint = Some(endpoint.clone());
-        entry.token = Some(server.token.clone());
-        drop(p);
-
-        self.check_and_connect(guild_id).await;
-    }
-
-    /// Internal — once all three pieces are collected, spin up the `CoreDriver`.
+    /// Once we have session_id + endpoint + token, bootstrap the CoreDriver.
     async fn check_and_connect(&self, guild_id: GuildId) {
         let args = {
             let p = self.pending.lock().await;
-            let Some(entry) = p.get(&guild_id) else {
-                return;
-            };
+            let Some(entry) = p.get(&guild_id) else { return };
             if !entry.is_ready() {
                 tracing::debug!(
                     "Pending for guild {} — session={} endpoint={} token={}",
@@ -213,41 +177,114 @@ impl SigilVoiceManager {
             )
         };
 
-        // Flush pending immediately so duplicate events don't trigger a second connect
-        {
-            let mut p = self.pending.lock().await;
-            p.remove(&guild_id);
-        }
+        // Flush pending so duplicate events don't re-trigger a connect
+        self.pending.lock().await.remove(&guild_id);
 
         let (endpoint, session_id, token) = args;
         let server_id_str = guild_id.get().to_string();
-        let user_id_str = self.user_id.to_string();
-        let sigil_calls = self.calls.clone();
+        let user_id_str = self.user_id.lock().await.to_string();
+        let calls_clone = self.calls.clone();
 
         tokio::spawn(async move {
-            tracing::info!("Bootstrapping Sigil CoreDriver for guild={}", guild_id);
-            match CoreDriver::connect(&endpoint, &server_id_str, &user_id_str, &session_id, &token)
-                .await
-            {
+            tracing::info!("🚀 Bootstrapping CoreDriver for guild={}", guild_id);
+            match CoreDriver::connect(&endpoint, &server_id_str, &user_id_str, &session_id, &token).await {
                 Ok(driver) => {
-                    tracing::info!("✅ CoreDriver connected for guild={}", guild_id);
+                    tracing::info!("✅ CoreDriver ready for guild={}", guild_id);
                     let call = Arc::new(Call::new(driver));
-                    let mut c = sigil_calls.lock().await;
-                    c.insert(guild_id, call);
+                    calls_clone.lock().await.insert(guild_id, call);
+                    tracing::info!("📞 Call inserted for guild={} — ready for playback", guild_id);
                 }
                 Err(e) => {
-                    tracing::error!("❌ CoreDriver failed for guild={}: {:?}", guild_id, e);
+                    tracing::error!("❌ CoreDriver::connect failed for guild={}: {:?}", guild_id, e);
                 }
             }
         });
     }
 }
 
-/// TypeMap key so the manager can live in Serenity's `ctx.data`.
+// ──────────────────────────────────────────────────────────────────────────────
+// VoiceGatewayManager implementation — Serenity calls these automatically
+// ──────────────────────────────────────────────────────────────────────────────
+
+#[async_trait]
+impl VoiceGatewayManager for SigilVoiceManager {
+    /// Called once at startup with the bot's UserId and shard count.
+    async fn initialise(&self, _shard_count: u32, user_id: UserId) {
+        *self.user_id.lock().await = user_id.get();
+        tracing::info!("SigilVoiceManager initialised [user_id={}]", user_id);
+    }
+
+    /// Called when a shard connects/reconnects — provides the channel to send gateway messages.
+    async fn register_shard(&self, shard_id: u32, sender: UnboundedSender<ShardRunnerMessage>) {
+        tracing::info!("SigilVoiceManager: shard {} registered", shard_id);
+        self.shards.lock().await.insert(shard_id, sender);
+    }
+
+    /// Called when a shard disconnects.
+    async fn deregister_shard(&self, shard_id: u32) {
+        tracing::info!("SigilVoiceManager: shard {} deregistered", shard_id);
+        self.shards.lock().await.remove(&shard_id);
+    }
+
+    /// Called by Serenity for every VOICE_SERVER_UPDATE.
+    /// Contains the voice gateway endpoint and authentication token.
+    async fn server_update(&self, guild_id: GuildId, endpoint: &Option<String>, token: &str) {
+        let Some(ep) = endpoint else {
+            tracing::warn!("VoiceServerUpdate for guild={} had no endpoint", guild_id);
+            return;
+        };
+        tracing::info!("VoiceServerUpdate [guild={}, endpoint={}]", guild_id, ep);
+        {
+            let mut p = self.pending.lock().await;
+            let entry = p.entry(guild_id).or_default();
+            entry.endpoint = Some(ep.clone());
+            entry.token = Some(token.to_string());
+        }
+        self.check_and_connect(guild_id).await;
+    }
+
+    /// Called by Serenity for every VOICE_STATE_UPDATE for our bot.
+    /// Contains the session_id needed to authenticate with the voice gateway.
+    async fn state_update(&self, guild_id: GuildId, voice_state: &VoiceState) {
+        // We only care about our own bot's state
+        let our_id = *self.user_id.lock().await;
+        if voice_state.user_id.get() != our_id {
+            return;
+        }
+
+        // Bot left voice
+        if voice_state.channel_id.is_none() {
+            tracing::info!("Bot disconnected from voice in guild={}", guild_id);
+            self.calls.lock().await.remove(&guild_id);
+            self.pending.lock().await.remove(&guild_id);
+            return;
+        }
+
+        tracing::info!(
+            "VoiceStateUpdate [guild={}, channel={:?}, session={}]",
+            guild_id, voice_state.channel_id, voice_state.session_id
+        );
+
+        {
+            let mut p = self.pending.lock().await;
+            let entry = p.entry(guild_id).or_default();
+            entry.session_id = Some(voice_state.session_id.clone());
+            entry.channel_id = voice_state.channel_id;
+        }
+        self.check_and_connect(guild_id).await;
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// TypeMap key
+// ──────────────────────────────────────────────────────────────────────────────
+
+/// Key for accessing `SigilVoiceManager` from `ctx.data`.
 ///
-/// # Example
 /// ```rust,no_run
-/// ctx.data.read().await.get::<SigilVoiceManagerKey>().unwrap()
+/// let data = ctx.data.read().await;
+/// let mgr = data.get::<SigilVoiceManagerKey>().unwrap();
+/// mgr.join(guild_id, channel_id).await;
 /// ```
 pub struct SigilVoiceManagerKey;
 impl serenity::prelude::TypeMapKey for SigilVoiceManagerKey {
