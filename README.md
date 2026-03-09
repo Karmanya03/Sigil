@@ -243,34 +243,36 @@ serenity = { version = "0.12", default-features = false, features = ["client", "
 tokio = { version = "1", features = ["full"] }
 ```
 
-#### Bot Skeleton using `yt-dlp`
+#### Advanced Multi-Track Mixing
 
-Here is exactly how you stream a YouTube video directly into a Voice Channel using `sigil-voice`. Make sure you have `yt-dlp` and `ffmpeg` installed on your system.
+Sigil-Voice can play multiple tracks simultaneously in the same voice channel. You can control each one independently.
 
 ```rust
 use sigil_voice::source::YtDlpSource;
 use sigil_voice::driver::CoreDriver;
 use sigil_voice::call::Call;
+use sigil_voice::track::TrackEvent;
 
-async fn play_youtube_audio(
-    endpoint: &str, server_id: &str, user_id: &str, session_id: &str, token: &str,
-    youtube_url: &str,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // 1. Connect the core driver (WS + UDP + DAVE)
-    let driver = CoreDriver::connect(endpoint, server_id, user_id, session_id, token).await?;
-    
-    // 2. Wrap it in a Call (starts the background mixing loop)
-    let call = Call::new(driver);
+async fn play_complex_scene(call: &Call) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // 1. Play background music at low volume
+    let bgm = YtDlpSource::create_track("https://youtube.com/watch?v=background-lofi").await?;
+    let bgm_handle = call.play(bgm).await;
+    bgm_handle.set_volume(0.2).await;
 
-    // 3. Create a track from YouTube (auto-resolves and spawns ffmpeg)
-    let track = YtDlpSource::create_track(youtube_url).await?;
+    // 2. Play an effect over it
+    let sfx = YtDlpSource::create_track("https://youtube.com/watch?v=explosion-sfx").await?;
+    let mut sfx_handle = call.play(sfx).await;
 
-    // 4. Play it!
-    let handle = call.play(track).await;
-    
-    // Optional: Control volume or pause
-    handle.set_volume(0.5).await;
-    
+    // 3. React to events (e.g. knowing when the SFX ends)
+    let mut events = sfx_handle.take_event_receiver().unwrap();
+    tokio::spawn(async move {
+        while let Some(event) = events.recv().await {
+            if let TrackEvent::End = event {
+                println!("The explosion finished playing!");
+            }
+        }
+    });
+
     Ok(())
 }
 ```

@@ -266,32 +266,41 @@ impl CoreDriver {
 
             {
                 let mut tracks = self.tracks.lock().await;
-                // Remove stopped tracks
-                tracks.retain(|t| {
-                    // This is a bit expensive to lock each handle in a loop, but simplest for now.
-                    // In a high-perf driver we'd use a more optimized structure.
-                    // We can't easily check state without awaiting, so we might need a non-async state check.
-                    true 
+                // Remove stopped or errored tracks
+                tracks.retain(|handle| {
+                    use crate::track::PlayState;
+                    let state = handle.get_state_atomic();
+                    state == PlayState::Playing || state == PlayState::Paused
                 });
 
                 for handle in tracks.iter() {
-                    let mut t = handle.inner().lock().await;
-                    if t.state != crate::track::PlayState::Playing {
+                    let state = handle.get_state_atomic();
+                    if state != crate::track::PlayState::Playing {
                         continue;
                     }
 
-                    if let Some(frame) = t.source.read_frame() {
-                        active_any = true;
-                        // Mix frame into mixed_pcm with volume scaling
-                        for (i, &sample) in frame.iter().enumerate() {
-                            if i >= mixed_pcm.len() { break; }
-                            let scaled = (sample as f32 * t.volume) as i32;
-                            let current = mixed_pcm[i] as i32;
-                            mixed_pcm[i] = (current + scaled).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+                    // Try to lock the track for the duration of the frame read/mix
+                    // We use try_lock to avoid blocking the mixer if the user is currently modifying track props
+                    if let Ok(mut t) = handle.inner().try_lock() {
+                        if let Some(frame) = t.source.read_frame() {
+                            active_any = true;
+                            // Mix frame into mixed_pcm with volume scaling
+                            for (i, &sample) in frame.iter().enumerate() {
+                                if i >= mixed_pcm.len() { break; }
+                                let scaled = (sample as f32 * t.volume) as i32;
+                                let current = mixed_pcm[i] as i32;
+                                mixed_pcm[i] = (current + scaled).clamp(i16::MIN as i32, i16::MAX as i32) as i16;
+                            }
+                        } else {
+                            // Source exhausted
+                            t.state.store(crate::track::PlayState::Stopped as u8, std::sync::atomic::Ordering::SeqCst);
+                            if let Some(tx) = &t.event_tx {
+                                let _ = tx.send(crate::track::TrackEvent::End);
+                            }
                         }
                     } else {
-                        // Source exhausted
-                        t.state = crate::track::PlayState::Stopped;
+                        // Skip this frame for this track if locked, mixer must keep ticking
+                        active_any = true; 
                     }
                 }
             }

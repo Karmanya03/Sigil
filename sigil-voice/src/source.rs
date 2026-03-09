@@ -87,11 +87,13 @@ impl YtDlpSource {
         Self::spawn_ffmpeg_stream(&direct_url, tx).await?;
         
         use crate::track::{Track, PlayState, ChannelSource};
+        use std::sync::atomic::AtomicU8;
         Ok(Track {
             source: Box::new(ChannelSource { receiver: rx }),
-            state: PlayState::Playing,
+            state: Arc::new(AtomicU8::new(PlayState::Playing as u8)),
             volume: 1.0,
             loops: 1,
+            event_tx: None,
         })
     }
 }
