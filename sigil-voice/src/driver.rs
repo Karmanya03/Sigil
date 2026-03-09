@@ -3,7 +3,7 @@ use sigil_discord::SigilSession;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex};
-use tracing::info;
+use tracing::{info, warn, error, debug};
 
 use crate::gateway::{ProtocolData, SelectProtocol, SessionDescription, VoiceGatewayClient, VoicePacket};
 use crate::udp::{receive_ip_discovery, send_ip_discovery};
@@ -23,8 +23,9 @@ pub struct CoreDriver {
 }
 
 impl CoreDriver {
-    /// Connects to Discord Voice, performs the WS handshake, completes UDP Hole Punching,
-    /// and establishes the final transport session keys while spinning up a WS background task.
+    /// Full voice connection lifecycle:
+    /// 1. SigilSession init → 2. WS Handshake → 3. UDP Bind → 4. IP Discovery
+    /// → 5. Select Protocol → 6. Session Description → 7. Background WS task
     pub async fn connect(
         endpoint: &str,
         server_id: &str,
@@ -32,58 +33,118 @@ impl CoreDriver {
         session_id: &str,
         token: &str,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        // 1. Initialize SigilSession for DAVE End-to-End Encryption
-        let sigil = Arc::new(Mutex::new(SigilSession::new(user_id.parse()?)?));
+        info!("⚡ CoreDriver::connect starting [endpoint={}, server={}, user={}]", endpoint, server_id, user_id);
 
-        // 2. Connect to WS and Handshake
-        let mut gateway = VoiceGatewayClient::connect(endpoint).await?;
+        // 1. SigilSession for DAVE E2EE
+        let user_id_u64: u64 = user_id.parse().map_err(|e| {
+            error!("Failed to parse user_id '{}': {:?}", user_id, e);
+            format!("Invalid user_id: {}", user_id)
+        })?;
+        let sigil = Arc::new(Mutex::new(SigilSession::new(user_id_u64).map_err(|e| {
+            error!("SigilSession::new failed: {:?}", e);
+            e
+        })?));
+        info!("✅ Step 1/7: SigilSession created");
+
+        // 2. Voice Gateway WS connect + handshake
+        let mut gateway = VoiceGatewayClient::connect(endpoint).await.map_err(|e| {
+            error!("Voice WS connect failed for endpoint '{}': {:?}", endpoint, e);
+            e
+        })?;
+        info!("✅ Step 2a/7: WS connected");
+
         let (ready, heartbeat_interval) = gateway
             .handshake(server_id, user_id, session_id, token)
-            .await?;
+            .await
+            .map_err(|e| {
+                error!("Voice WS handshake failed: {:?}", e);
+                e
+            })?;
+        info!("✅ Step 2b/7: WS handshake done [SSRC={}, IP={}, Port={}]", ready.ssrc, ready.ip, ready.port);
 
-        // 3. Bind local UDP socket
-        let udp = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
+        // 3. Bind local UDP
+        let udp = Arc::new(UdpSocket::bind("0.0.0.0:0").await.map_err(|e| {
+            error!("UDP bind failed: {:?}", e);
+            e
+        })?);
+        info!("✅ Step 3/7: UDP socket bound to {:?}", udp.local_addr());
 
-        // 4. Perform IP Discovery
-        info!("Starting IP discovery towards {}:{}", ready.ip, ready.port);
-        send_ip_discovery(&udp, &ready.ip, ready.port, ready.ssrc).await?;
-        let (external_ip, external_port) = receive_ip_discovery(&udp).await?;
+        // 4. IP Discovery
+        let target_addr = format!("{}:{}", ready.ip, ready.port);
+        info!("Starting IP discovery towards {}", target_addr);
+        send_ip_discovery(&udp, &ready.ip, ready.port, ready.ssrc).await.map_err(|e| {
+            error!("IP discovery send failed: {:?}", e);
+            e
+        })?;
+        let (external_ip, external_port) = receive_ip_discovery(&udp).await.map_err(|e| {
+            error!("IP discovery receive failed: {:?}", e);
+            e
+        })?;
+        info!("✅ Step 4/7: IP Discovery done [external={}:{}]", external_ip, external_port);
 
-        // 5. Select Protocol based on UDP discovery
+        // 5. Select Protocol
         let select_protocol = SelectProtocol {
             protocol: "udp".to_string(),
             data: ProtocolData {
                 address: external_ip,
                 port: external_port,
-                mode: "aead_aes256_gcm_rtpsize".to_string(), // Discord's preferred UDP encryption
+                mode: "aead_aes256_gcm_rtpsize".to_string(),
             },
         };
-        gateway.send_packet(1, select_protocol).await?;
-        info!("Sent SelectProtocol");
+        gateway.send_packet(1, select_protocol).await.map_err(|e| {
+            error!("SelectProtocol send failed: {:?}", e);
+            e
+        })?;
+        info!("✅ Step 5/7: SelectProtocol sent");
 
-        // 6. Wait for SessionDescription (OP 4)
+        // 6. Wait for SessionDescription (OP 4) with timeout
         let mode;
         let secret_key;
-        loop {
-            let packet = gateway
-                .recv_packet()
-                .await?
-                .ok_or("Connection closed before SessionDescription")?;
-            if let crate::gateway::WsMessage::Text(p) = packet {
-                if p.op == 4 {
-                    let session_desc: SessionDescription = serde_json::from_value(p.d.unwrap())?;
-                    info!(
-                        "Received SessionDescription from Voice Gateway. Mode: {}",
-                        session_desc.mode
-                    );
-                    mode = Some(session_desc.mode);
-                    secret_key = Some(session_desc.secret_key);
-                    break;
+        let session_desc_timeout = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            async {
+                loop {
+                    let packet = gateway
+                        .recv_packet()
+                        .await?
+                        .ok_or("Connection closed before SessionDescription")?;
+                    match packet {
+                        crate::gateway::WsMessage::Text(p) => {
+                            debug!("Voice WS received OP {} (waiting for OP 4)", p.op);
+                            if p.op == 4 {
+                                let desc: SessionDescription = serde_json::from_value(
+                                    p.d.ok_or("SessionDescription missing 'd' field")?
+                                )?;
+                                return Ok::<_, Box<dyn std::error::Error + Send + Sync>>(desc);
+                            }
+                            // Skip other text opcodes while waiting
+                        }
+                        crate::gateway::WsMessage::Binary(bin) => {
+                            debug!("Voice WS skipping binary len={} while waiting for OP 4", bin.len());
+                        }
+                    }
                 }
             }
-        }
+        ).await;
 
-        // 7. Spawn Background Task for WS (Heartbeats, DAVE Opcodes)
+        let session_desc = match session_desc_timeout {
+            Ok(Ok(desc)) => desc,
+            Ok(Err(e)) => {
+                error!("SessionDescription receive failed: {:?}", e);
+                return Err(e);
+            }
+            Err(_) => {
+                error!("Timed out waiting for SessionDescription (10s)");
+                return Err("Timed out waiting for SessionDescription".into());
+            }
+        };
+
+        info!("✅ Step 6/7: SessionDescription received [mode={}, key_len={}]",
+            session_desc.mode, session_desc.secret_key.len());
+        mode = Some(session_desc.mode);
+        secret_key = Some(session_desc.secret_key);
+
+        // 7. Spawn background WS task for heartbeats + DAVE opcodes
         let (mut ws_tx, mut ws_rx) = gateway.ws.split();
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<crate::gateway::WsMessage>(100);
         let ssrc_map = Arc::new(Mutex::new(std::collections::HashMap::new()));
@@ -94,6 +155,7 @@ impl CoreDriver {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(heartbeat_interval as u64));
             interval.tick().await; // skip first immediate tick
             let mut seq_ack: Option<u64> = None;
+            info!("🔄 Voice WS background task started (heartbeat={}ms)", heartbeat_interval);
 
             loop {
                 tokio::select! {
@@ -109,12 +171,16 @@ impl CoreDriver {
                         };
                         if let Ok(text) = serde_json::to_string(&hb) {
                             if ws_tx.send(tokio_tungstenite::tungstenite::Message::Text(text.into())).await.is_err() {
+                                warn!("WS heartbeat send failed — connection dropped");
                                 break;
                             }
                         }
                     }
                     cmd_opt = cmd_rx.recv() => {
-                        let Some(cmd) = cmd_opt else { break; };
+                        let Some(cmd) = cmd_opt else {
+                            info!("Command channel closed — WS background task exiting");
+                            break;
+                        };
                         let msg = match cmd {
                             crate::gateway::WsMessage::Text(p) => {
                                 if let Ok(text) = serde_json::to_string(&p) {
@@ -128,93 +194,107 @@ impl CoreDriver {
                             }
                         };
                         if ws_tx.send(msg).await.is_err() {
+                            warn!("WS command send failed — connection dropped");
                             break;
                         }
                     }
                     msg_opt = ws_rx.next() => {
-                        let Some(Ok(msg)) = msg_opt else { break; };
+                        let Some(Ok(msg)) = msg_opt else {
+                            warn!("Voice WS read ended — background task exiting");
+                            break;
+                        };
                         match msg {
                             tokio_tungstenite::tungstenite::Message::Text(text) => {
                                 if let Ok(packet) = serde_json::from_str::<VoicePacket>(&text) {
                                     if let Some(seq) = packet.s {
                                         seq_ack = Some(seq);
                                     }
-                                    if packet.op == 6 {
-                                        tracing::debug!("Received Heartbeat ACK");
-                                    } else if packet.op == 5 {
-                                        if let Some(d) = packet.d {
-                                            if let Ok(spk) = serde_json::from_value::<crate::gateway::Speaking>(d) {
-                                                if let Some(uid_str) = spk.user_id {
-                                                    if let Ok(uid) = uid_str.parse::<u64>() {
-                                                        let mut map = ssrc_map_clone.lock().await;
-                                                        map.insert(spk.ssrc, uid);
-                                                        tracing::debug!("Mapped SSRC {} to UserId {}", spk.ssrc, uid);
+                                    match packet.op {
+                                        6 => debug!("Heartbeat ACK"),
+                                        5 => {
+                                            if let Some(d) = packet.d {
+                                                if let Ok(spk) = serde_json::from_value::<crate::gateway::Speaking>(d) {
+                                                    if let Some(uid_str) = spk.user_id {
+                                                        if let Ok(uid) = uid_str.parse::<u64>() {
+                                                            let mut map = ssrc_map_clone.lock().await;
+                                                            map.insert(spk.ssrc, uid);
+                                                            debug!("Mapped SSRC {} → UserId {}", spk.ssrc, uid);
+                                                        }
                                                     }
                                                 }
                                             }
                                         }
+                                        _ => debug!("Voice WS text OP {}", packet.op),
                                     }
                                 }
                             }
                             tokio_tungstenite::tungstenite::Message::Binary(bin) => {
                                 if bin.len() > 2 {
                                     let opcode = bin[2];
+                                    debug!("Voice WS binary OP {} (len={})", opcode, bin.len());
                                     let mut s = sigil_clone.lock().await;
-                                    if let Ok(event) = s.handle_gateway_event(opcode, &bin) {
-                                        use sigil_discord::gateway::handler::DaveEvent;
-                                        match event {
-                                            DaveEvent::PrepareTransition(p) => {
-                                                let ready = sigil_discord::gateway::opcodes::ReadyForTransition {
-                                                    transition_id: p.transition_id,
-                                                };
-                                                let packet = VoicePacket {
-                                                    op: 23,
-                                                    d: Some(serde_json::to_value(ready).unwrap_or_default()),
-                                                    s: None, t: None, seq_ack: None,
-                                                };
-                                                if let Ok(text) = serde_json::to_string(&packet) {
-                                                    let _ = ws_tx.send(tokio_tungstenite::tungstenite::Message::Text(text.into())).await;
-                                                    tracing::info!("Sent OP 23 ReadyForTransition for {:?}", p.transition_id);
-                                                }
-                                            }
-                                            DaveEvent::ExecuteTransition(e) => {
-                                                tracing::info!("Executing Dave Transition {:?}", e);
-                                            }
-                                            DaveEvent::MlsExternalSender(ext) => {
-                                                // ext.credential contains the full blended binary payload from OP 25
-                                                let _ = s.set_external_sender(&ext.credential);
-                                                tracing::info!("Processed DAVE OP 25 External Sender");
-                                            }
-                                            DaveEvent::MlsProposals(prop) => {
-                                                let _ = s.process_proposals(&[prop.data.clone()]);
-                                                if let Ok((commit_bytes, opt_welcome)) = s.commit_and_welcome() {
-                                                    let mut payload = vec![0u8; 3];
-                                                    payload[2] = 28; // OP 28 MlsCommitWelcome
-                                                    payload.extend_from_slice(&commit_bytes);
-                                                    if let Some(w) = opt_welcome {
-                                                        payload.extend_from_slice(&w);
+                                    match s.handle_gateway_event(opcode, &bin) {
+                                        Ok(event) => {
+                                            use sigil_discord::gateway::handler::DaveEvent;
+                                            match event {
+                                                DaveEvent::PrepareTransition(p) => {
+                                                    let ready = sigil_discord::gateway::opcodes::ReadyForTransition {
+                                                        transition_id: p.transition_id,
+                                                    };
+                                                    let packet = VoicePacket {
+                                                        op: 23,
+                                                        d: Some(serde_json::to_value(ready).unwrap_or_default()),
+                                                        s: None, t: None, seq_ack: None,
+                                                    };
+                                                    if let Ok(text) = serde_json::to_string(&packet) {
+                                                        let _ = ws_tx.send(tokio_tungstenite::tungstenite::Message::Text(text.into())).await;
+                                                        info!("DAVE: Sent OP 23 ReadyForTransition");
                                                     }
-                                                    let _ = ws_tx.send(tokio_tungstenite::tungstenite::Message::Binary(payload.into())).await;
                                                 }
-                                            }
-                                            DaveEvent::MlsWelcome(w) => {
-                                                let _ = s.join_group(&w.welcome_bytes);
-                                                tracing::info!("DAVE Group successfully joined!");
-                                            }
-                                            DaveEvent::MlsAnnounceCommitTransition(c) => {
-                                                let _ = s.process_commit(&c.commit_bytes);
-                                                tracing::info!("DAVE Processed OP 29 Announce Commit");
-                                            }
-                                            DaveEvent::PrepareEpoch(p) => {
-                                                if p.epoch == 1 {
-                                                    if let Ok(kp) = s.generate_key_package() {
+                                                DaveEvent::ExecuteTransition(e) => {
+                                                    info!("DAVE: ExecuteTransition {:?}", e);
+                                                }
+                                                DaveEvent::MlsExternalSender(ext) => {
+                                                    let _ = s.set_external_sender(&ext.credential);
+                                                    info!("DAVE: Processed OP 25 External Sender");
+                                                }
+                                                DaveEvent::MlsProposals(prop) => {
+                                                    let _ = s.process_proposals(&[prop.data.clone()]);
+                                                    if let Ok((commit_bytes, opt_welcome)) = s.commit_and_welcome() {
                                                         let mut payload = vec![0u8; 3];
-                                                        payload[2] = 26; // OP 26 MlsKeyPackage
-                                                        payload.extend_from_slice(&kp);
+                                                        payload[2] = 28;
+                                                        payload.extend_from_slice(&commit_bytes);
+                                                        if let Some(w) = opt_welcome {
+                                                            payload.extend_from_slice(&w);
+                                                        }
                                                         let _ = ws_tx.send(tokio_tungstenite::tungstenite::Message::Binary(payload.into())).await;
+                                                        info!("DAVE: Sent OP 28 MlsCommitWelcome");
+                                                    }
+                                                }
+                                                DaveEvent::MlsWelcome(w) => {
+                                                    let _ = s.join_group(&w.welcome_bytes);
+                                                    info!("DAVE: ✅ Group joined via Welcome!");
+                                                }
+                                                DaveEvent::MlsAnnounceCommitTransition(c) => {
+                                                    let _ = s.process_commit(&c.commit_bytes);
+                                                    info!("DAVE: Processed OP 29 Commit");
+                                                }
+                                                DaveEvent::PrepareEpoch(p) => {
+                                                    info!("DAVE: PrepareEpoch {}", p.epoch);
+                                                    if p.epoch == 1 {
+                                                        if let Ok(kp) = s.generate_key_package() {
+                                                            let mut payload = vec![0u8; 3];
+                                                            payload[2] = 26;
+                                                            payload.extend_from_slice(&kp);
+                                                            let _ = ws_tx.send(tokio_tungstenite::tungstenite::Message::Binary(payload.into())).await;
+                                                            info!("DAVE: Sent OP 26 MlsKeyPackage");
+                                                        }
                                                     }
                                                 }
                                             }
+                                        }
+                                        Err(e) => {
+                                            debug!("DAVE event OP {} parse error: {:?}", opcode, e);
                                         }
                                     }
                                 }
@@ -224,7 +304,10 @@ impl CoreDriver {
                     }
                 }
             }
+            warn!("Voice WS background task ended");
         });
+
+        info!("✅ Step 7/7: Background WS task spawned — CoreDriver fully ready");
 
         Ok(Self {
             udp,
@@ -234,7 +317,7 @@ impl CoreDriver {
             ws_tx_channel: cmd_tx,
             tracks: Arc::new(Mutex::new(Vec::new())),
             ssrc: ready.ssrc,
-            target_addr: ready.ip + ":" + &ready.port.to_string(),
+            target_addr,
             ssrc_map,
             receiver_tx: None,
             decoders: Arc::new(Mutex::new(std::collections::HashMap::new())),
@@ -246,12 +329,14 @@ impl CoreDriver {
         let handle = crate::track::TrackHandle::new(track);
         let mut tracks = self.tracks.lock().await;
         tracks.push(handle.clone());
+        info!("🎵 Track added (total active: {})", tracks.len());
         handle
     }
 
     /// Stop all playback and clear the track list.
     pub async fn stop(&self) {
         let mut tracks = self.tracks.lock().await;
+        info!("⏹️ Stopping {} tracks", tracks.len());
         tracks.clear();
     }
 
@@ -263,16 +348,19 @@ impl CoreDriver {
         let secret_key = match self.secret_key.clone() {
             Some(k) => k,
             None => {
-                tracing::error!("start_mixing: No secret_key — cannot start mixing loop");
+                error!("start_mixing: No secret_key — cannot start mixing loop");
                 return Err("No secret key".into());
             }
         };
 
         // Create the Opus encoder
         let mut encoder = match crate::audio::AudioEncoder::new() {
-            Ok(e) => e,
+            Ok(e) => {
+                info!("🎙️ AudioEncoder created successfully");
+                e
+            }
             Err(e) => {
-                tracing::error!("start_mixing: Failed to create AudioEncoder: {:?}", e);
+                error!("start_mixing: Failed to create AudioEncoder: {:?}", e);
                 return Err(e);
             }
         };
@@ -284,7 +372,7 @@ impl CoreDriver {
                 op: 5, d: Some(d), s: None, t: None, seq_ack: None,
             })).await;
         }
-        tracing::info!("🎙️ Mixing loop started for SSRC={}", self.ssrc);
+        info!("🎙️ Mixing loop started for SSRC={}, target={}", self.ssrc, self.target_addr);
 
         let mut seq = 0u16;
         let mut timestamp = 0u32;
@@ -292,6 +380,8 @@ impl CoreDriver {
         let mut opus_buf = [0u8; 4000];
         let mut ticker = tokio::time::interval(std::time::Duration::from_millis(20));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut frames_sent: u64 = 0;
+        let mut dave_skip_count: u64 = 0;
 
         loop {
             ticker.tick().await;
@@ -324,30 +414,29 @@ impl CoreDriver {
                                 }
                             }
                             None => {
-                                // Sender dropped — stream truly finished
                                 t.state.store(crate::track::PlayState::Stopped as u8,
                                     std::sync::atomic::Ordering::SeqCst);
                                 if let Some(tx) = &t.event_tx {
                                     let _ = tx.send(crate::track::TrackEvent::End);
                                 }
-                                tracing::info!("Track finished (source exhausted)");
+                                info!("Track source exhausted (sender dropped)");
                             }
                         }
                     } else {
-                        active_any = true; // locked by user, keep tick alive
+                        active_any = true;
                     }
                 }
             }
 
             if !active_any {
-                continue; // nothing to encode this tick
+                continue;
             }
 
             // --- 2. Encode to Opus ---
             let opus_len = match encoder.encode_pcm(&mixed_pcm, &mut opus_buf) {
                 Ok(n) => n,
                 Err(e) => {
-                    tracing::warn!("Opus encode error (skipping frame): {:?}", e);
+                    warn!("Opus encode error (skipping frame): {:?}", e);
                     continue;
                 }
             };
@@ -357,10 +446,20 @@ impl CoreDriver {
             let dave_ciphertext = {
                 let mut sigil_guard = self.sigil.lock().await;
                 match sigil_guard.encrypt_own_frame(opus_data, sigil_discord::crypto::codec::Codec::Opus) {
-                    Ok(ct) => ct,
-                    Err(e) => {
-                        tracing::debug!("DAVE encrypt not ready yet (MLS pending?): {:?}", e);
-                        continue; // Skip this frame — DAVE key exchange still in progress
+                    Ok(ct) => {
+                        if dave_skip_count > 0 {
+                            info!("DAVE encryption now working (skipped {} frames while MLS was pending)", dave_skip_count);
+                            dave_skip_count = 0;
+                        }
+                        ct
+                    }
+                    Err(_) => {
+                        dave_skip_count += 1;
+                        if dave_skip_count == 1 || dave_skip_count % 250 == 0 {
+                            // Log every 5 seconds (250 * 20ms)
+                            debug!("DAVE encrypt pending... (skipped {} frames so far)", dave_skip_count);
+                        }
+                        continue;
                     }
                 }
             };
@@ -372,15 +471,24 @@ impl CoreDriver {
             ) {
                 Ok(p) => p,
                 Err(e) => {
-                    tracing::warn!("Transport encrypt failed (skipping frame): {:?}", e);
+                    warn!("Transport encrypt failed (skipping frame): {:?}", e);
                     continue;
                 }
             };
 
             // --- 5. Send via UDP ---
             if let Err(e) = self.udp.send_to(&udp_payload, &self.target_addr).await {
-                tracing::warn!("UDP send error (skipping frame): {:?}", e);
+                warn!("UDP send error (skipping frame): {:?}", e);
                 continue;
+            }
+
+            frames_sent += 1;
+            if frames_sent == 1 {
+                info!("🔊 First audio frame sent via UDP!");
+            } else if frames_sent == 50 {
+                info!("🔊 50 audio frames sent (1 second of audio)");
+            } else if frames_sent % 2500 == 0 {
+                info!("🔊 {} audio frames sent (~{} seconds)", frames_sent, frames_sent / 50);
             }
 
             seq = seq.wrapping_add(1);
@@ -400,24 +508,21 @@ impl CoreDriver {
 
         tokio::spawn(async move {
             let mut buf = [0u8; 4096];
-            let mut pcm_out = [0i16; 1920]; 
+            let mut pcm_out = [0i16; 1920];
 
             loop {
                 match udp.recv_from(&mut buf).await {
                     Ok((n, _addr)) => {
                         let packet = &buf[..n];
-                        if n < 12 { continue; } // Too short for RTP
+                        if n < 12 { continue; }
 
-                        // 1. Extract RTP Header
                         let ssrc = u32::from_be_bytes([packet[8], packet[9], packet[10], packet[11]]);
-                        
-                        // 2. Transport Decrypt
+
                         let decrypted_rtp = match crate::udp::transport_decrypt_rtpsize(&secret_key, packet) {
                             Ok(d) => d,
                             Err(_) => continue,
                         };
 
-                        // 3. Sigil DAVE Decrypt (requires UserId)
                         let mut user_id = 0u64;
                         {
                             let map = ssrc_map.lock().await;
@@ -426,7 +531,7 @@ impl CoreDriver {
                             }
                         }
 
-                        if user_id == 0 { continue; } // Unknown sender
+                        if user_id == 0 { continue; }
 
                         let dave_decrypted = {
                             let s = sigil.lock().await;
@@ -436,7 +541,6 @@ impl CoreDriver {
                             }
                         };
 
-                        // 4. Decode Opus to PCM
                         let mut decs = decoders.lock().await;
                         let decoder = decs.entry(user_id).or_insert_with(|| {
                             crate::audio::AudioDecoder::new().expect("Failed to create decoder")
@@ -447,7 +551,7 @@ impl CoreDriver {
                         }
                     }
                     Err(e) => {
-                        tracing::error!("UDP Receiver error: {:?}", e);
+                        error!("UDP Receiver error: {:?}", e);
                         break;
                     }
                 }
