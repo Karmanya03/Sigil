@@ -277,44 +277,112 @@ async fn play_complex_scene(call: &Call) -> Result<(), Box<dyn std::error::Error
 }
 ```
 
-#### Modern Bot Integration (Serenity Commands)
+#### Complete Bot Setup
 
-If you are using the `SigilVoiceManager` inside your `TypeMap`, your command handlers become extremely clean. Sigil handles all the DAVE transitions and Voice state synchronization in the background.
+Sigil Voice fully replaces Songbird. Here's a complete working setup:
 
 ```rust
-use sigil_voice::serenity_hook::SigilVoiceManager;
+use sigil_voice::serenity_hook::{SigilVoiceManager, SigilVoiceManagerKey};
 use sigil_voice::source::YtDlpSource;
+use serenity::async_trait;
+use serenity::model::event::VoiceServerUpdateEvent;
+use serenity::model::prelude::*;
+use serenity::prelude::*;
+use std::sync::Arc;
+
+struct Bot;
+
+#[async_trait]
+impl EventHandler for Bot {
+    // ✅ Required: Wire these two events so Sigil can bootstrap the voice connection
+    async fn voice_state_update(&self, ctx: Context, _old: Option<VoiceState>, new: VoiceState) {
+        let data = ctx.data.read().await;
+        if let Some(mgr) = data.get::<SigilVoiceManagerKey>() {
+            mgr.handle_voice_state(&new).await;
+        }
+    }
+
+    async fn voice_server_update(&self, ctx: Context, event: VoiceServerUpdateEvent) {
+        let data = ctx.data.read().await;
+        if let Some(mgr) = data.get::<SigilVoiceManagerKey>() {
+            mgr.handle_voice_server(&event).await;
+        }
+    }
+}
+
+#[tokio::main]
+async fn main() {
+    let bot_user_id: u64 = /* your bot user ID */;
+    let manager = Arc::new(SigilVoiceManager::new(bot_user_id));
+
+    let mut client = Client::builder(&token, GatewayIntents::non_privileged() | GatewayIntents::GUILD_VOICE_STATES)
+        .event_handler(Bot)
+        .await
+        .unwrap();
+
+    // Register the manager in the TypeMap
+    client.data.write().await.insert::<SigilVoiceManagerKey>(manager);
+    client.start().await.unwrap();
+}
+```
+
+#### Voice Commands — Join, Leave & Play
+
+> ⚠️ **Important**: Do **not** use `guild_id.connect(&ctx, ...)` — that uses Serenity's internal voice manager. Sigil provides its own `manager.join()` that sends the correct Gateway OP 4 packet.
+
+```rust
+#[command]
+async fn join(ctx: &Context, msg: &Message) -> CommandResult {
+    let guild = msg.guild(&ctx.cache).unwrap();
+    let channel_id = guild
+        .voice_states
+        .get(&msg.author.id)
+        .and_then(|vs| vs.channel_id)
+        .ok_or("You must be in a voice channel!")?;
+
+    let data = ctx.data.read().await;
+    let manager = data.get::<SigilVoiceManagerKey>().expect("Manager not found");
+
+    // Sends Discord Gateway OP 4 to physically move the bot into the channel
+    manager.join(&ctx.shard, guild.id, channel_id).await;
+
+    msg.reply(ctx, "✅ Joined your voice channel!").await?;
+    Ok(())
+}
+
+#[command]
+async fn leave(ctx: &Context, msg: &Message) -> CommandResult {
+    let guild_id = msg.guild_id.ok_or("Must be in a guild")?;
+    let data = ctx.data.read().await;
+    let manager = data.get::<SigilVoiceManagerKey>().expect("Manager not found");
+
+    // Sends OP 4 with channel_id: null and cleans up the local driver
+    manager.leave(&ctx.shard, guild_id).await;
+
+    msg.reply(ctx, "👋 Left the voice channel.").await?;
+    Ok(())
+}
 
 #[command]
 async fn play(ctx: &Context, msg: &Message, mut args: Args) -> CommandResult {
     let url = args.single::<String>()?;
     let guild_id = msg.guild_id.ok_or("Must be in a guild")?;
 
-    // 1. Join the voice channel using Serenity's native connect
-    // This triggers the Discord events that SigilVoiceManager traps.
-    let channel_id = msg.guild(&ctx.cache).unwrap()
-        .voice_states.get(&msg.author.id)
-        .and_then(|vs| vs.channel_id)
-        .ok_or("You must be in a voice channel!")?;
-
-    let _ = guild_id.connect(&ctx, channel_id).await;
-
-    // 2. Access the Sigil manager from your bot's data
     let data = ctx.data.read().await;
-    let manager = data.get::<SigilVoiceManager>().expect("SigilVoiceManager not initialized");
-    
-    // 3. Retrieve the auto-initialized Call handle
+    let manager = data.get::<SigilVoiceManagerKey>().expect("Manager not found");
+
+    // Wait for the CoreDriver to bootstrap (triggered by the voice events above)
     let call = loop {
-        if let Some(c) = manager.get_call(guild_id).await { break c; }
+        if let Some(c) = manager.get_call(guild_id).await {
+            break c;
+        }
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     };
 
-    // 4. Create and play!
-    // Sigil handles Opus encoding, DAVE encryption, and 20ms rhythmic mixing.
     let track = YtDlpSource::create_track(&url).await?;
     let handle = call.play(track).await;
 
-    msg.reply(ctx, "🎶 Now playing...").await?;
+    msg.reply(ctx, "🎶 Now playing!").await?;
     Ok(())
 }
 
@@ -322,17 +390,18 @@ async fn play(ctx: &Context, msg: &Message, mut args: Args) -> CommandResult {
 async fn stop(ctx: &Context, msg: &Message) -> CommandResult {
     let guild_id = msg.guild_id.unwrap();
     let data = ctx.data.read().await;
-    let manager = data.get::<SigilVoiceManager>().unwrap();
+    let manager = data.get::<SigilVoiceManagerKey>().unwrap();
 
     if let Some(call) = manager.get_call(guild_id).await {
         call.stop().await;
-        msg.reply(ctx, "⏹️ Playback stopped.").await?;
+        msg.reply(ctx, "⏹️ Stopped.").await?;
     }
     Ok(())
 }
 ```
 
-> **Requirements:** The `sigil-voice` audio pipeline relies on `audiopus` which requires `CMake` installed to compile the C-bindings for Opus. If you hit a CMake error on Windows, make sure Visual Studio Build Tools (C++ workload) is installed, or `libopus-dev` on Linux.
+> **Requirements:** `yt-dlp` and `ffmpeg` must be installed and on your `PATH`. Build with `$env:CMAKE_POLICY_VERSION_MINIMUM=3.5; cargo build` on Windows.
+
 
 ## Project Structure
 
