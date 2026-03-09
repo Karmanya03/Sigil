@@ -43,8 +43,7 @@ impl SigilVoiceManager {
 
     /// Trap incoming Voice State patches (e.g. tracking when the bot physically enters the VC)
     pub async fn handle_voice_state(&self, state: &VoiceState) {
-        let Some(user) = &state.user_id else { return };
-        if user.get() == self.user_id {
+        if state.user_id.get() == self.user_id {
             let Some(guild_id) = state.guild_id else { return };
             let mut p = self.pending.lock().await;
             let entry = p.entry(guild_id).or_default();
