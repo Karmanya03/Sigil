@@ -223,6 +223,14 @@ We've built `sigil-voice`—a completely standalone Discord Voice v8 async drive
 
 **It 100% replaces Songbird.**
 
+### Under the Hood Features
+* **Serenity Hooking (`SigilVoiceManager`)**: Exposes a `SigilVoiceClient` trait that seamlessly drops into your Serenity bot to harvest `endpoint`, `token`, and `session_id` directly from Discord events, automatically spawning `CoreDriver` instances on VC join.
+* **Unified Background WS Loop**: Natively handles the DAVE OP 21-31 state transitions inside a detached Tokio thread via `Arc<Mutex<SigilSession>>`.
+* **Precise `seq_ack` Heartbeats**: Captures sequence acknowledgments from text payloads and executes perfect outbound OP 3 pings at the requested server interval.
+* **Transport Encryption Nonces**: Strictly isolated RTP AADs with properly appended, mathematically independent 96-bit AES-GCM padded nonces to ensure UDP block cipher integrity.
+* **Silence Frame Termination**: Automatically writes `0xF8 0xFF 0xFE` Opus termination sequences when an audio channel drops out, guaranteeing Discord clients experience no audio artifacting.
+* **Native Opus Media Injection**: Drops the fake mock bytes for real Opus C-bindings `0.3.0-rc.0` to correctly convert `ffmpeg`/`yt-dlp` 48kHz PCM stdout pipes.
+
 If you're building a music bot with [Serenity](https://github.com/serenity-rs/serenity), simply add `sigil-voice` instead:
 
 #### Cargo Setup
