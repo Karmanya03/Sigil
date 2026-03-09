@@ -257,10 +257,16 @@ impl CoreDriver {
                                                     info!("DAVE: ExecuteTransition (ID: {})", e.transition_id);
                                                 }
                                                 DaveEvent::MlsExternalSender(ext) => {
-                                                    let _ = s.set_external_sender(&ext.credential);
+                                                    match s.set_external_sender(&ext.credential) {
+                                                        Ok(()) => info!("DAVE: Group created via External Sender"),
+                                                        Err(e) => error!("DAVE: set_external_sender FAILED: {:?}", e),
+                                                    }
                                                     let uid = s.user_id;
-                                                    let _ = s.export_sender_keys(&[uid]);
-                                                    info!("DAVE: Processed OP 25 External Sender (Group Created, Keys Exported)");
+                                                    match s.export_sender_keys(&[uid]) {
+                                                        Ok(keys) => info!("DAVE: Exported sender keys for user {} ({} keys)", uid, keys.len()),
+                                                        Err(e) => error!("DAVE: export_sender_keys FAILED: {:?}", e),
+                                                    }
+                                                    info!("DAVE: Processed OP 25 External Sender");
                                                 }
                                                 DaveEvent::MlsProposals(prop) => {
                                                     let _ = s.process_proposals(&[prop.data.clone()]);
@@ -277,22 +283,6 @@ impl CoreDriver {
                                                         }
                                                         let _ = ws_tx.send(tokio_tungstenite::tungstenite::Message::Binary(payload.into())).await;
                                                         info!("DAVE: Sent OP 28 MlsCommitWelcome (Keys Exported)");
-
-                                                        // Send OP 12 Encryption Ready
-                                                        let ready_packet = VoicePacket {
-                                                            op: 12,
-                                                            d: Some(serde_json::json!({
-                                                                "audio_ssrc": my_ssrc,
-                                                                                                "video_ssrc": 0,
-                                                                "rtx_ssrc": 0,
-                                                                "encryption_ready": true
-                                                            })),
-                                                            s: None, t: None, seq_ack: None,
-                                                        };
-                                                        if let Ok(text) = serde_json::to_string(&ready_packet) {
-                                                            let _ = ws_tx.send(tokio_tungstenite::tungstenite::Message::Text(text.into())).await;
-                                                            info!("DAVE: Sent OP 12 Encryption Ready (SSRC={})", my_ssrc);
-                                                        }
                                                     }
                                                 }
                                                 DaveEvent::MlsWelcome(w) => {
@@ -300,22 +290,6 @@ impl CoreDriver {
                                                     let uid = s.user_id;
                                                     let _ = s.export_sender_keys(&[uid]);
                                                     info!("DAVE: ✅ Group joined via Welcome! (Keys Exported)");
-
-                                                    // Send OP 12 Encryption Ready
-                                                    let ready_packet = VoicePacket {
-                                                        op: 12,
-                                                        d: Some(serde_json::json!({
-                                                            "audio_ssrc": my_ssrc,
-                                                            "video_ssrc": 0,
-                                                            "rtx_ssrc": 0,
-                                                            "encryption_ready": true
-                                                        })),
-                                                        s: None, t: None, seq_ack: None,
-                                                    };
-                                                    if let Ok(text) = serde_json::to_string(&ready_packet) {
-                                                        let _ = ws_tx.send(tokio_tungstenite::tungstenite::Message::Text(text.into())).await;
-                                                        info!("DAVE: Sent OP 12 Encryption Ready (SSRC={})", my_ssrc);
-                                                    }
                                                 }
                                                 DaveEvent::MlsAnnounceCommitTransition(c) => {
                                                     let _ = s.process_commit(&c.commit_bytes);

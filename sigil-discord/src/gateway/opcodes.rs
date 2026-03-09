@@ -94,7 +94,9 @@ pub struct ReadyForTransition {
     pub transition_id: u64,
 }
 
-/// Payload for [`DaveOpcode::PrepareEpoch`] (opcode 24).
+/// Payload for [`DaveOpcode::PrepareEpoch`] (opcode 24, binary).
+///
+/// Binary format: [seq(2)][op(1)][epoch(4 bytes LE)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrepareEpoch {
     /// The protocol version for the upcoming epoch.
