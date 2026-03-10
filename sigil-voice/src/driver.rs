@@ -465,6 +465,38 @@ impl CoreDriver {
     /// Runs every 20ms: poll tracks → mix PCM → Opus encode → DAVE encrypt → UDP send.
     /// The loop NEVER exits on per-frame errors — it logs and skips to keep the connection alive.
     pub async fn start_mixing(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Wait for MLS group to be established before starting mixing
+        let mut sigil_guard = self.sigil.lock().await;
+        let mut retries = 0;
+        while !sigil_guard.is_established() && retries < 30 {
+            info!("Waiting for MLS group to be established (attempt {}/30)...", retries + 1);
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            retries += 1;
+            sigil_guard = self.sigil.lock().await;
+        }
+
+        if !sigil_guard.is_established() {
+            error!("MLS group never established — cannot start mixing loop");
+            return Err("MLS group not established".into());
+        }
+
+        // Export sender keys to ensure we have our own key cached
+        let user_id = sigil_guard.user_id;
+        match sigil_guard.export_sender_keys(&[user_id]) {
+            Ok(keys) => {
+                if keys.contains_key(&user_id) {
+                    info!("✅ Exported own sender key for encryption (key: {:02x}...)", keys.get(&user_id).unwrap()[0]);
+                } else {
+                    error!("❌ export_sender_keys returned OK but missing own key!");
+                    return Err("Failed to export own sender key".into());
+                }
+            }
+            Err(e) => {
+                error!("❌ export_sender_keys FAILED: {:?}", e);
+                return Err("Failed to export sender keys".into());
+            }
+        }
+
         let secret_key = match self.secret_key.clone() {
             Some(k) => k,
             None => {
@@ -570,34 +602,43 @@ impl CoreDriver {
             let opus_data = &opus_buf[..opus_len];
 
             // --- 3. DAVE encrypt (may fail if MLS group not ready yet) ---
-            let dave_ciphertext = {
+let audio_payload: Vec<u8> = {
                 let mut sigil_guard = self.sigil.lock().await;
-                match sigil_guard.encrypt_own_frame(opus_data, sigil_discord::crypto::codec::Codec::Opus) {
-                    Ok(ct) => {
-                        if dave_skip_count > 0 {
-                            info!("🔊 DAVE encryption active! (skipped {} frames while MLS was pending)", dave_skip_count);
-                            dave_skip_count = 0;
+                if sigil_guard.has_own_key() {
+                    // DAVE is ready — encrypt
+                    match sigil_guard.encrypt_own_frame(opus_data, sigil_discord::crypto::codec::Codec::Opus) {
+                        Ok(ct) => {
+                            if dave_skip_count > 0 {
+                                info!("🔊 DAVE encryption active! (skipped {} frames while MLS was pending)", dave_skip_count);
+                                dave_skip_count = 0;
+                            }
+                            if frames_sent == 0 {
+                                info!("🔊 First DAVE-encrypted audio frame produced! Sending via UDP...");
+                            }
+                            info!("🔐 DAVE encryption active for frame {}", frames_sent + 1);
+                            ct
                         }
-                        if frames_sent == 0 {
-                            info!("🔊 First DAVE-encrypted audio frame produced! Sending via UDP...");
+                        Err(e) => {
+                            warn!("DAVE encrypt failed despite key present: {:?}", e);
+                            info!("🔓 Falling back to raw Opus for frame {}", frames_sent + 1);
+                            opus_data.to_vec() // fallback
                         }
-                        ct
                     }
-                    Err(e) => {
-                        dave_skip_count += 1;
-                        if dave_skip_count == 1 || dave_skip_count % 250 == 0 {
-                            info!("🔒 DAVE encrypt failed/pending: {:?} (dropped {} frames so far — established: {})", 
-                                e, dave_skip_count, sigil_guard.is_established());
-                        }
-                        continue;
+                } else {
+                    // MLS not ready yet — send raw Opus (unencrypted, Discord accepts this)
+                    dave_skip_count += 1;
+                    if dave_skip_count == 1 || dave_skip_count % 500 == 0 {
+                        info!("🔒 DAVE pending ({}), sending raw Opus frames", dave_skip_count);
                     }
+                    info!("🔓 Sending raw Opus frame {}", frames_sent + 1);
+                    opus_data.to_vec()
                 }
             };
 
             // --- 4. Transport encrypt (AES-256-GCM) ---
             let rtp_header = crate::udp::build_rtp_header(seq, timestamp, self.ssrc);
             let udp_payload = match crate::udp::transport_encrypt_rtpsize(
-                &secret_key, &rtp_header, &dave_ciphertext, nonce_counter
+                &secret_key, &rtp_header, &audio_payload, nonce_counter
             ) {
                 Ok(p) => p,
                 Err(e) => {

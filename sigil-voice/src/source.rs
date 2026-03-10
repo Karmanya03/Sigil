@@ -1,7 +1,7 @@
 use std::process::Stdio;
 use tokio::process::Command;
 use tokio::io::{AsyncReadExt, AsyncBufReadExt, BufReader};
-use tracing::{info, error};
+use tracing::{info, error, debug};
 use std::sync::Arc;
 
 /// A utility to spawn `yt-dlp` to resolve a URL or search query into a direct playable audio
@@ -15,9 +15,9 @@ pub struct YtDlpSource;
 /// 3. cookies.txt in current working directory (default fallback)
 fn get_cookies_for_ffmpeg() -> Option<String> {
     // Priority 1: Check for raw cookie string in environment variable
-    if let Ok(cookies) = std::env::var("YOUTUBE_COOKIES") {
+    if let Ok(cookies) = std::env::var("YT_COOKIES") {
         if !cookies.is_empty() {
-            info!("Using cookies from YOUTUBE_COOKIES env var");
+            info!("Using cookies from YT_COOKIES env var");
             return Some(cookies);
         }
     }
@@ -85,7 +85,7 @@ impl YtDlpSource {
             format!("ytsearch1:{}", query)
         };
 
-        let cookies_file = std::env::var("YOUTUBE_COOKIES").unwrap_or_else(|_| "cookies.txt".to_string());
+        let cookies_file = std::env::var("YT_COOKIES").unwrap_or_else(|_| "cookies.txt".to_string());
         
         let mut cmd = Command::new("yt-dlp");
         cmd.args(&[
@@ -139,7 +139,14 @@ impl YtDlpSource {
         pcm_tx: tokio::sync::mpsc::Sender<Vec<i16>>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut cmd = Command::new("ffmpeg");
-        cmd.args(&["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"]);
+        cmd.args(&[
+            "-reconnect", "1", 
+            "-reconnect_streamed", "1", 
+            "-reconnect_delay_max", "5",
+            "-nostdin",
+            "-loglevel", "error",
+            "-hide_banner",
+        ]);
         
         // Build headers string, including cookies if available
         let mut full_headers = headers.to_string();
@@ -158,7 +165,14 @@ impl YtDlpSource {
         }
         
         cmd.args(&["-i", direct_url])
-            .args(&["-f", "s16le", "-ar", "48000", "-ac", "2"])
+            .args(&[
+                "-f", "s16le", 
+                "-ar", "48000", 
+                "-ac", "2",
+                "-acodec", "pcm_s16le",
+                "-af", "aresample=48000",
+                "-af", "channels=2",
+            ])
             .arg("-")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -188,6 +202,13 @@ impl YtDlpSource {
                 if !got_audio_clone.load(std::sync::atomic::Ordering::SeqCst) {
                     info!("FFmpeg Init: {}", l);
                 } else if l.to_lowercase().contains("error") || l.to_lowercase().contains("failed") {
+                    if l.contains("Error muxing") 
+                        || l.contains("Error writing trailer") 
+                        || l.contains("Error closing file")
+                        || l.contains("Conversion failed") {
+                        debug!("FFmpeg shutdown noise (pipe closed): {}", l);
+                        continue;
+                    }
                     error!("FFmpeg Error: {}", l);
                 }
                 line.clear();
