@@ -11,6 +11,10 @@ use crate::gateway::{
 };
 use crate::udp::{receive_ip_discovery, send_ip_discovery};
 
+/// Opus silence frame — 3 bytes that decode to 20 ms of silence.
+/// Discord requires 5 of these when audio stops to avoid decoder artifacts.
+const OPUS_SILENCE: [u8; 3] = [0xF8, 0xFF, 0xFE];
+
 pub struct CoreDriver {
     pub udp:         Arc<UdpSocket>,
     pub sigil:       Arc<Mutex<SigilSession>>,
@@ -106,7 +110,6 @@ impl CoreDriver {
             .map_err(|_| "Timed out waiting for SessionDescription")?
             .map_err(|e| format!("SessionDescription error: {:?}", e))?;
 
-        // Validate key length — must be 32 bytes for AES-256-GCM
         if session_desc.secret_key.len() != 32 {
             return Err(format!(
                 "Wrong secret_key length: {} (expected 32 for aead_aes256_gcm_rtpsize)",
@@ -134,9 +137,10 @@ impl CoreDriver {
             interval.tick().await; // skip first immediate tick
             let mut seq_ack:    Option<u64> = None;
             let mut binary_seq: u16         = 0;
+            let mut hb_nonce:   u64         = 0;
+            let mut hb_acked                = true; // assume first is OK
             info!("🔄 WS background task started (hb={}ms)", heartbeat_interval);
 
-            // Helper closure to send a binary DAVE response
             macro_rules! send_bin {
                 ($op:expr, $data:expr) => {{
                     let mut buf = vec![0u8; 3];
@@ -152,7 +156,8 @@ impl CoreDriver {
 
             macro_rules! send_text {
                 ($op:expr, $val:expr) => {{
-                    let pkt = VoicePacket { op: $op, d: Some($val), s: None, t: None, seq_ack: None };
+                    let mut pkt = VoicePacket { op: $op, d: Some($val), s: None, t: None, seq_ack: None };
+                    pkt.seq_ack = seq_ack;
                     if let Ok(txt) = serde_json::to_string(&pkt) {
                         let _ = ws_tx.send(
                             tokio_tungstenite::tungstenite::Message::Text(txt.into())
@@ -165,13 +170,20 @@ impl CoreDriver {
                 tokio::select! {
                     // ── Heartbeat ────────────────────────────────────────
                     _ = interval.tick() => {
-                        let nonce = std::time::SystemTime::now()
+                        // FIX: detect zombie connection — if previous HB wasn't ACKed,
+                        // the connection is dead. Log but continue (Discord may be slow).
+                        if !hb_acked {
+                            warn!("⚠️ Previous heartbeat not ACKed — connection may be zombied");
+                        }
+
+                        hb_nonce = std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_millis() as u64;
+
                         let hb = VoicePacket {
                             op: 3,
-                            d: Some(serde_json::json!(nonce)),
+                            d: Some(serde_json::json!(hb_nonce)),
                             s: None, t: None, seq_ack,
                         };
                         if let Ok(txt) = serde_json::to_string(&hb) {
@@ -182,6 +194,7 @@ impl CoreDriver {
                                 break;
                             }
                         }
+                        hb_acked = false;
                     }
 
                     // ── Outbound command from driver ──────────────────────
@@ -223,7 +236,10 @@ impl CoreDriver {
                                     seq_ack = Some(seq);
                                 }
                                 match pkt.op {
-                                    6 => debug!("Heartbeat ACK"),
+                                    6 => {
+                                        hb_acked = true;
+                                        debug!("Heartbeat ACK");
+                                    }
                                     5 => {
                                         if let Some(d) = pkt.d {
                                             if let Ok(spk) = serde_json::from_value::<
@@ -239,6 +255,18 @@ impl CoreDriver {
                                             }
                                         }
                                     }
+                                    9 => {
+                                        // OP 9 = Resumed. Log and continue.
+                                        info!("Voice WS resumed");
+                                    }
+                                    13 => {
+                                        // OP 13 = Client Connect (voice user joined)
+                                        debug!("Client connected (OP 13)");
+                                    }
+                                    18 => {
+                                        // OP 18 = Client Disconnect
+                                        debug!("Client disconnected (OP 18)");
+                                    }
                                     _ => debug!("Text OP {}", pkt.op),
                                 }
                             }
@@ -249,7 +277,6 @@ impl CoreDriver {
                                 let opcode = bin[2];
                                 debug!("DAVE binary OP {} ({} bytes)", opcode, bin.len());
 
-                                // Lock sigil only for the duration of event dispatch
                                 let mut s = sigil_clone.lock().await;
                                 let event = match s.handle_gateway_event(opcode, &bin) {
                                     Ok(e)  => e,
@@ -267,12 +294,12 @@ impl CoreDriver {
                                         send_text!(23, serde_json::to_value(
                                             ReadyForTransition { transition_id: p.transition_id }
                                         ).unwrap_or_default());
-                                        info!("DAVE: → OP 23 ReadyForTransition");
+                                        info!("DAVE: → OP 23 ReadyForTransition (tid={})", p.transition_id);
                                     }
 
                                     // ── OP 22: ExecuteTransition ──────────
                                     DaveEvent::ExecuteTransition(e) => {
-                                        info!("DAVE: ExecuteTransition ({})", e.transition_id);
+                                        info!("DAVE: ExecuteTransition (tid={})", e.transition_id);
                                     }
 
                                     // ── OP 24: PrepareEpoch ───────────────
@@ -302,7 +329,6 @@ impl CoreDriver {
                                         match s.export_sender_keys(&[uid]) {
                                             Ok(keys) if keys.contains_key(&uid) => {
                                                 info!("DAVE: ✅ Own key exported (OP 25)");
-                                                // Notify mixing loop — DAVE is ready
                                                 dave_ready_clone.notify_one();
                                             }
                                             Ok(_) => error!("DAVE: export_sender_keys missing own key"),
@@ -335,7 +361,6 @@ impl CoreDriver {
                                                     Err(e) => error!("DAVE: export failed: {:?}", e),
                                                 }
 
-                                                // OP 12: notify Discord we're encryption-ready
                                                 send_text!(12, serde_json::json!({
                                                     "audio_ssrc": my_ssrc,
                                                     "video_ssrc": 0,
@@ -367,6 +392,14 @@ impl CoreDriver {
                                             Err(e) => error!("DAVE: export failed: {:?}", e),
                                         }
 
+                                        // FIX: Send OP 23 ReadyForTransition after Welcome
+                                        // The Welcome carries a transition_id that must be ACKed.
+                                        use sigil_discord::gateway::opcodes::ReadyForTransition;
+                                        send_text!(23, serde_json::to_value(
+                                            ReadyForTransition { transition_id: w.transition_id }
+                                        ).unwrap_or_default());
+                                        info!("DAVE: → OP 23 ReadyForTransition (welcome tid={})", w.transition_id);
+
                                         send_text!(12, serde_json::json!({
                                             "audio_ssrc": my_ssrc,
                                             "video_ssrc": 0,
@@ -380,11 +413,22 @@ impl CoreDriver {
                                     DaveEvent::MlsAnnounceCommitTransition(c) => {
                                         match s.process_commit(&c.commit_bytes) {
                                             Ok(epoch) => info!("DAVE: ✅ Commit processed, epoch={}", epoch),
-                                            Err(e)    => {
+                                            Err(e) => {
                                                 error!("DAVE: process_commit failed: {:?}", e);
                                                 continue;
                                             }
                                         }
+
+                                        // FIX: Must send OP 23 ReadyForTransition after
+                                        // processing the commit. Without this, the voice
+                                        // gateway stalls waiting for our ACK and may tear
+                                        // down the session.
+                                        use sigil_discord::gateway::opcodes::ReadyForTransition;
+                                        send_text!(23, serde_json::to_value(
+                                            ReadyForTransition { transition_id: c.transition_id }
+                                        ).unwrap_or_default());
+                                        info!("DAVE: → OP 23 ReadyForTransition (commit tid={})", c.transition_id);
+
                                         let uid = s.user_id;
                                         if let Ok(keys) = s.export_sender_keys(&[uid]) {
                                             if keys.contains_key(&uid) {
@@ -395,6 +439,23 @@ impl CoreDriver {
                                     }
                                 }
                                 // sigil lock dropped here
+                            }
+
+                            // ── Ping → Pong (keep WS alive) ──────────────
+                            tokio_tungstenite::tungstenite::Message::Ping(data) => {
+                                let _ = ws_tx.send(
+                                    tokio_tungstenite::tungstenite::Message::Pong(data)
+                                ).await;
+                            }
+
+                            // ── Close frame — log code and exit ───────────
+                            tokio_tungstenite::tungstenite::Message::Close(frame) => {
+                                if let Some(f) = frame {
+                                    warn!("Voice WS closed: code={}, reason={}", f.code, f.reason);
+                                } else {
+                                    warn!("Voice WS closed (no close frame)");
+                                }
+                                break;
                             }
 
                             _ => {}
@@ -433,9 +494,11 @@ impl CoreDriver {
         let mut tracks = self.tracks.lock().await;
         info!("⏹️ Stopping {} track(s)", tracks.len());
         tracks.clear();
+        // Note: silence frames are sent by the mixing loop when it detects
+        // no active tracks (see `was_active` logic in start_mixing).
     }
 
-    /// Audio engine loop — 20ms tick: mix PCM → Opus encode → DAVE/raw encrypt → UDP send.
+    /// Audio engine loop — 20ms tick: mix PCM → Opus encode → DAVE encrypt → transport encrypt → UDP send.
     pub async fn start_mixing(
         &self,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -446,20 +509,19 @@ impl CoreDriver {
             .map_err(|e| format!("AudioEncoder::new: {:?}", e))?;
         info!("🎙️ AudioEncoder created");
 
-        // ── Wait for DAVE readiness using Notify (zero-overhead, no polling) ──
-        // Timeout after 5s — fall back to raw Opus if DAVE never negotiates.
+        // ── Wait for DAVE readiness (zero-overhead, no polling) ───────────
         let dave_established = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
+            std::time::Duration::from_secs(8),
             self.dave_ready.notified(),
         ).await.is_ok();
 
         if dave_established {
             info!("✅ DAVE ready — audio will be E2EE encrypted");
         } else {
-            warn!("⚠️ DAVE not ready after 5s — sending raw Opus (no E2EE)");
+            warn!("⚠️ DAVE not ready after 8s — sending raw Opus (no E2EE)");
         }
 
-        // ── OP 5 Speaking — sent immediately before first RTP packet ──────
+        // ── OP 5 Speaking — MUST be sent before first RTP packet ─────────
         let speaking = crate::gateway::Speaking {
             speaking: 1, delay: 0, ssrc: self.ssrc, user_id: None,
         };
@@ -478,6 +540,8 @@ impl CoreDriver {
         let mut opus_buf           = [0u8; 4000];
         let mut frames_sent:   u64 = 0;
         let mut dave_failures: u64 = 0;
+        let mut was_active         = false;
+        let mut silence_sent:  u8  = 0;
 
         let mut ticker = tokio::time::interval(std::time::Duration::from_millis(20));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -486,7 +550,7 @@ impl CoreDriver {
             ticker.tick().await;
 
             // ── 1. Mix PCM from all active tracks ─────────────────────────
-            let mut mixed = vec![0i32; 1920]; // i32 accumulator avoids overflow
+            let mut mixed = vec![0i32; 1920];
             let mut active = false;
             {
                 let mut tracks = self.tracks.lock().await;
@@ -521,22 +585,81 @@ impl CoreDriver {
                             }
                         }
                     } else {
-                        active = true; // Track is locked by another task, assume playing
+                        active = true;
                     }
                 }
             }
 
-            if !active { continue; }
+            // ── FIX: Send 5 Opus silence frames when audio stops ──────────
+            // Discord's Opus decoder interpolates the last packet if it doesn't
+            // receive silence frames, causing clicks/pops. Per the voice spec,
+            // send exactly 5 frames of [0xF8, 0xFF, 0xFE].
+            if !active && was_active && silence_sent < 5 {
+                let rtp_hdr = crate::udp::build_rtp_header(seq, timestamp, self.ssrc);
+                let payload = {
+                    let mut s = self.sigil.lock().await;
+                    if s.has_own_key() {
+                        match s.encrypt_own_frame(&OPUS_SILENCE, sigil_discord::crypto::codec::Codec::Opus) {
+                            Ok(ct) => ct,
+                            Err(_) => OPUS_SILENCE.to_vec(),
+                        }
+                    } else {
+                        OPUS_SILENCE.to_vec()
+                    }
+                };
+                if let Ok(pkt) = crate::udp::transport_encrypt_rtpsize(
+                    &secret_key, &rtp_hdr, &payload, nonce_counter,
+                ) {
+                    let _ = self.udp.send_to(&pkt, &self.target_addr).await;
+                }
+                seq           = seq.wrapping_add(1);
+                timestamp     = timestamp.wrapping_add(960);
+                nonce_counter = nonce_counter.wrapping_add(1);
+                silence_sent += 1;
+
+                if silence_sent == 5 {
+                    info!("🔇 Sent 5 silence frames (audio stopped cleanly)");
+                    // Send OP 5 Speaking=0 to tell Discord we stopped
+                    let stop_speaking = crate::gateway::Speaking {
+                        speaking: 0, delay: 0, ssrc: self.ssrc, user_id: None,
+                    };
+                    if let Ok(d) = serde_json::to_value(&stop_speaking) {
+                        let _ = self.ws_tx_channel.send(crate::gateway::WsMessage::Text(VoicePacket {
+                            op: 5, d: Some(d), s: None, t: None, seq_ack: None,
+                        })).await;
+                    }
+                }
+                continue;
+            }
+
+            if !active {
+                continue;
+            }
+
+            // Reset silence counter when audio becomes active again
+            if active && !was_active {
+                silence_sent = 0;
+                // Re-send OP 5 Speaking=1 when resuming
+                let resume_speaking = crate::gateway::Speaking {
+                    speaking: 1, delay: 0, ssrc: self.ssrc, user_id: None,
+                };
+                if let Ok(d) = serde_json::to_value(&resume_speaking) {
+                    let _ = self.ws_tx_channel.send(crate::gateway::WsMessage::Text(VoicePacket {
+                        op: 5, d: Some(d), s: None, t: None, seq_ack: None,
+                    })).await;
+                    info!("🎙️ Re-sent OP 5 Speaking (resumed)");
+                }
+            }
+            was_active = active;
 
             // Clamp i32 accumulator → i16
             let pcm: Vec<i16> = mixed.iter()
                 .map(|&s| s.clamp(i16::MIN as i32, i16::MAX as i32) as i16)
                 .collect();
 
-            // Periodic amplitude check (every 10s)
             if frames_sent % 500 == 0 {
                 let avg: i64 = pcm.iter().map(|&s| s.abs() as i64).sum::<i64>()
-                    / pcm.len() as i64;
+                    / pcm.len().max(1) as i64;
                 info!("🎙️ Amplitude avg={} frames_sent={}", avg, frames_sent);
             }
 
@@ -565,9 +688,8 @@ impl CoreDriver {
                         }
                     }
                 } else {
-                    opus.to_vec() // DAVE not ready — send raw (Discord allows this)
+                    opus.to_vec()
                 }
-                // sigil lock released here
             };
 
             // ── 4. Transport encrypt (AES-256-GCM rtpsize) ────────────────
@@ -622,7 +744,7 @@ impl CoreDriver {
                     Err(e) => { error!("UDP recv error: {:?}", e); break; }
                 };
 
-                if n < 12 + 16 + 4 { continue; } // too short for rtpsize
+                if n < 12 + 16 + 4 { continue; }
 
                 let pkt = &buf[..n];
                 let ssrc = u32::from_be_bytes([pkt[8], pkt[9], pkt[10], pkt[11]]);

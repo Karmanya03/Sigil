@@ -8,51 +8,54 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 pub struct YtDlpSource;
 
-// ─── Cookie helpers ──────────────────────────────────────────────────────────
+// ── Constants ────────────────────────────────────────────────────────────────
 
-fn get_cookies_for_ffmpeg() -> Option<String> {
-    // Priority 1: Raw cookie string env var
-    if let Ok(c) = std::env::var("YT_COOKIES") {
-        if !c.is_empty() && !std::path::Path::new(&c).exists() {
-            // It's a raw cookie string, not a file path
-            return Some(c);
-        }
-    }
-    // Priority 2: Cookie file path env var
-    if let Ok(path) = std::env::var("YOUTUBE_COOKIES_FILE") {
-        if std::path::Path::new(&path).exists() {
-            if let Some(c) = parse_cookies_file(&path) {
-                return Some(c);
-            }
-        }
-    }
-    // Priority 3: Default cookies.txt
-    if std::path::Path::new("cookies.txt").exists() {
-        return parse_cookies_file("cookies.txt");
-    }
-    None
-}
+/// 960 stereo samples × 2 bytes/sample × 2 channels = one 20 ms Opus frame
+const FRAME_BYTES: usize = 3840;
 
-/// Resolve the cookies.txt file path for yt-dlp --cookies flag.
-/// Returns the path if a Netscape-format cookie file exists.
+/// Pre-buffer depth: 128 KiB ≈ 340 ms of s16le stereo 48 kHz
+const READER_BUF: usize = 128 * 1024;
+
+/// mpsc channel depth: 512 frames ≈ 10.2 s of PCM — absorbs MLS handshake delay
+const CHANNEL_DEPTH: usize = 512;
+
+// ── Cookie helpers ───────────────────────────────────────────────────────────
+
+/// Return a filesystem path suitable for `yt-dlp --cookies <path>`.
+/// Checks `YOUTUBE_COOKIES_FILE` env first, then `YT_COOKIES` (if it points to
+/// a file), then falls back to `./cookies.txt`.
 fn get_cookies_file_path() -> Option<String> {
-    // Priority 1: YT_COOKIES env — only if it's a file path (not raw cookies)
-    if let Ok(val) = std::env::var("YT_COOKIES") {
-        if std::path::Path::new(&val).exists() {
-            return Some(val);
-        }
-    }
-    // Priority 2: YOUTUBE_COOKIES_FILE env
+    // Explicit file path env
     if let Ok(path) = std::env::var("YOUTUBE_COOKIES_FILE") {
         if std::path::Path::new(&path).exists() {
             return Some(path);
         }
     }
-    // Priority 3: cookies.txt in cwd
+    // YT_COOKIES might be a path (legacy)
+    if let Ok(val) = std::env::var("YT_COOKIES") {
+        if !val.is_empty() && std::path::Path::new(&val).exists() {
+            return Some(val);
+        }
+    }
+    // Default
     if std::path::Path::new("cookies.txt").exists() {
         return Some("cookies.txt".to_string());
     }
     None
+}
+
+/// Return a `Cookie: …` value for ffmpeg's `-headers`. Parses Netscape-format
+/// cookie files into `name=value; …` pairs.
+fn get_cookies_for_ffmpeg() -> Option<String> {
+    // If YT_COOKIES is a raw cookie string (not a file), use it directly
+    if let Ok(c) = std::env::var("YT_COOKIES") {
+        if !c.is_empty() && !std::path::Path::new(&c).exists() {
+            return Some(c);
+        }
+    }
+    // Otherwise parse from a file
+    let path = get_cookies_file_path()?;
+    parse_cookies_file(&path)
 }
 
 fn parse_cookies_file(path: &str) -> Option<String> {
@@ -76,14 +79,12 @@ fn parse_cookies_file(path: &str) -> Option<String> {
     Some(pairs.join("; "))
 }
 
-// ─── YtDlpSource ─────────────────────────────────────────────────────────────
+// ── YtDlpSource ──────────────────────────────────────────────────────────────
 
 impl YtDlpSource {
-    /// Resolve a URL or search query to a direct audio URL via yt-dlp.
-    ///
-    /// Uses `-J` (JSON dump) for single-pass resolution. Handles both direct
-    /// URLs (where `url` is at the root) and search queries (where yt-dlp
-    /// wraps the result in `entries[0]`).
+    /// Resolve a URL **or** search query to a direct audio stream URL via
+    /// `yt-dlp -J`. For `ytsearch1:` queries the real URL lives inside
+    /// `entries[0]` — not at the root level.
     pub async fn get_direct_url_and_headers(
         query: &str,
     ) -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>> {
@@ -101,7 +102,6 @@ impl YtDlpSource {
             "--no-warnings",
         ]);
 
-        // Use the resolved cookie file path (not raw cookie string)
         if let Some(cookie_path) = get_cookies_file_path() {
             cmd.arg("--cookies").arg(&cookie_path);
         }
@@ -116,66 +116,58 @@ impl YtDlpSource {
         let json_str = String::from_utf8(output.stdout)?;
         let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
 
-        // ─── FIX: handle both direct URLs and search results ─────────
-        // Direct URL → `parsed["url"]` exists at root.
-        // Search query → yt-dlp returns `{ "_type": "playlist", "entries": [{ "url": ... }] }`
-        // so we must dig into entries[0].
-        let entry = if parsed.get("url").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty()) {
-            // Direct URL — metadata is at root
-            &parsed
-        } else if let Some(first) = parsed.get("entries")
-            .and_then(|e| e.as_array())
-            .and_then(|arr| arr.first())
-        {
-            // Search result — metadata is inside entries[0]
-            first
+        // ── FIX: for `ytsearch1:` results the URL is inside entries[0] ───
+        let entry = if parsed["url"].as_str().filter(|s| !s.is_empty()).is_some() {
+            &parsed                        // direct URL / single video
+        } else if let Some(first) = parsed["entries"].get(0) {
+            first                          // search result → unwrap entries
         } else {
-            return Err("yt-dlp returned no playable results".into());
+            return Err("yt-dlp returned no URL and no entries".into());
         };
 
-        let url = entry.get("url")
-            .and_then(|v| v.as_str())
+        let url = entry["url"]
+            .as_str()
             .filter(|s| !s.is_empty())
-            .ok_or("yt-dlp resolved entry has no stream URL")?
+            .ok_or("yt-dlp: resolved entry has empty URL")?
             .to_string();
 
-        // Extract HTTP headers from the same entry (or fall back to root)
+        // Headers may live in the entry or at root level
         let mut header_str = String::new();
-        let headers_obj = entry.get("http_headers")
-            .or_else(|| parsed.get("http_headers"))
-            .and_then(|v| v.as_object());
-        if let Some(hdrs) = headers_obj {
-            for (k, v) in hdrs {
+        let hdrs = entry
+            .get("http_headers")
+            .and_then(|v| v.as_object())
+            .or_else(|| parsed.get("http_headers").and_then(|v| v.as_object()));
+        if let Some(h) = hdrs {
+            for (k, v) in h {
                 if let Some(vs) = v.as_str() {
                     header_str.push_str(&format!("{}: {}\r\n", k, vs));
                 }
             }
         }
 
-        info!("Resolved URL ({}...)", &url[..url.len().min(60)]);
+        info!("Resolved URL ({}...)", &url[..url.len().min(80)]);
         Ok((url, header_str))
     }
 
-    /// Spawn ffmpeg, pipe raw s16le 48 kHz stereo PCM into `pcm_tx`.
-    ///
-    /// The caller owns the `Receiver` end. When it drops, the ffmpeg process
-    /// is killed automatically (child is moved into the spawned task).
+    /// Spawn `ffmpeg`, pipe raw s16le 48 kHz stereo PCM into `pcm_tx`.
     pub async fn spawn_ffmpeg_stream(
         direct_url: &str,
         headers: &str,
         pcm_tx: mpsc::Sender<Vec<i16>>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut cmd = Command::new("ffmpeg");
+
+        // ── Input options ─────────────────────────────────────────────────
         cmd.args(&[
-            "-reconnect", "1",
-            "-reconnect_streamed", "1",
+            "-reconnect",           "1",
+            "-reconnect_streamed",  "1",
             "-reconnect_delay_max", "5",
             "-nostdin",
             "-loglevel", "error",
             "-hide_banner",
         ]);
 
-        // Combine yt-dlp headers + cookie header for ffmpeg
+        // Combine yt-dlp headers + cookies into one `-headers` value
         let mut full_headers = headers.to_string();
         if let Some(cookie) = get_cookies_for_ffmpeg() {
             if !full_headers.is_empty() && !full_headers.ends_with("\r\n") {
@@ -189,8 +181,9 @@ impl YtDlpSource {
 
         cmd.args(&["-i", direct_url]);
 
-        // Single -af chain: resample → format → output.
-        // Two separate -af flags would cause the second to silently override the first!
+        // ── Output options ────────────────────────────────────────────────
+        // Single -af chain: resample → format (avoids the silent-override bug
+        // where a second -af flag discards the first).
         cmd.args(&[
             "-af", "aresample=48000,aformat=sample_fmts=s16:channel_layouts=stereo",
             "-f",  "s16le",
@@ -210,9 +203,9 @@ impl YtDlpSource {
         let stderr = child.stderr.take().expect("ffmpeg stderr");
 
         let got_audio = Arc::new(AtomicBool::new(false));
-        let got_audio_stderr = got_audio.clone();
+        let got_audio_clone = got_audio.clone();
 
-        // ─── stderr logger ────────────────────────────────────────────
+        // ── stderr logger ─────────────────────────────────────────────────
         tokio::spawn(async move {
             let mut reader = BufReader::new(stderr);
             let mut line = String::new();
@@ -229,12 +222,11 @@ impl YtDlpSource {
                     || l.contains("Conversion failed");
 
                 if is_shutdown_noise {
-                    debug!("FFmpeg pipe-close noise (normal on stop): {}", l);
-                } else if !got_audio_stderr.load(Ordering::Relaxed) {
+                    debug!("FFmpeg pipe-close noise: {}", l);
+                } else if !got_audio_clone.load(Ordering::Relaxed) {
                     info!("FFmpeg init: {}", l);
                 } else if l.to_lowercase().contains("error")
-                    || l.to_lowercase().contains("failed")
-                {
+                       || l.to_lowercase().contains("failed") {
                     error!("FFmpeg error: {}", l);
                 } else {
                     debug!("FFmpeg: {}", l);
@@ -243,31 +235,27 @@ impl YtDlpSource {
             }
         });
 
-        // ─── PCM reader ───────────────────────────────────────────────
-        // 128 KiB buffer ≈ 340 ms of pre-buffered audio at 48 kHz stereo s16le.
-        let mut reader = BufReader::with_capacity(128 * 1024, stdout);
+        // ── PCM reader ────────────────────────────────────────────────────
+        let mut reader = BufReader::with_capacity(READER_BUF, stdout);
 
         tokio::spawn(async move {
-            let _child = child; // Guard — drops child (kills ffmpeg) when task ends
+            let _child = child; // child is killed when this task exits
 
-            // 3840 bytes = 960 samples × 2 channels × 2 bytes = one 20 ms frame
-            const FRAME_BYTES: usize = 3840;
             let mut chunk = vec![0u8; FRAME_BYTES];
             let mut frames_produced: u64 = 0;
 
             loop {
                 // Fill exactly one 20 ms frame
-                let mut cursor = 0usize;
+                let mut cursor = 0;
                 loop {
                     match reader.read(&mut chunk[cursor..]).await {
                         Ok(0) => {
                             if cursor > 0 {
-                                warn!("FFmpeg EOF mid-frame ({}/{} bytes), discarding", cursor, FRAME_BYTES);
+                                warn!("FFmpeg EOF mid-frame ({cursor} bytes), discarding");
                             }
                             info!(
                                 "FFmpeg PCM stream ended after {} frames (~{}s)",
-                                frames_produced,
-                                frames_produced / 50
+                                frames_produced, frames_produced / 50
                             );
                             return;
                         }
@@ -287,7 +275,6 @@ impl YtDlpSource {
                     info!("🎞️ FFmpeg producing PCM frames");
                 }
 
-                // Convert raw bytes → i16 PCM samples
                 let pcm: Vec<i16> = chunk
                     .chunks_exact(2)
                     .map(|b| i16::from_le_bytes([b[0], b[1]]))
@@ -295,7 +282,7 @@ impl YtDlpSource {
 
                 frames_produced += 1;
                 if frames_produced % 500 == 0 {
-                    debug!("FFmpeg heartbeat: {} frames (~{}s)", frames_produced, frames_produced / 50);
+                    debug!("FFmpeg: {} frames (~{}s)", frames_produced, frames_produced / 50);
                 }
 
                 if pcm_tx.send(pcm).await.is_err() {
@@ -308,27 +295,25 @@ impl YtDlpSource {
         Ok(())
     }
 
-    /// One-shot: resolve → spawn ffmpeg → return a ready-to-play Track.
+    /// Convenience: resolve + spawn ffmpeg → return a Track ready for playback.
     pub async fn create_track(
         query: &str,
     ) -> Result<crate::track::Track, Box<dyn std::error::Error + Send + Sync>> {
         let (direct_url, headers) = Self::get_direct_url_and_headers(query).await?;
-        // Channel depth 512 ≈ 10 s of pre-buffered PCM — absorbs MLS handshake delay.
-        let (tx, rx) = mpsc::channel(512);
+        let (tx, rx) = mpsc::channel(CHANNEL_DEPTH);
         Self::spawn_ffmpeg_stream(&direct_url, &headers, tx).await?;
 
         use crate::track::{Track, PlayState, ChannelSource};
         use std::sync::atomic::AtomicU8;
         Ok(Track {
-            source:   Box::new(ChannelSource { receiver: rx }),
-            state:    Arc::new(AtomicU8::new(PlayState::Playing as u8)),
-            volume:   1.0,
-            loops:    1,
+            source: Box::new(ChannelSource { receiver: rx }),
+            state: Arc::new(AtomicU8::new(PlayState::Playing as u8)),
+            volume: 1.0,
+            loops: 1,
             event_tx: None,
         })
     }
 
-    /// Alias for `create_track` — kept for backward compat.
     pub async fn search_and_play(
         query: &str,
     ) -> Result<crate::track::Track, Box<dyn std::error::Error + Send + Sync>> {
