@@ -253,10 +253,16 @@ impl CoreDriver {
                             .unwrap_or_default()
                             .as_millis() as u64;
 
+                        // V8 heartbeat: seq_ack goes INSIDE d, not at top level
+                        let mut hb_d = serde_json::json!({"t": hb_nonce});
+                        if let Some(sa) = seq_ack {
+                            hb_d["seq_ack"] = serde_json::json!(sa);
+                        }
+
                         let hb = VoicePacket {
                             op: 3,
-                            d: Some(serde_json::json!(hb_nonce)),
-                            s: None, t: None, seq_ack,
+                            d: Some(hb_d),
+                            s: None, t: None, seq_ack: None,
                         };
                         if let Ok(txt) = serde_json::to_string(&hb) {
                             if ws_tx.send(
@@ -312,9 +318,13 @@ impl CoreDriver {
                                     6 => {
                                         hb_acked = true;
                                         if let Some(d) = &pkt.d {
-                                            if let Some(ack_nonce) = d.as_u64() {
-                                                if ack_nonce != hb_nonce {
-                                                    warn!("Heartbeat ACK nonce mismatch: sent={}, got={}", hb_nonce, ack_nonce);
+                                            // V8 ACK format: {"t": nonce} or just nonce (compat)
+                                            let ack_nonce = d.get("t")
+                                                .and_then(|v| v.as_u64())
+                                                .or_else(|| d.as_u64());
+                                            if let Some(n) = ack_nonce {
+                                                if n != hb_nonce {
+                                                    warn!("Heartbeat ACK nonce mismatch: sent={}, got={}", hb_nonce, n);
                                                 }
                                             }
                                         }
