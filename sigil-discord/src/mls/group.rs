@@ -205,7 +205,8 @@ impl DaveGroup {
     ) -> Result<[u8; KEY_LENGTH], SigilError> {
         let context = sender_id.to_le_bytes();
 
-        // SENDER_KEY_LABEL is &[u8] = b"Discord Secure Frames v0"
+        // SENDER_KEY_LABEL is &[u8] = b"Discord Secure Frames v0" (from types.rs)
+        // This MUST match Discord's expected label exactly!
         // export_secret expects &str, so convert
         let label = std::str::from_utf8(SENDER_KEY_LABEL)
             .map_err(|e| SigilError::Mls(format!("label conversion: {}", e)))?;

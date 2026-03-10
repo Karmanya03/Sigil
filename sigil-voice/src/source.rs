@@ -1,12 +1,81 @@
 use std::process::Stdio;
 use tokio::process::Command;
 use tokio::io::{AsyncReadExt, AsyncBufReadExt, BufReader};
-use tracing::{info, error};
+use tracing::{info, error, debug};
 use std::sync::Arc;
 
 /// A utility to spawn `yt-dlp` to resolve a URL or search query into a direct playable audio
 /// stream, then pipe it into `ffmpeg` to produce raw 48kHz stereo 16-bit PCM.
 pub struct YtDlpSource;
+
+/// Reads cookies from the cookies.txt file and formats them for FFmpeg
+/// Supports three methods (in order of priority):
+/// 1. YOUTUBE_COOKIES env var - raw cookie string (name1=value1; name2=value2)
+/// 2. YOUTUBE_COOKIES_FILE env var - path to cookies.txt file
+/// 3. cookies.txt in current working directory (default fallback)
+fn get_cookies_for_ffmpeg() -> Option<String> {
+    // Priority 1: Check for raw cookie string in environment variable
+    if let Ok(cookies) = std::env::var("YT_COOKIES") {
+        if !cookies.is_empty() {
+            info!("Using cookies from YT_COOKIES env var");
+            return Some(cookies);
+        }
+    }
+    
+    // Priority 2: Check for cookie file path in environment variable
+    if let Ok(cookies_file) = std::env::var("YOUTUBE_COOKIES_FILE") {
+        if std::path::Path::new(&cookies_file).exists() {
+            if let Some(cookies) = parse_cookies_file(&cookies_file) {
+                return Some(cookies);
+            }
+        }
+    }
+    
+    // Priority 3: Default cookies.txt file
+    let cookies_file = "cookies.txt";
+    if std::path::Path::new(cookies_file).exists() {
+        if let Some(cookies) = parse_cookies_file(cookies_file) {
+            return Some(cookies);
+        }
+    }
+    
+    None
+}
+
+/// Parse a cookies.txt file (Netscape format) and return cookie header string
+fn parse_cookies_file(cookies_file: &str) -> Option<String> {
+    let content = std::fs::read_to_string(cookies_file).ok()?;
+    
+    // Parse cookies.txt (Netscape format) and extract cookie name=value pairs
+    let mut cookies_vec: Vec<String> = Vec::new();
+    
+    for line in content.lines() {
+        let line = line.trim();
+        // Skip comments and empty lines
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        
+        // Format: domain	flag	path	expire	name	value
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() >= 7 {
+            let name = parts[5];
+            let value = parts[6];
+            if !name.is_empty() && !value.is_empty() {
+                cookies_vec.push(format!("{}={}", name, value));
+            }
+        }
+    }
+    
+    if cookies_vec.is_empty() {
+        return None;
+    }
+    
+    // Join cookies with "; " (standard cookie separator)
+    let cookie_header = cookies_vec.join("; ");
+    info!("Loaded {} cookies from {}", cookies_vec.len(), cookies_file);
+    Some(cookie_header)
+}
 
 impl YtDlpSource {
     pub async fn get_direct_url_and_headers(query: &str) -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>> {
@@ -16,7 +85,7 @@ impl YtDlpSource {
             format!("ytsearch1:{}", query)
         };
 
-        let cookies_file = std::env::var("YOUTUBE_COOKIES").unwrap_or_else(|_| "cookies.txt".to_string());
+        let cookies_file = std::env::var("YT_COOKIES").unwrap_or_else(|_| "cookies.txt".to_string());
         
         let mut cmd = Command::new("yt-dlp");
         cmd.args(&[
@@ -70,14 +139,40 @@ impl YtDlpSource {
         pcm_tx: tokio::sync::mpsc::Sender<Vec<i16>>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut cmd = Command::new("ffmpeg");
-        cmd.args(&["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5"]);
+        cmd.args(&[
+            "-reconnect", "1", 
+            "-reconnect_streamed", "1", 
+            "-reconnect_delay_max", "5",
+            "-nostdin",
+            "-loglevel", "error",
+            "-hide_banner",
+        ]);
         
-        if !headers.is_empty() {
-            cmd.args(&["-headers", headers]);
+        // Build headers string, including cookies if available
+        let mut full_headers = headers.to_string();
+        
+        // Add cookies from cookies.txt to the headers
+        if let Some(cookie_header) = get_cookies_for_ffmpeg() {
+            if !full_headers.is_empty() && !full_headers.ends_with("\r\n") {
+                full_headers.push_str("\r\n");
+            }
+            full_headers.push_str(&format!("Cookie: {}\r\n", cookie_header));
+            info!("Added cookies to FFmpeg request");
+        }
+        
+        if !full_headers.is_empty() {
+            cmd.args(&["-headers", &full_headers]);
         }
         
         cmd.args(&["-i", direct_url])
-            .args(&["-f", "s16le", "-ar", "48000", "-ac", "2"])
+            .args(&[
+                "-f", "s16le", 
+                "-ar", "48000", 
+                "-ac", "2",
+                "-acodec", "pcm_s16le",
+                "-af", "aresample=48000",
+                "-af", "channels=2",
+            ])
             .arg("-")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -107,6 +202,13 @@ impl YtDlpSource {
                 if !got_audio_clone.load(std::sync::atomic::Ordering::SeqCst) {
                     info!("FFmpeg Init: {}", l);
                 } else if l.to_lowercase().contains("error") || l.to_lowercase().contains("failed") {
+                    if l.contains("Error muxing") 
+                        || l.contains("Error writing trailer") 
+                        || l.contains("Error closing file")
+                        || l.contains("Conversion failed") {
+                        debug!("FFmpeg shutdown noise (pipe closed): {}", l);
+                        continue;
+                    }
                     error!("FFmpeg Error: {}", l);
                 }
                 line.clear();
@@ -182,3 +284,4 @@ impl YtDlpSource {
         Self::create_track(query).await
     }
 }
+
