@@ -138,7 +138,8 @@ impl CoreDriver {
             let mut seq_ack:    Option<u64> = None;
             let mut binary_seq: u16         = 0;
             let mut hb_nonce:   u64         = 0;
-            let mut hb_acked                = true; // assume first is OK
+            let mut hb_acked                = true;
+            let mut encryption_ready_sent   = false;
             info!("🔄 WS background task started (hb={}ms)", heartbeat_interval);
 
             macro_rules! send_bin {
@@ -166,12 +167,26 @@ impl CoreDriver {
                 }};
             }
 
+            /// Helper: send OP 12 EncryptionReady (idempotent — only sends once)
+            macro_rules! send_encryption_ready {
+                () => {{
+                    if !encryption_ready_sent {
+                        send_text!(12, serde_json::json!({
+                            "audio_ssrc": my_ssrc,
+                            "video_ssrc": 0,
+                            "rtx_ssrc": 0,
+                            "encryption_ready": true
+                        }));
+                        encryption_ready_sent = true;
+                        info!("DAVE: → OP 12 EncryptionReady");
+                    }
+                }};
+            }
+
             loop {
                 tokio::select! {
                     // ── Heartbeat ────────────────────────────────────────
                     _ = interval.tick() => {
-                        // FIX: detect zombie connection — if previous HB wasn't ACKed,
-                        // the connection is dead. Log but continue (Discord may be slow).
                         if !hb_acked {
                             warn!("⚠️ Previous heartbeat not ACKed — connection may be zombied");
                         }
@@ -256,15 +271,12 @@ impl CoreDriver {
                                         }
                                     }
                                     9 => {
-                                        // OP 9 = Resumed. Log and continue.
                                         info!("Voice WS resumed");
                                     }
                                     13 => {
-                                        // OP 13 = Client Connect (voice user joined)
                                         debug!("Client connected (OP 13)");
                                     }
                                     18 => {
-                                        // OP 18 = Client Disconnect
                                         debug!("Client disconnected (OP 18)");
                                     }
                                     _ => debug!("Text OP {}", pkt.op),
@@ -300,6 +312,8 @@ impl CoreDriver {
                                     // ── OP 22: ExecuteTransition ──────────
                                     DaveEvent::ExecuteTransition(e) => {
                                         info!("DAVE: ExecuteTransition (tid={})", e.transition_id);
+                                        // Reset flag so we re-send OP 12 after next key export
+                                        encryption_ready_sent = false;
                                     }
 
                                     // ── OP 24: PrepareEpoch ───────────────
@@ -330,6 +344,10 @@ impl CoreDriver {
                                             Ok(keys) if keys.contains_key(&uid) => {
                                                 info!("DAVE: ✅ Own key exported (OP 25)");
                                                 dave_ready_clone.notify_one();
+                                                // FIX: Send OP 12 immediately after we have
+                                                // a working key. Don't wait for OP 27 which
+                                                // may fail with UnknownValue(16).
+                                                send_encryption_ready!();
                                             }
                                             Ok(_) => error!("DAVE: export_sender_keys missing own key"),
                                             Err(e) => error!("DAVE: export_sender_keys failed: {:?}", e),
@@ -338,38 +356,45 @@ impl CoreDriver {
 
                                     // ── OP 27: MlsProposals ───────────────
                                     DaveEvent::MlsProposals(prop) => {
-                                        if let Err(e) = s.process_proposals(&[prop.data.clone()]) {
-                                            error!("DAVE: process_proposals failed: {:?}", e);
-                                            continue;
-                                        }
-                                        match s.commit_and_welcome() {
-                                            Ok((commit, welcome)) => {
-                                                let mut payload = commit;
-                                                if let Some(w) = welcome {
-                                                    payload.extend_from_slice(&w);
-                                                }
-                                                send_bin!(28, payload);
-                                                info!("DAVE: → OP 28 CommitWelcome");
+                                        // FIX: Don't hard-fail on proposal errors.
+                                        // Discord may send proposal types our OpenMLS
+                                        // version doesn't support (e.g. UnknownValue(16)
+                                        // for external/custom proposals). The session
+                                        // stays valid — we just skip the commit.
+                                        match s.process_proposals(&[prop.data.clone()]) {
+                                            Ok(()) => {
+                                                match s.commit_and_welcome() {
+                                                    Ok((commit, welcome)) => {
+                                                        let mut payload = commit;
+                                                        if let Some(w) = welcome {
+                                                            payload.extend_from_slice(&w);
+                                                        }
+                                                        send_bin!(28, payload);
+                                                        info!("DAVE: → OP 28 CommitWelcome");
 
-                                                let uid = s.user_id;
-                                                match s.export_sender_keys(&[uid]) {
-                                                    Ok(keys) if keys.contains_key(&uid) => {
-                                                        info!("DAVE: ✅ Own key exported (OP 27)");
-                                                        dave_ready_clone.notify_one();
+                                                        let uid = s.user_id;
+                                                        match s.export_sender_keys(&[uid]) {
+                                                            Ok(keys) if keys.contains_key(&uid) => {
+                                                                info!("DAVE: ✅ Own key exported (OP 27)");
+                                                                dave_ready_clone.notify_one();
+                                                            }
+                                                            Ok(_) => error!("DAVE: missing own key after commit"),
+                                                            Err(e) => error!("DAVE: export failed: {:?}", e),
+                                                        }
+
+                                                        send_encryption_ready!();
                                                     }
-                                                    Ok(_) => error!("DAVE: missing own key after commit"),
-                                                    Err(e) => error!("DAVE: export failed: {:?}", e),
+                                                    Err(e) => error!("DAVE: commit_and_welcome failed: {:?}", e),
                                                 }
-
-                                                send_text!(12, serde_json::json!({
-                                                    "audio_ssrc": my_ssrc,
-                                                    "video_ssrc": 0,
-                                                    "rtx_ssrc": 0,
-                                                    "encryption_ready": true
-                                                }));
-                                                info!("DAVE: → OP 12 EncryptionReady");
                                             }
-                                            Err(e) => error!("DAVE: commit_and_welcome failed: {:?}", e),
+                                            Err(e) => {
+                                                // FIX: gracefully skip — don't `continue` which
+                                                // would prevent OP 12 from ever being sent.
+                                                warn!("DAVE: Skipping unprocessable proposal: {:?}", e);
+                                                // Still send OP 12 if we already have a key
+                                                // (from OP 25) — the session is still valid.
+                                                send_encryption_ready!();
+                                            }
                                         }
                                     }
 
@@ -392,21 +417,13 @@ impl CoreDriver {
                                             Err(e) => error!("DAVE: export failed: {:?}", e),
                                         }
 
-                                        // FIX: Send OP 23 ReadyForTransition after Welcome
-                                        // The Welcome carries a transition_id that must be ACKed.
                                         use sigil_discord::gateway::opcodes::ReadyForTransition;
                                         send_text!(23, serde_json::to_value(
                                             ReadyForTransition { transition_id: w.transition_id }
                                         ).unwrap_or_default());
                                         info!("DAVE: → OP 23 ReadyForTransition (welcome tid={})", w.transition_id);
 
-                                        send_text!(12, serde_json::json!({
-                                            "audio_ssrc": my_ssrc,
-                                            "video_ssrc": 0,
-                                            "rtx_ssrc": 0,
-                                            "encryption_ready": true
-                                        }));
-                                        info!("DAVE: → OP 12 EncryptionReady");
+                                        send_encryption_ready!();
                                     }
 
                                     // ── OP 29: AnnounceCommitTransition ───
@@ -415,14 +432,11 @@ impl CoreDriver {
                                             Ok(epoch) => info!("DAVE: ✅ Commit processed, epoch={}", epoch),
                                             Err(e) => {
                                                 error!("DAVE: process_commit failed: {:?}", e);
-                                                continue;
+                                                // Don't `continue` — still send OP 23 so
+                                                // the gateway doesn't stall waiting for us.
                                             }
                                         }
 
-                                        // FIX: Must send OP 23 ReadyForTransition after
-                                        // processing the commit. Without this, the voice
-                                        // gateway stalls waiting for our ACK and may tear
-                                        // down the session.
                                         use sigil_discord::gateway::opcodes::ReadyForTransition;
                                         send_text!(23, serde_json::to_value(
                                             ReadyForTransition { transition_id: c.transition_id }
@@ -436,6 +450,8 @@ impl CoreDriver {
                                                 dave_ready_clone.notify_one();
                                             }
                                         }
+
+                                        send_encryption_ready!();
                                     }
                                 }
                                 // sigil lock dropped here
@@ -494,8 +510,6 @@ impl CoreDriver {
         let mut tracks = self.tracks.lock().await;
         info!("⏹️ Stopping {} track(s)", tracks.len());
         tracks.clear();
-        // Note: silence frames are sent by the mixing loop when it detects
-        // no active tracks (see `was_active` logic in start_mixing).
     }
 
     /// Audio engine loop — 20ms tick: mix PCM → Opus encode → DAVE encrypt → transport encrypt → UDP send.
@@ -591,9 +605,6 @@ impl CoreDriver {
             }
 
             // ── FIX: Send 5 Opus silence frames when audio stops ──────────
-            // Discord's Opus decoder interpolates the last packet if it doesn't
-            // receive silence frames, causing clicks/pops. Per the voice spec,
-            // send exactly 5 frames of [0xF8, 0xFF, 0xFE].
             if !active && was_active && silence_sent < 5 {
                 let rtp_hdr = crate::udp::build_rtp_header(seq, timestamp, self.ssrc);
                 let payload = {
@@ -619,7 +630,6 @@ impl CoreDriver {
 
                 if silence_sent == 5 {
                     info!("🔇 Sent 5 silence frames (audio stopped cleanly)");
-                    // Send OP 5 Speaking=0 to tell Discord we stopped
                     let stop_speaking = crate::gateway::Speaking {
                         speaking: 0, delay: 0, ssrc: self.ssrc, user_id: None,
                     };
@@ -636,10 +646,8 @@ impl CoreDriver {
                 continue;
             }
 
-            // Reset silence counter when audio becomes active again
             if active && !was_active {
                 silence_sent = 0;
-                // Re-send OP 5 Speaking=1 when resuming
                 let resume_speaking = crate::gateway::Speaking {
                     speaking: 1, delay: 0, ssrc: self.ssrc, user_id: None,
                 };
