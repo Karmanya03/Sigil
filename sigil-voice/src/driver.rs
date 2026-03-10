@@ -1,6 +1,7 @@
 use futures_util::{SinkExt, StreamExt};
 use sigil_discord::SigilSession;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex, Notify};
 use tracing::{info, warn, error, debug};
@@ -16,20 +17,22 @@ use crate::udp::{receive_ip_discovery, send_ip_discovery};
 const OPUS_SILENCE: [u8; 3] = [0xF8, 0xFF, 0xFE];
 
 pub struct CoreDriver {
-    pub udp:         Arc<UdpSocket>,
-    pub sigil:       Arc<Mutex<SigilSession>>,
-    pub mode:        Option<String>,
-    pub secret_key:  Option<Vec<u8>>,
-    pub ws_tx_channel: mpsc::Sender<crate::gateway::WsMessage>,
-    pub tracks:      Arc<Mutex<Vec<crate::track::TrackHandle>>>,
-    pub ssrc:        u32,
-    pub target_addr: String,
-    pub ssrc_map:    Arc<Mutex<std::collections::HashMap<u32, u64>>>,
-    pub receiver_tx: Option<mpsc::UnboundedSender<(u64, Vec<i16>)>>,
-    pub decoders:    Arc<Mutex<std::collections::HashMap<u64, crate::audio::AudioDecoder>>>,
-    /// Fires once when MLS group is established AND own_key is exported.
-    /// The mixing loop waits on this instead of polling with sleep().
-    pub dave_ready:  Arc<Notify>,
+    pub udp:            Arc<UdpSocket>,
+    pub sigil:          Arc<Mutex<SigilSession>>,
+    pub mode:           Option<String>,
+    pub secret_key:     Option<Vec<u8>>,
+    pub ws_tx_channel:  mpsc::Sender<crate::gateway::WsMessage>,
+    pub tracks:         Arc<Mutex<Vec<crate::track::TrackHandle>>>,
+    pub ssrc:           u32,
+    pub target_addr:    String,
+    pub ssrc_map:       Arc<Mutex<std::collections::HashMap<u32, u64>>>,
+    pub receiver_tx:    Option<mpsc::UnboundedSender<(u64, Vec<i16>)>>,
+    pub decoders:       Arc<Mutex<std::collections::HashMap<u64, crate::audio::AudioDecoder>>>,
+    /// Set to `true` once the WS task has exported our own sender key.
+    /// The mixing loop polls this — no Notify race condition.
+    pub dave_ready:     Arc<AtomicBool>,
+    /// Wakes the mixing loop once after dave_ready flips to true.
+    pub dave_notify:    Arc<Notify>,
 }
 
 impl CoreDriver {
@@ -51,7 +54,8 @@ impl CoreDriver {
             SigilSession::new(user_id_u64)
                 .map_err(|e| format!("SigilSession::new: {:?}", e))?,
         ));
-        let dave_ready = Arc::new(Notify::new());
+        let dave_ready  = Arc::new(AtomicBool::new(false));
+        let dave_notify = Arc::new(Notify::new());
         info!("✅ 1/7 SigilSession created");
 
         // ── 2. WS connect + handshake ─────────────────────────────────────
@@ -128,6 +132,7 @@ impl CoreDriver {
         let ssrc_map_clone         = ssrc_map.clone();
         let sigil_clone            = sigil.clone();
         let dave_ready_clone       = dave_ready.clone();
+        let dave_notify_clone      = dave_notify.clone();
         let my_ssrc                = ready.ssrc;
 
         tokio::spawn(async move {
@@ -167,7 +172,7 @@ impl CoreDriver {
                 }};
             }
 
-            /// Helper: send OP 12 EncryptionReady (idempotent — only sends once)
+            /// Helper: send OP 12 EncryptionReady (idempotent — only sends once per epoch)
             macro_rules! send_encryption_ready {
                 () => {{
                     if !encryption_ready_sent {
@@ -179,6 +184,16 @@ impl CoreDriver {
                         }));
                         encryption_ready_sent = true;
                         info!("DAVE: → OP 12 EncryptionReady");
+                    }
+                }};
+            }
+
+            /// Helper: mark DAVE as ready (atomic flag + wake mixing loop)
+            macro_rules! mark_dave_ready {
+                () => {{
+                    if !dave_ready_clone.load(Ordering::Relaxed) {
+                        dave_ready_clone.store(true, Ordering::Release);
+                        dave_notify_clone.notify_waiters();
                     }
                 }};
             }
@@ -312,7 +327,6 @@ impl CoreDriver {
                                     // ── OP 22: ExecuteTransition ──────────
                                     DaveEvent::ExecuteTransition(e) => {
                                         info!("DAVE: ExecuteTransition (tid={})", e.transition_id);
-                                        // Reset flag so we re-send OP 12 after next key export
                                         encryption_ready_sent = false;
                                     }
 
@@ -343,10 +357,7 @@ impl CoreDriver {
                                         match s.export_sender_keys(&[uid]) {
                                             Ok(keys) if keys.contains_key(&uid) => {
                                                 info!("DAVE: ✅ Own key exported (OP 25)");
-                                                dave_ready_clone.notify_one();
-                                                // FIX: Send OP 12 immediately after we have
-                                                // a working key. Don't wait for OP 27 which
-                                                // may fail with UnknownValue(16).
+                                                mark_dave_ready!();
                                                 send_encryption_ready!();
                                             }
                                             Ok(_) => error!("DAVE: export_sender_keys missing own key"),
@@ -356,11 +367,6 @@ impl CoreDriver {
 
                                     // ── OP 27: MlsProposals ───────────────
                                     DaveEvent::MlsProposals(prop) => {
-                                        // FIX: Don't hard-fail on proposal errors.
-                                        // Discord may send proposal types our OpenMLS
-                                        // version doesn't support (e.g. UnknownValue(16)
-                                        // for external/custom proposals). The session
-                                        // stays valid — we just skip the commit.
                                         match s.process_proposals(&[prop.data.clone()]) {
                                             Ok(()) => {
                                                 match s.commit_and_welcome() {
@@ -376,7 +382,7 @@ impl CoreDriver {
                                                         match s.export_sender_keys(&[uid]) {
                                                             Ok(keys) if keys.contains_key(&uid) => {
                                                                 info!("DAVE: ✅ Own key exported (OP 27)");
-                                                                dave_ready_clone.notify_one();
+                                                                mark_dave_ready!();
                                                             }
                                                             Ok(_) => error!("DAVE: missing own key after commit"),
                                                             Err(e) => error!("DAVE: export failed: {:?}", e),
@@ -388,11 +394,7 @@ impl CoreDriver {
                                                 }
                                             }
                                             Err(e) => {
-                                                // FIX: gracefully skip — don't `continue` which
-                                                // would prevent OP 12 from ever being sent.
                                                 warn!("DAVE: Skipping unprocessable proposal: {:?}", e);
-                                                // Still send OP 12 if we already have a key
-                                                // (from OP 25) — the session is still valid.
                                                 send_encryption_ready!();
                                             }
                                         }
@@ -411,7 +413,7 @@ impl CoreDriver {
                                         match s.export_sender_keys(&[uid]) {
                                             Ok(keys) if keys.contains_key(&uid) => {
                                                 info!("DAVE: ✅ Own key exported (Welcome)");
-                                                dave_ready_clone.notify_one();
+                                                mark_dave_ready!();
                                             }
                                             Ok(_) => error!("DAVE: missing own key after welcome"),
                                             Err(e) => error!("DAVE: export failed: {:?}", e),
@@ -432,8 +434,6 @@ impl CoreDriver {
                                             Ok(epoch) => info!("DAVE: ✅ Commit processed, epoch={}", epoch),
                                             Err(e) => {
                                                 error!("DAVE: process_commit failed: {:?}", e);
-                                                // Don't `continue` — still send OP 23 so
-                                                // the gateway doesn't stall waiting for us.
                                             }
                                         }
 
@@ -447,7 +447,7 @@ impl CoreDriver {
                                         if let Ok(keys) = s.export_sender_keys(&[uid]) {
                                             if keys.contains_key(&uid) {
                                                 info!("DAVE: ✅ Own key refreshed (epoch advance)");
-                                                dave_ready_clone.notify_one();
+                                                mark_dave_ready!();
                                             }
                                         }
 
@@ -496,6 +496,7 @@ impl CoreDriver {
             receiver_tx: None,
             decoders: Arc::new(Mutex::new(std::collections::HashMap::new())),
             dave_ready,
+            dave_notify,
         })
     }
 
@@ -523,16 +524,53 @@ impl CoreDriver {
             .map_err(|e| format!("AudioEncoder::new: {:?}", e))?;
         info!("🎙️ AudioEncoder created");
 
-        // ── Wait for DAVE readiness (zero-overhead, no polling) ───────────
-        let dave_established = tokio::time::timeout(
-            std::time::Duration::from_secs(8),
-            self.dave_ready.notified(),
-        ).await.is_ok();
+        // ── Wait for DAVE readiness ───────────────────────────────────────
+        // FIX: Use AtomicBool + Notify instead of bare Notify.
+        // Notify::notify_one() stores a permit that can be consumed by a
+        // future notified() that hasn't been registered yet — causing a race
+        // where the mixing loop skips the wait entirely.
+        //
+        // With AtomicBool we first check if DAVE is already ready (fast path),
+        // then wait on the Notify only if it isn't.
+        info!("🔒 Waiting for DAVE key...");
+        let dave_established = if self.dave_ready.load(Ordering::Acquire) {
+            true
+        } else {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                async {
+                    loop {
+                        // Check flag first (might have been set between our load and here)
+                        if self.dave_ready.load(Ordering::Acquire) {
+                            return;
+                        }
+                        // Wait for the WS task to wake us, with a short poll interval
+                        // as a safety net against missed notifications.
+                        tokio::select! {
+                            _ = self.dave_notify.notified() => {
+                                if self.dave_ready.load(Ordering::Acquire) {
+                                    return;
+                                }
+                            }
+                            _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
+                        }
+                    }
+                }
+            ).await.is_ok()
+        };
 
         if dave_established {
             info!("✅ DAVE ready — audio will be E2EE encrypted");
         } else {
-            warn!("⚠️ DAVE not ready after 8s — sending raw Opus (no E2EE)");
+            let has_key = {
+                let s = self.sigil.lock().await;
+                s.has_own_key()
+            };
+            if has_key {
+                info!("✅ DAVE key exists (late arrival) — proceeding with E2EE");
+            } else {
+                warn!("⚠️ DAVE not ready after 10s — sending raw Opus (no E2EE)");
+            }
         }
 
         // ── OP 5 Speaking — MUST be sent before first RTP packet ─────────
@@ -604,7 +642,7 @@ impl CoreDriver {
                 }
             }
 
-            // ── FIX: Send 5 Opus silence frames when audio stops ──────────
+            // ── Send 5 Opus silence frames when audio stops ───────────────
             if !active && was_active && silence_sent < 5 {
                 let rtp_hdr = crate::udp::build_rtp_header(seq, timestamp, self.ssrc);
                 let payload = {
@@ -646,6 +684,7 @@ impl CoreDriver {
                 continue;
             }
 
+            // Reset silence counter when audio becomes active again
             if active && !was_active {
                 silence_sent = 0;
                 let resume_speaking = crate::gateway::Speaking {
@@ -733,17 +772,17 @@ impl CoreDriver {
     pub async fn start_receiver(
         &self,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let udp        = self.udp.clone();
-        let sigil      = self.sigil.clone();
-        let ssrc_map   = self.ssrc_map.clone();
-        let decoders   = self.decoders.clone();
+        let udp         = self.udp.clone();
+        let sigil       = self.sigil.clone();
+        let ssrc_map    = self.ssrc_map.clone();
+        let decoders    = self.decoders.clone();
         let receiver_tx = self.receiver_tx.clone()
             .ok_or("No receiver channel configured")?;
-        let secret_key = self.secret_key.clone()
+        let secret_key  = self.secret_key.clone()
             .ok_or("No secret key")?;
 
         tokio::spawn(async move {
-            let mut buf    = [0u8; 4096];
+            let mut buf     = [0u8; 4096];
             let mut pcm_out = [0i16; 1920];
 
             loop {
@@ -754,7 +793,7 @@ impl CoreDriver {
 
                 if n < 12 + 16 + 4 { continue; }
 
-                let pkt = &buf[..n];
+                let pkt  = &buf[..n];
                 let ssrc = u32::from_be_bytes([pkt[8], pkt[9], pkt[10], pkt[11]]);
 
                 let decrypted = match crate::udp::transport_decrypt_rtpsize(&secret_key, pkt) {
