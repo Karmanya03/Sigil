@@ -74,10 +74,10 @@ impl CoreDriver {
             SigilSession::new(user_id_u64)
                 .map_err(|e| format!("SigilSession::new: {:?}", e))?,
         ));
-        let dave_ready  = Arc::new(AtomicBool::new(false));
+        let dave_ready = Arc::new(AtomicBool::new(false));
         let dave_notify = Arc::new(Notify::new());
-        let ws_alive    = Arc::new(AtomicBool::new(true));
-        let shutdown    = Arc::new(AtomicBool::new(false));
+        let ws_alive = Arc::new(AtomicBool::new(true));
+        let shutdown = Arc::new(AtomicBool::new(false));
         info!("✅ 1/7 SigilSession created");
 
         // ── 2. WS connect + handshake ─────────────────────────────────────
@@ -88,7 +88,7 @@ impl CoreDriver {
             .handshake(server_id, user_id, session_id, token)
             .await?;
         info!("✅ 2b/7 WS handshake [SSRC={}, {}:{}]",
-              ready.ssrc, ready.ip, ready.port);
+            ready.ssrc, ready.ip, ready.port);
 
         // ── 3. UDP bind ───────────────────────────────────────────────────
         let udp = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
@@ -144,31 +144,31 @@ impl CoreDriver {
         }
         info!("✅ 6/7 SessionDescription [mode={}, key=32 bytes]", session_desc.mode);
 
-        let mode       = Some(session_desc.mode);
+        let mode = Some(session_desc.mode);
         let secret_key = Some(session_desc.secret_key);
 
         // ── 7. Background WS task (heartbeats + DAVE) ─────────────────────
         let (mut ws_tx, mut ws_rx) = gateway.ws.split();
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<crate::gateway::WsMessage>(100);
         let ssrc_map = Arc::new(Mutex::new(std::collections::HashMap::new()));
-        let ssrc_map_clone      = ssrc_map.clone();
-        let sigil_clone         = sigil.clone();
-        let dave_ready_clone    = dave_ready.clone();
-        let dave_notify_clone   = dave_notify.clone();
-        let ws_alive_clone      = ws_alive.clone();
-        let shutdown_clone      = shutdown.clone();
-        let my_ssrc             = ready.ssrc;
+        let ssrc_map_clone = ssrc_map.clone();
+        let sigil_clone = sigil.clone();
+        let dave_ready_clone = dave_ready.clone();
+        let dave_notify_clone = dave_notify.clone();
+        let ws_alive_clone = ws_alive.clone();
+        let shutdown_clone = shutdown.clone();
+        let my_ssrc = ready.ssrc;
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(
                 std::time::Duration::from_millis(heartbeat_interval as u64)
             );
             interval.tick().await; // skip first immediate tick
-            let mut seq_ack: Option<u64>  = None;
-            let mut binary_seq: u16       = 0;
-            let mut hb_nonce: u64         = 0;
-            let mut hb_acked              = true;
-            let mut missed_acks: u8       = 0;
+            let mut seq_ack: Option<u64> = None;
+            let mut binary_seq: u16 = 0;
+            let mut hb_nonce: u64 = 0;
+            let mut hb_acked = true;
+            let mut missed_acks: u8 = 0;
             let mut encryption_ready_sent = false;
             info!("🔄 WS background task started (hb={}ms)", heartbeat_interval);
 
@@ -262,7 +262,7 @@ impl CoreDriver {
                         let hb = VoicePacket {
                             op: 3,
                             d: Some(hb_d),
-                            s: None, t: None, seq_ack: None,
+                            s: None, t: None, seq_ack: None, // NOT at top level for OP 3
                         };
                         if let Ok(txt) = serde_json::to_string(&hb) {
                             if ws_tx.send(
@@ -318,7 +318,6 @@ impl CoreDriver {
                                     6 => {
                                         hb_acked = true;
                                         if let Some(d) = &pkt.d {
-                                            // V8 ACK format: {"t": nonce} or just nonce (compat)
                                             let ack_nonce = d.get("t")
                                                 .and_then(|v| v.as_u64())
                                                 .or_else(|| d.as_u64());
@@ -330,7 +329,6 @@ impl CoreDriver {
                                         }
                                         debug!("Heartbeat ACK");
                                     }
-
                                     5 => {
                                         if let Some(d) = pkt.d {
                                             if let Ok(spk) = serde_json::from_value::<
@@ -346,7 +344,6 @@ impl CoreDriver {
                                             }
                                         }
                                     }
-
                                     9  => { info!("Voice WS resumed"); }
                                     13 => { debug!("Client connected (OP 13)"); }
                                     18 => { debug!("Client disconnected (OP 18)"); }
@@ -362,7 +359,7 @@ impl CoreDriver {
 
                                 let mut s = sigil_clone.lock().await;
                                 let event = match s.handle_gateway_event(opcode, &bin) {
-                                    Ok(e)  => e,
+                                    Ok(e) => e,
                                     Err(e) => {
                                         debug!("DAVE OP {} parse error: {:?}", opcode, e);
                                         continue;
@@ -371,6 +368,7 @@ impl CoreDriver {
 
                                 use sigil_discord::gateway::handler::DaveEvent;
                                 match event {
+                                    // ── OP 21: PrepareTransition ──────────
                                     DaveEvent::PrepareTransition(p) => {
                                         use sigil_discord::gateway::opcodes::ReadyForTransition;
                                         send_text!(23, serde_json::to_value(
@@ -379,11 +377,14 @@ impl CoreDriver {
                                         info!("DAVE: → OP 23 ReadyForTransition (tid={})", p.transition_id);
                                     }
 
+                                    // ── OP 22: ExecuteTransition ─────────
                                     DaveEvent::ExecuteTransition(e) => {
                                         info!("DAVE: ExecuteTransition (tid={})", e.transition_id);
+                                        // Reset encryption_ready so we re-send it for the new epoch
                                         encryption_ready_sent = false;
                                     }
 
+                                    // ── OP 24: PrepareEpoch ──────────────
                                     DaveEvent::PrepareEpoch(p) => {
                                         info!("DAVE: PrepareEpoch {}", p.epoch);
                                         if p.epoch == 1 {
@@ -397,6 +398,7 @@ impl CoreDriver {
                                         }
                                     }
 
+                                    // ── OP 25: MlsExternalSender ─────────
                                     DaveEvent::MlsExternalSender(ext) => {
                                         match s.set_external_sender(&ext.credential) {
                                             Ok(()) => info!("DAVE: ✅ Group created"),
@@ -405,6 +407,7 @@ impl CoreDriver {
                                                 continue;
                                             }
                                         }
+
                                         let uid = s.user_id;
                                         match s.export_sender_keys(&[uid]) {
                                             Ok(keys) if keys.contains_key(&uid) => {
@@ -412,16 +415,28 @@ impl CoreDriver {
                                                 mark_dave_ready!();
                                                 send_encryption_ready!();
                                             }
-                                            Ok(_)  => error!("DAVE: export_sender_keys missing own key"),
+                                            Ok(_) => error!("DAVE: export_sender_keys missing own key"),
                                             Err(e) => error!("DAVE: export_sender_keys failed: {:?}", e),
                                         }
                                     }
 
-                                    DaveEvent::MlsProposals(prop) => {
-                                        match s.process_proposals(&[prop.data.clone()]) {
+                                    // ── OP 27: MlsProposals ──────────────
+                                    DaveEvent::MlsProposals { operation_type: _operation_type, proposals } => {
+                                        if proposals.is_empty() {
+                                            debug!("DAVE: Empty proposal data, skipping");
+                                            send_encryption_ready!();
+                                            continue;
+                                        }
+
+                                        // proposals is already &[Vec<u8>]
+                                        match s.process_proposals(&proposals) {
                                             Ok(()) => {
+                                                // FIX: commit_and_welcome now internally calls
+                                                // merge_own_pending_commit() before returning,
+                                                // so export_sender_keys sees the NEW epoch's secret.
                                                 match s.commit_and_welcome() {
                                                     Ok((commit, welcome)) => {
+                                                        // OP 28 payload: commit bytes, then welcome bytes
                                                         let mut payload = commit;
                                                         if let Some(w) = welcome {
                                                             payload.extend_from_slice(&w);
@@ -432,12 +447,13 @@ impl CoreDriver {
                                                         let uid = s.user_id;
                                                         match s.export_sender_keys(&[uid]) {
                                                             Ok(keys) if keys.contains_key(&uid) => {
-                                                                info!("DAVE: ✅ Own key exported (OP 27)");
+                                                                info!("DAVE: ✅ Own key exported (post-commit, new epoch)");
                                                                 mark_dave_ready!();
                                                             }
-                                                            Ok(_)  => error!("DAVE: missing own key after commit"),
+                                                            Ok(_) => error!("DAVE: missing own key after commit"),
                                                             Err(e) => error!("DAVE: export failed: {:?}", e),
                                                         }
+
                                                         send_encryption_ready!();
                                                     }
                                                     Err(e) => error!("DAVE: commit_and_welcome failed: {:?}", e),
@@ -450,6 +466,7 @@ impl CoreDriver {
                                         }
                                     }
 
+                                    // ── OP 30: MlsWelcome ───────────────
                                     DaveEvent::MlsWelcome(w) => {
                                         match s.join_group(&w.welcome_bytes) {
                                             Ok(()) => info!("DAVE: ✅ Joined via Welcome"),
@@ -458,15 +475,17 @@ impl CoreDriver {
                                                 continue;
                                             }
                                         }
+
                                         let uid = s.user_id;
                                         match s.export_sender_keys(&[uid]) {
                                             Ok(keys) if keys.contains_key(&uid) => {
                                                 info!("DAVE: ✅ Own key exported (Welcome)");
                                                 mark_dave_ready!();
                                             }
-                                            Ok(_)  => error!("DAVE: missing own key after welcome"),
+                                            Ok(_) => error!("DAVE: missing own key after welcome"),
                                             Err(e) => error!("DAVE: export failed: {:?}", e),
                                         }
+
                                         use sigil_discord::gateway::opcodes::ReadyForTransition;
                                         send_text!(23, serde_json::to_value(
                                             ReadyForTransition { transition_id: w.transition_id }
@@ -476,6 +495,7 @@ impl CoreDriver {
                                         send_encryption_ready!();
                                     }
 
+                                    // ── OP 29: MlsAnnounceCommitTransition
                                     DaveEvent::MlsAnnounceCommitTransition(c) => {
                                         match s.process_commit(&c.commit_bytes) {
                                             Ok(epoch) => info!("DAVE: ✅ Commit processed, epoch={}", epoch),
@@ -483,12 +503,14 @@ impl CoreDriver {
                                                 error!("DAVE: process_commit failed: {:?}", e);
                                             }
                                         }
+
                                         use sigil_discord::gateway::opcodes::ReadyForTransition;
                                         send_text!(23, serde_json::to_value(
                                             ReadyForTransition { transition_id: c.transition_id }
                                         ).unwrap_or_default());
                                         info!("DAVE: → OP 23 ReadyForTransition (commit tid={})", c.transition_id);
 
+                                        // Re-export keys for the new epoch
                                         let uid = s.user_id;
                                         if let Ok(keys) = s.export_sender_keys(&[uid]) {
                                             if keys.contains_key(&uid) {
@@ -496,6 +518,7 @@ impl CoreDriver {
                                                 mark_dave_ready!();
                                             }
                                         }
+
                                         send_encryption_ready!();
                                     }
                                 }
@@ -571,10 +594,8 @@ impl CoreDriver {
 
     /// Audio engine loop — 20ms tick.
     ///
-    /// When tracks are active:  mix PCM → Opus encode → DAVE encrypt → transport encrypt → UDP send
-    /// When idle (no tracks):   send a silence frame every 5 seconds to keep the session alive
-    ///
-    /// This prevents Discord 4006 "Session is no longer valid" kills.
+    /// When tracks are active: mix PCM → Opus encode → DAVE encrypt → transport encrypt → UDP send
+    /// When idle (no tracks): send a silence frame every 5 seconds to keep the session alive
     pub async fn start_mixing(
         &self,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -645,16 +666,17 @@ impl CoreDriver {
 
         info!("🎙️ Mixing loop started → {}", self.target_addr);
 
-        let mut seq: u16            = 0;
-        let mut timestamp: u32      = 0;
-        let mut nonce_counter: u32  = 0;
-        let mut opus_buf            = [0u8; 4000];
-        let mut frames_sent: u64    = 0;
-        let mut dave_failures: u64  = 0;
-        let mut was_active          = false;
-        let mut silence_sent: u8    = 0;
+        let mut seq: u16 = 0;
+        let mut timestamp: u32 = 0;
+        let mut nonce_counter: u32 = 0;
+        let mut opus_buf = [0u8; 4000];
+        let mut frames_sent: u64 = 0;
+        let mut dave_failures: u64 = 0;
+        let mut was_active = false;
+        let mut silence_sent: u8 = 0;
         let mut idle_tick_count: u64 = 0;
 
+        // Pre-allocated mixing buffer (reused every 20ms tick)
         let mut mixed = vec![0i32; 1920];
 
         let mut ticker = tokio::time::interval(std::time::Duration::from_millis(20));
@@ -688,6 +710,7 @@ impl CoreDriver {
                     if handle.get_state_atomic() != crate::track::PlayState::Playing {
                         continue;
                     }
+
                     if let Ok(mut t) = handle.inner().try_lock() {
                         match t.source.read_frame() {
                             Some(frame) => {
@@ -717,13 +740,11 @@ impl CoreDriver {
 
             // ═══════════════════════════════════════════════════════════════
             // IDLE KEEPALIVE: No tracks active → send silence every 5s
-            // This prevents Discord from killing the session with 4006.
             // ═══════════════════════════════════════════════════════════════
             if !active && !was_active {
                 idle_tick_count += 1;
 
                 if idle_tick_count % IDLE_KEEPALIVE_TICKS == 1 {
-                    // Send a single silence frame as keepalive
                     let rtp_hdr = crate::udp::build_rtp_header(seq, timestamp, self.ssrc);
                     let payload = {
                         let mut s = self.sigil.lock().await;
@@ -786,13 +807,12 @@ impl CoreDriver {
                         })).await;
                     }
                     was_active = false;
-                    idle_tick_count = 0; // start idle keepalive counter
+                    idle_tick_count = 0;
                 }
                 continue;
             }
 
             if !active {
-                // was_active is still true but silence_sent >= 5, transition complete
                 was_active = false;
                 idle_tick_count = 0;
                 continue;
@@ -827,7 +847,7 @@ impl CoreDriver {
 
             // ── 2. Opus encode ─────────────────────────────────────────────
             let opus_len = match encoder.encode_pcm(&pcm, &mut opus_buf) {
-                Ok(n)  => n,
+                Ok(n) => n,
                 Err(e) => { warn!("Opus encode error: {:?}", e); continue; }
             };
             let opus = &opus_buf[..opus_len];
@@ -859,7 +879,7 @@ impl CoreDriver {
             let udp_pkt = match crate::udp::transport_encrypt_rtpsize(
                 &secret_key, &rtp_hdr, &audio_payload, nonce_counter,
             ) {
-                Ok(p)  => p,
+                Ok(p) => p,
                 Err(e) => { warn!("Transport encrypt failed: {:?}", e); continue; }
             };
 
@@ -891,12 +911,12 @@ impl CoreDriver {
     pub async fn start_receiver(
         &self,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let udp        = self.udp.clone();
-        let sigil      = self.sigil.clone();
-        let ssrc_map   = self.ssrc_map.clone();
-        let decoders   = self.decoders.clone();
-        let ws_alive   = self.ws_alive.clone();
-        let shutdown   = self.shutdown.clone();
+        let udp = self.udp.clone();
+        let sigil = self.sigil.clone();
+        let ssrc_map = self.ssrc_map.clone();
+        let decoders = self.decoders.clone();
+        let ws_alive = self.ws_alive.clone();
+        let shutdown = self.shutdown.clone();
         let receiver_tx = self.receiver_tx.clone()
             .ok_or("No receiver channel configured")?;
         let secret_key = self.secret_key.clone()
@@ -913,7 +933,7 @@ impl CoreDriver {
                 }
 
                 let (n, _) = match udp.recv_from(&mut buf).await {
-                    Ok(v)  => v,
+                    Ok(v) => v,
                     Err(e) => { error!("UDP recv error: {:?}", e); break; }
                 };
 
@@ -923,7 +943,7 @@ impl CoreDriver {
                 let ssrc = u32::from_be_bytes([pkt[8], pkt[9], pkt[10], pkt[11]]);
 
                 let decrypted = match crate::udp::transport_decrypt_rtpsize(&secret_key, pkt) {
-                    Ok(d)  => d,
+                    Ok(d) => d,
                     Err(_) => continue,
                 };
 
