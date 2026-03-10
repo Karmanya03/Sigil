@@ -1,126 +1,117 @@
-//! DAVE session state machine with nonce management and key retention.
+//! Gateway-level DAVE session state machine.
 //!
-//! Tracks the lifecycle of a DAVE voice connection: disconnected → pending
-//! → established (with epoch) → transitioning between epochs.
+//! Tracks the MLS epoch lifecycle, manages the per-sender key ratchets,
+//! and provides nonce management for frame encryption.
 
 use std::collections::HashMap;
 
 use crate::crypto::key_ratchet::KeyRatchet;
-use crate::types::{Epoch, TransitionId, UserId};
+use crate::types::{Epoch, UserId};
 
-/// The current state of a DAVE session.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The state of the DAVE gateway session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SessionState {
-    /// Not connected to any DAVE session.
+    /// No MLS group is active.
     Disconnected,
-    /// Waiting for the session to be established.
-    Pending,
-    /// Session is active at a specific epoch.
-    Established {
-        /// Current MLS epoch.
-        epoch: Epoch,
-    },
-    /// Transitioning between epochs.
-    Transitioning {
-        /// The epoch we are transitioning from.
-        from: Epoch,
-        /// The epoch we are transitioning to.
-        to: Epoch,
-        /// The transition identifier.
-        tid: TransitionId,
-    },
+    /// MLS group is being negotiated (proposals pending).
+    Negotiating { epoch: Epoch },
+    /// MLS group is established and keys are ready.
+    Established { epoch: Epoch },
 }
 
-/// DAVE session state machine for a single voice connection.
+/// Gateway-level DAVE session managing epoch transitions and nonce state.
 ///
-/// Manages the protocol state, per-sender key ratchets, and the
-/// monotonically increasing send nonce.
+/// This is a lightweight state machine that sits between the MLS group
+/// (managed by `SigilSession`) and the mixing loop (in `driver.rs`).
+/// It tracks:
+/// - Current session state (disconnected / negotiating / established)
+/// - The monotonic 32-bit send nonce (auto-incrementing per frame)
+/// - Per-sender key ratchets for generation advancement
 pub struct DaveSession {
+    /// Our Discord user ID.
+    pub user_id: UserId,
     /// Current session state.
     pub state: SessionState,
-    /// Our user ID.
-    pub user_id: UserId,
-    /// Negotiated protocol version.
-    pub protocol_version: u16,
-    /// Per-sender key ratchets for the current epoch.
-    sender_ratchets: HashMap<UserId, KeyRatchet>,
-    /// Key ratchets from the previous epoch, retained temporarily for
-    /// out-of-order frame decryption during transitions.
-    previous_ratchets: HashMap<UserId, KeyRatchet>,
-    /// Monotonically increasing send nonce counter.
+    /// Monotonic 32-bit nonce counter for outgoing frames.
+    /// Resets to 0 on each new epoch (new key material).
     send_nonce: u32,
+    /// Per-sender key ratchets for the current epoch.
+    ratchets: HashMap<UserId, KeyRatchet>,
 }
 
 impl DaveSession {
-    /// Create a new session in the [`Disconnected`](SessionState::Disconnected) state.
+    /// Create a new disconnected session.
     pub fn new(user_id: UserId) -> Self {
         Self {
-            state: SessionState::Disconnected,
             user_id,
-            protocol_version: crate::types::DAVE_PROTOCOL_VERSION,
-            sender_ratchets: HashMap::new(),
-            previous_ratchets: HashMap::new(),
+            state: SessionState::Disconnected,
             send_nonce: 0,
+            ratchets: HashMap::new(),
         }
     }
 
-    /// Transition the session to the [`Established`](SessionState::Established) state.
+    /// Transition to negotiating state for a given epoch.
+    pub fn begin_negotiation(&mut self, epoch: Epoch) {
+        self.state = SessionState::Negotiating { epoch };
+    }
+
+    /// Establish the session with new key ratchets.
     ///
-    /// Moves the current ratchets to `previous_ratchets` for key retention,
-    /// installs the new ratchets, and resets the send nonce to 0.
+    /// **CRITICAL**: Resets `send_nonce` to 0 because the key material
+    /// has changed. The receiving side derives `generation = nonce >> 24`,
+    /// so a fresh epoch must start at nonce 0 to align with generation 0
+    /// of the new ratchet.
     pub fn establish(&mut self, epoch: Epoch, ratchets: HashMap<UserId, KeyRatchet>) {
-        // Rotate: current → previous
-        self.previous_ratchets = std::mem::take(&mut self.sender_ratchets);
-
-        // Install new ratchets
-        self.sender_ratchets = ratchets;
-
-        // Reset nonce
-        self.send_nonce = 0;
-
         self.state = SessionState::Established { epoch };
+        self.send_nonce = 0; // MUST reset on new epoch
+        // Merge new ratchets (don't clobber existing ones for other senders
+        // that haven't changed)
+        for (uid, ratchet) in ratchets {
+            self.ratchets.insert(uid, ratchet);
+        }
     }
 
-    /// Get and auto-increment the send nonce.
+    /// Get the next nonce and auto-increment.
     ///
-    /// The nonce is a 32-bit counter that wraps around at `u32::MAX`.
+    /// The nonce is a monotonic 32-bit counter that wraps around.
+    /// Generation is derived as `nonce >> 24`, meaning after 2^24
+    /// frames (~5.6 hours at 50fps), the generation advances and
+    /// the key ratchet produces a new AES key.
     pub fn next_nonce(&mut self) -> u32 {
-        let nonce = self.send_nonce;
+        let n = self.send_nonce;
         self.send_nonce = self.send_nonce.wrapping_add(1);
-        nonce
+        n
     }
 
-    /// Clear the previous epoch's key ratchets.
-    ///
-    /// Called after the key retention period (typically 10 seconds) has
-    /// elapsed following an epoch transition.
-    pub fn expire_previous_keys(&mut self) {
-        self.previous_ratchets.clear();
-    }
-
-    /// Reset the session back to [`Disconnected`](SessionState::Disconnected),
-    /// clearing all ratchets and nonce state.
-    pub fn reset(&mut self) {
-        self.state = SessionState::Disconnected;
-        self.sender_ratchets.clear();
-        self.previous_ratchets.clear();
-        self.send_nonce = 0;
-    }
-
-    /// Get a mutable reference to the key ratchet for a sender in the current epoch.
-    pub fn sender_ratchet(&mut self, sender_id: UserId) -> Option<&mut KeyRatchet> {
-        self.sender_ratchets.get_mut(&sender_id)
-    }
-
-    /// Get a mutable reference to the key ratchet for a sender in the previous epoch.
-    ///
-    /// Used during transitions to decrypt out-of-order frames.
-    pub fn previous_ratchet(&mut self, sender_id: UserId) -> Option<&mut KeyRatchet> {
-        self.previous_ratchets.get_mut(&sender_id)
-    }
-
-    /// Returns the current send nonce without incrementing.
+    /// Peek at the current nonce without incrementing.
     pub fn current_nonce(&self) -> u32 {
         self.send_nonce
+    }
+
+    /// Reset the nonce to 0 (e.g., on epoch change or reconnect).
+    pub fn reset_nonce(&mut self) {
+        self.send_nonce = 0;
+    }
+
+    /// Get a mutable reference to a sender's key ratchet.
+    pub fn ratchet_mut(&mut self, sender_id: UserId) -> Option<&mut KeyRatchet> {
+        self.ratchets.get_mut(&sender_id)
+    }
+
+    /// Get a reference to a sender's key ratchet.
+    pub fn ratchet(&self, sender_id: UserId) -> Option<&KeyRatchet> {
+        self.ratchets.get(&sender_id)
+    }
+
+    /// Check if a ratchet exists for the given sender.
+    pub fn has_ratchet(&self, sender_id: UserId) -> bool {
+        self.ratchets.contains_key(&sender_id)
+    }
+
+    /// Full reset: go back to disconnected, clear all state.
+    pub fn reset(&mut self) {
+        self.state = SessionState::Disconnected;
+        self.send_nonce = 0;
+        self.ratchets.clear();
     }
 }

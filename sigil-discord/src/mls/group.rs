@@ -34,6 +34,15 @@ impl DaveGroup {
     ///
     /// # Errors
     ///
+    pub fn merge_own_pending_commit(
+    &mut self,
+    provider: &OpenMlsRustCrypto,
+) -> Result<(), SigilError> {
+    self.mls_group.merge_pending_commit(provider)
+        .map_err(|e| SigilError::Mls(format!("merge_pending_commit: {:?}", e)))?;
+    self.current_epoch = self.mls_group.epoch().as_u64();
+    Ok(())
+}
     /// Returns [`SigilError::Mls`] if group creation fails.
     pub fn create(
         identity: &DaveIdentity,

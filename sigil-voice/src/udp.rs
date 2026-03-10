@@ -17,7 +17,7 @@ pub async fn send_ip_discovery(
     packet[0] = 0x00;
     packet[1] = 0x01; // Type = 1 (Request)
     packet[2] = 0x00;
-    packet[3] = 70; // Length = 70 bytes of data after header
+    packet[3] = 70;   // Length = 70 bytes of data after header
     packet[4..8].copy_from_slice(&ssrc.to_be_bytes());
 
     let target = format!("{}:{}", server_ip, server_port);
@@ -26,7 +26,7 @@ pub async fn send_ip_discovery(
 }
 
 /// Parses the 74-byte IP Discovery response block.
-/// discord sends back our public IP and the UDP port we are routing from.
+/// Discord sends back our public IP and the UDP port we are routing from.
 pub async fn receive_ip_discovery(socket: &UdpSocket) -> Result<(String, u16), std::io::Error> {
     let mut buf = [0u8; 74];
     socket.recv_from(&mut buf).await?;
@@ -44,7 +44,7 @@ pub async fn receive_ip_discovery(socket: &UdpSocket) -> Result<(String, u16), s
     Ok((ip, port))
 }
 
-/// standard RTP Header used by Discord:
+/// Standard RTP Header used by Discord:
 /// - Version 2, no padding, no extensions, no CSRC
 /// - Payload type: 0x78 (120) for Opus
 pub fn build_rtp_header(seq: u16, timestamp: u32, ssrc: u32) -> [u8; 12] {
@@ -63,9 +63,14 @@ use aes_gcm::{
 };
 
 /// Encrypts an RTP block using `aead_aes256_gcm_rtpsize` mode.
-/// - Nonce: A 32-bit incrementing integer (padded to 96 bits with leading zeroes).
+///
+/// This is the **transport-level** encryption between bot and Discord's SFU.
+/// Separate from DAVE E2EE frame encryption.
+///
+/// - Nonce: A 32-bit incrementing integer, **big-endian** padded to 96 bits.
+///   Discord expects BE for transport nonces (unlike DAVE frame nonces which are LE).
 /// - AAD: The 12-byte RTP header.
-/// - Output: [12-byte RTP Header] + [Encrypted Payload + 16-byte MAC Tag] + [4-byte Nonce]
+/// - Output: `[12-byte RTP Header] + [Encrypted Payload + 16-byte MAC Tag] + [4-byte Nonce BE]`
 pub fn transport_encrypt_rtpsize(
     key: &[u8],
     rtp_header: &[u8; 12],
@@ -73,8 +78,8 @@ pub fn transport_encrypt_rtpsize(
     nonce_counter: u32,
 ) -> Result<Vec<u8>, aes_gcm::Error> {
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
-    
-    // Nonce is 4 bytes padded with 8 leading zero bytes
+
+    // Transport nonce: 4 bytes big-endian at the end of 12-byte nonce
     let mut nonce_bytes = [0u8; 12];
     nonce_bytes[8..12].copy_from_slice(&nonce_counter.to_be_bytes());
     let nonce = Nonce::from_slice(&nonce_bytes);
@@ -89,14 +94,17 @@ pub fn transport_encrypt_rtpsize(
     let mut out = Vec::with_capacity(12 + ciphertext.len() + 4);
     out.extend_from_slice(rtp_header);
     out.extend_from_slice(&ciphertext);
-    out.extend_from_slice(&nonce_counter.to_be_bytes());
+    out.extend_from_slice(&nonce_counter.to_be_bytes()); // Append nonce suffix for receiver
     Ok(out)
 }
 
 /// Decrypts an RTP block using `aead_aes256_gcm_rtpsize` mode.
+///
+/// Expects: `[12-byte RTP Header] + [Encrypted Payload + 16-byte MAC Tag] + [4-byte Nonce BE]`
 pub fn transport_decrypt_rtpsize(key: &[u8], packet: &[u8]) -> Result<Vec<u8>, aes_gcm::Error> {
+    // Minimum: 12 (header) + 16 (tag) + 4 (nonce) = 32 bytes
     if packet.len() < 12 + 16 + 4 {
-        return Err(aes_gcm::Error); // Too short
+        return Err(aes_gcm::Error);
     }
 
     let rtp_header = &packet[0..12];
@@ -104,7 +112,7 @@ pub fn transport_decrypt_rtpsize(key: &[u8], packet: &[u8]) -> Result<Vec<u8>, a
     let encrypted_payload = &packet[12..packet.len() - 4];
 
     let cipher = Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(key));
-    
+
     let mut nonce_bytes = [0u8; 12];
     nonce_bytes[8..12].copy_from_slice(nonce_bytes_suffix);
     let nonce = Nonce::from_slice(&nonce_bytes);

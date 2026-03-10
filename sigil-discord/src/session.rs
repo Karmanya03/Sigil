@@ -3,25 +3,6 @@
 //! [`SigilSession`] is the single entry point that bot developers should use.
 //! It orchestrates MLS group management, key derivation, frame encryption/decryption,
 //! and gateway event handling behind a clean, ergonomic API.
-//!
-//! # Example
-//!
-//! ```rust,no_run
-//! use sigil_discord::session::SigilSession;
-//! use sigil_discord::crypto::codec::Codec;
-//!
-//! // Create a session for your bot's user ID
-//! let mut session = SigilSession::new(123456789012345678).unwrap();
-//!
-//! // Encrypt an outgoing audio frame
-//! let key = [0u8; 16]; // from MLS key export
-//! let raw_opus = vec![0u8; 960];
-//! let encrypted = session.encrypt_frame(&key, &raw_opus, Codec::Opus).unwrap();
-//!
-//! // Decrypt an incoming frame
-//! let decrypted = session.decrypt_frame(&key, &encrypted).unwrap();
-//! assert_eq!(decrypted, raw_opus);
-//! ```
 
 use std::collections::HashMap;
 
@@ -42,13 +23,6 @@ use openmls_rust_crypto::OpenMlsRustCrypto;
 
 /// High-level DAVE session that wraps MLS, crypto, frame, and gateway
 /// into a single cohesive API for Discord bot integration.
-///
-/// This is the main struct you interact with. It manages:
-/// - MLS identity and group lifecycle
-/// - Per-sender key derivation and rotation
-/// - Frame encryption/decryption with codec awareness
-/// - Gateway event processing
-/// - Nonce management with automatic incrementing
 pub struct SigilSession {
     /// Our Discord user ID.
     pub user_id: UserId,
@@ -68,13 +42,6 @@ pub struct SigilSession {
 
 impl SigilSession {
     /// Create a new DAVE session for the given Discord user ID.
-    ///
-    /// Generates an MLS identity (P-256 keypair + Basic credential) and
-    /// initializes the session in a disconnected state.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SigilError::Mls`] if identity generation fails.
     pub fn new(user_id: UserId) -> Result<Self, SigilError> {
         let provider = crypto_provider();
         let identity = DaveIdentity::new(user_id, &provider)?;
@@ -90,21 +57,9 @@ impl SigilSession {
         })
     }
 
-    // ─── MLS Group Lifecycle ───────────────────────────────────────────
+    // --- MLS Group Lifecycle ---
 
     /// Create a new MLS group for a voice channel.
-    ///
-    /// Call this when your bot joins a voice channel and no existing
-    /// group is present (i.e., you're the first DAVE participant).
-    ///
-    /// # Arguments
-    ///
-    /// * `gateway_credential` — the Discord gateway's MLS credential
-    /// * `gateway_pubkey` — the gateway's P-256 signature public key
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SigilError::Mls`] if group creation fails.
     pub fn create_group(
         &mut self,
         gateway_credential: Credential,
@@ -117,13 +72,6 @@ impl SigilSession {
     }
 
     /// Join an existing MLS group via a Welcome message.
-    ///
-    /// Call this when you receive a Welcome message from the gateway
-    /// after another member adds you to the group.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SigilError::Mls`] if the Welcome is invalid.
     pub fn join_group(&mut self, welcome_bytes: &[u8]) -> Result<(), SigilError> {
         use openmls::prelude::tls_codec::DeserializeBytes;
         let welcome_msg = MlsMessageIn::tls_deserialize_exact_bytes(welcome_bytes)
@@ -136,23 +84,23 @@ impl SigilSession {
         Ok(())
     }
 
-    /// Set the external sender credentials received from the Voice Gateway.
+    /// Set the external sender credentials received from the Voice Gateway (OP 25).
     pub fn set_external_sender(&mut self, payload: &[u8]) -> Result<(), SigilError> {
         use openmls::prelude::tls_codec::Deserialize;
         let mut cursor = std::io::Cursor::new(payload);
-        
+
         let credential = Credential::tls_deserialize(&mut cursor)
             .map_err(|e| SigilError::Mls(format!("credential deserialize: {}", e)))?;
-        
-        // The remaining bytes are the gateway's public signature key
+
         let pos = cursor.position() as usize;
         let signature_key = payload[pos..].to_vec();
-        
-        // Directly cache it as the group initializer parameters and create group.
+
         self.create_group(credential, signature_key)
     }
 
     /// Process incoming OP 27 proposals (Append / Revoke) from the Voice server.
+    ///
+    /// `operations` is a slice of raw MLS proposal byte vectors.
     pub fn process_proposals(&mut self, operations: &[Vec<u8>]) -> Result<(), SigilError> {
         let group = self.group.as_mut().ok_or(SigilError::GroupNotEstablished)?;
         group.process_proposals(operations, &self.provider)?;
@@ -160,20 +108,27 @@ impl SigilSession {
     }
 
     /// Resolve pending proposals by committing and issuing a Welcome buffer.
+    ///
+    /// **FIX (critical)**: After creating the commit, we call `merge_pending_commit()`
+    /// on the underlying MLS group so that the local group state advances to the
+    /// new epoch. Without this, `export_secret()` would still return the OLD epoch's
+    /// exporter secret, causing a key mismatch where our encrypted frames use a
+    /// stale key that receivers (who processed our commit) cannot decrypt.
     pub fn commit_and_welcome(&mut self) -> Result<(Vec<u8>, Option<Vec<u8>>), SigilError> {
         let group = self.group.as_mut().ok_or(SigilError::GroupNotEstablished)?;
         let signer = &self.identity.signature_keys;
-        group.commit_pending(&self.provider, signer)
+        let (commit_bytes, welcome_bytes) = group.commit_pending(&self.provider, signer)?;
+
+        // FIX: Merge our own pending commit so we advance to the new epoch
+        // OpenMLS leaves the group in PendingCommit state after commit_to_pending_proposals().
+        // We must merge it before exporting secrets, otherwise the exporter secret
+        // is from the pre-commit epoch and doesn't match what receivers derive.
+        group.merge_own_pending_commit(&self.provider)?;
+
+        Ok((commit_bytes, welcome_bytes))
     }
 
-    /// Generate a key package for other group members to add us.
-    ///
-    /// Send the returned bytes to the gateway so other members can
-    /// create Add proposals for us.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SigilError::Mls`] if key package generation fails.
+    /// Generate a key package for the Voice Gateway to add us to a group.
     pub fn generate_key_package(&self) -> Result<Vec<u8>, SigilError> {
         use openmls::prelude::tls_codec::Serialize;
         let kp = crate::mls::key_package::generate_key_package(&self.identity, &self.provider)?;
@@ -181,17 +136,14 @@ impl SigilSession {
             .map_err(|e| SigilError::Mls(format!("key package serialize: {}", e)))
     }
 
-    // ─── Key Management ────────────────────────────────────────────────
+    // --- Key Management ---
 
-    /// Export encryption keys for all known senders in the current epoch.
+    /// Export encryption keys for the given senders and install ratchets.
     ///
-    /// Call this after the MLS group epoch advances (after processing a commit).
-    /// It uses MLS-Exporter with label `"Discord Secure Frames v0"` (from types.rs)
-    /// and the sender's user ID as context.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SigilError::GroupNotEstablished`] if no group exists.
+    /// **FIX**: After exporting, we call `gateway_session.establish()` which:
+    /// - Resets `send_nonce` to 0 (critical for epoch transitions)
+    /// - Rotates current ratchets to `previous_ratchets` (for out-of-order decryption)
+    /// - Installs fresh ratchets for the new epoch
     pub fn export_sender_keys(
         &mut self,
         sender_ids: &[UserId],
@@ -204,19 +156,25 @@ impl SigilSession {
             keys.insert(sender_id, key);
         }
 
-        // Cache our own key
+        // Cache our own key for encrypt_own_frame()
         if let Some(key) = keys.get(&self.user_id) {
             self.own_key = Some(*key);
         }
 
         self.sender_keys = keys.clone();
+
+        // FIX: Install ratchets and establish the DaveSession
+        let epoch = group.current_epoch;
+        let mut ratchets = HashMap::new();
+        for (&sid, &base_secret) in &keys {
+            ratchets.insert(sid, KeyRatchet::new(base_secret));
+        }
+        self.gateway_session.establish(epoch, ratchets);
+
         Ok(keys)
     }
 
-    /// Install a pre-derived sender key directly (e.g. from a key ratchet).
-    ///
-    /// Useful when you already have the key from a ratchet advancement
-    /// rather than MLS export.
+    /// Install a pre-derived sender key directly.
     pub fn install_sender_key(&mut self, sender_id: UserId, key: [u8; KEY_LENGTH]) {
         if sender_id == self.user_id {
             self.own_key = Some(key);
@@ -225,25 +183,21 @@ impl SigilSession {
     }
 
     /// Install a key ratchet for a sender and derive the initial key.
-    ///
-    /// Creates a [`KeyRatchet`] with the given base secret and installs
-    /// it in the gateway session for automatic generation advancement.
     pub fn install_ratchet(
         &mut self,
         sender_id: UserId,
         base_secret: [u8; KEY_LENGTH],
     ) -> Result<(), SigilError> {
         let ratchet = KeyRatchet::new(base_secret);
-        let key = ratchet.base_secret();
-        self.sender_keys.insert(sender_id, *key);
+        let key = *ratchet.base_secret();
+        self.sender_keys.insert(sender_id, key);
         if sender_id == self.user_id {
-            self.own_key = Some(*key);
+            self.own_key = Some(key);
         }
 
         let mut ratchets = HashMap::new();
         ratchets.insert(sender_id, ratchet);
 
-        // Merge with existing session ratchets if established
         if let SessionState::Established { epoch } = self.gateway_session.state {
             self.gateway_session.establish(epoch, ratchets);
         }
@@ -251,22 +205,13 @@ impl SigilSession {
         Ok(())
     }
 
-    // ─── Frame Encryption/Decryption ───────────────────────────────────
+    // --- Frame Encryption/Decryption ---
 
     /// Encrypt a raw media frame for sending.
     ///
-    /// Automatically handles codec-specific unencrypted ranges and
-    /// nonce management. The nonce auto-increments on each call.
-    ///
-    /// # Arguments
-    ///
-    /// * `key` — 16-byte AES-128 sender key
-    /// * `raw_frame` — the unencrypted media frame
-    /// * `codec` — the media codec (determines which bytes stay in the clear)
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SigilError`] if encryption fails.
+    /// Uses the key ratchet to derive the correct key for the current
+    /// generation (nonce >> 24). For the first ~16M frames per epoch,
+    /// generation is 0 and the base secret is used directly.
     pub fn encrypt_frame(
         &mut self,
         key: &[u8; KEY_LENGTH],
@@ -274,18 +219,25 @@ impl SigilSession {
         codec: Codec,
     ) -> Result<Vec<u8>, SigilError> {
         let nonce = self.gateway_session.next_nonce();
+        let generation = nonce >> 24;
+
+        // For generation > 0, derive the ratcheted key
+        let actual_key = if generation > 0 {
+            if let Some(ratchet) = self.gateway_session.ratchet_mut(self.user_id) {
+
+                ratchet.get(generation)?
+            } else {
+                *key
+            }
+        } else {
+            *key
+        };
+
         let encryptor = FrameEncryptor::new(codec);
-        encryptor.encrypt(key, nonce, raw_frame)
+        encryptor.encrypt(&actual_key, nonce, raw_frame)
     }
 
     /// Encrypt a frame using our own cached key.
-    ///
-    /// Convenience method that uses the key previously exported/installed
-    /// for our own user ID.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SigilError::NoSenderKey`] if no own key is cached.
     pub fn encrypt_own_frame(
         &mut self,
         raw_frame: &[u8],
@@ -298,18 +250,6 @@ impl SigilSession {
     }
 
     /// Decrypt an incoming DAVE frame.
-    ///
-    /// The frame footer contains all metadata needed for decryption
-    /// (nonce, tag, unencrypted ranges), so no codec info is required.
-    ///
-    /// # Arguments
-    ///
-    /// * `key` — 16-byte AES-128 sender key for the frame's sender
-    /// * `dave_frame` — the complete encrypted DAVE frame
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SigilError`] if decryption or authentication fails.
     pub fn decrypt_frame(
         &self,
         key: &[u8; KEY_LENGTH],
@@ -319,12 +259,6 @@ impl SigilSession {
     }
 
     /// Decrypt an incoming frame using a cached sender key.
-    ///
-    /// Looks up the key for the given sender ID from the internal cache.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SigilError::NoSenderKey`] if no key is cached for this sender.
     pub fn decrypt_from_sender(
         &self,
         sender_id: UserId,
@@ -337,16 +271,9 @@ impl SigilSession {
         self.decrypt_frame(key, dave_frame)
     }
 
-    // ─── Gateway Events ────────────────────────────────────────────────
+    // --- Gateway Events ---
 
-    /// Process a raw gateway event (opcode + payload).
-    ///
-    /// Dispatches the event through the DAVE handler and returns
-    /// a structured [`DaveEvent`] for further processing.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SigilError`] if the opcode is unknown or payload is malformed.
+    /// Dispatch a raw gateway event (opcode + payload) into a DaveEvent.
     pub fn handle_gateway_event(
         &self,
         opcode: u8,
@@ -355,58 +282,47 @@ impl SigilSession {
         dispatch(opcode, payload)
     }
 
-    /// Process an incoming commit and advance the epoch.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SigilError`] if no group exists or commit processing fails.
+    /// Process an incoming commit (OP 29) and advance the epoch.
     pub fn process_commit(&mut self, commit_bytes: &[u8]) -> Result<Epoch, SigilError> {
         let group = self.group.as_mut().ok_or(SigilError::GroupNotEstablished)?;
         group.process_commit(commit_bytes, &self.provider)?;
         Ok(group.current_epoch)
     }
 
-    // ─── State Accessors ───────────────────────────────────────────────
+    // --- State Accessors ---
 
-    /// Returns `true` if the MLS group is established.
     pub fn is_established(&self) -> bool {
         self.group.is_some()
     }
+
     pub fn has_own_key(&self) -> bool {
         self.own_key.is_some()
     }
 
-    /// Returns the current MLS epoch, or `None` if no group is active.
     pub fn current_epoch(&self) -> Option<Epoch> {
         self.group.as_ref().map(|g| g.current_epoch)
     }
 
-    /// Returns the current gateway session state.
     pub fn session_state(&self) -> &SessionState {
         &self.gateway_session.state
     }
 
-    /// Returns a reference to the underlying MLS identity.
     pub fn identity(&self) -> &DaveIdentity {
         &self.identity
     }
 
-    /// Returns a reference to the openmls crypto provider.
     pub fn provider(&self) -> &OpenMlsRustCrypto {
         &self.provider
     }
 
-    /// Returns a reference to the underlying gateway session.
     pub fn gateway_session(&self) -> &DaveSession {
         &self.gateway_session
     }
 
-    /// Returns a mutable reference to the gateway session.
     pub fn gateway_session_mut(&mut self) -> &mut DaveSession {
         &mut self.gateway_session
     }
 
-    /// Returns a reference to the underlying MLS group, if established.
     pub fn mls_group(&self) -> Option<&DaveGroup> {
         self.group.as_ref()
     }
