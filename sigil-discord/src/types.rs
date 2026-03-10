@@ -13,7 +13,8 @@ pub type TransitionId = u64;
 pub const DAVE_PROTOCOL_VERSION: u16 = 1;
 
 /// MLS-Exporter label for per-sender key derivation.
-pub const SENDER_KEY_LABEL: &[u8] = b"Discord Secure Frames v1";
+/// NOTE: Discord's DAVE protocol uses "v0" - this MUST match exactly!
+pub const SENDER_KEY_LABEL: &[u8] = b"Discord Secure Frames v0";
 
 /// AES-128 key length in bytes.
 pub const KEY_LENGTH: usize = 16;

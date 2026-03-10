@@ -48,10 +48,19 @@ pub fn dispatch(opcode: u8, payload: &[u8]) -> Result<DaveEvent, SigilError> {
     debug!(?op, payload_len = payload.len(), "dispatching DAVE opcode");
 
     match op {
+        // ─── Fix OP 21 (PrepareTransition): binary, not JSON ───
         DaveOpcode::PrepareTransition => {
-            let data: PrepareTransition = serde_json::from_slice(payload)
-                .map_err(|e| SigilError::Mls(format!("PrepareTransition deserialize: {}", e)))?;
-            Ok(DaveEvent::PrepareTransition(data))
+            // Format: [seq(2)][op(1)][transition_id(4)][protocol_version(1)]
+            if payload.len() >= 7 {
+                let transition_id = u32::from_be_bytes([payload[3], payload[4], payload[5], payload[6]]);
+                let protocol_version = if payload.len() > 7 { payload[7] as u16 } else { 0 };
+                Ok(DaveEvent::PrepareTransition(PrepareTransition { 
+                    transition_id: transition_id as u64, 
+                    protocol_version,
+                }))
+            } else {
+                Err(SigilError::Mls("PrepareTransition too short".into()))
+            }
         }
 
         DaveOpcode::ExecuteTransition => {
@@ -60,16 +69,25 @@ pub fn dispatch(opcode: u8, payload: &[u8]) -> Result<DaveEvent, SigilError> {
             Ok(DaveEvent::ExecuteTransition(data))
         }
 
+        // ─── Fix OP 24 (PrepareEpoch): binary, not JSON ───
         DaveOpcode::PrepareEpoch => {
-            let data: PrepareEpoch = serde_json::from_slice(payload)
-                .map_err(|e| SigilError::Mls(format!("PrepareEpoch deserialize: {}", e)))?;
-            Ok(DaveEvent::PrepareEpoch(data))
+            // Format: [seq(2)][op(1)][epoch(4 bytes LE)]
+            if payload.len() >= 7 {
+                let epoch = u32::from_le_bytes([payload[3], payload[4], payload[5], payload[6]]);
+                Ok(DaveEvent::PrepareEpoch(PrepareEpoch { 
+                    epoch: epoch as u64,
+                    protocol_version: 1, // Default protocol version for binary format
+                }))
+            } else {
+                Err(SigilError::Mls("PrepareEpoch too short".into()))
+            }
         }
 
+        // ─── Fix OP 25 (MlsExternalSender): skip 3, not 11 ───
         DaveOpcode::MlsExternalSender => {
-            // Binary: seq(2) + opcode(1) + transition_id(8) + credential
-            let data = if payload.len() > 11 {
-                &payload[11..]
+            // Format: [seq(2)][op(1)][credential_bytes] — NO transition_id
+            let data = if payload.len() > 3 {
+                &payload[3..]     // ← was [11..], now correctly [3..]
             } else {
                 payload
             };
@@ -79,10 +97,11 @@ pub fn dispatch(opcode: u8, payload: &[u8]) -> Result<DaveEvent, SigilError> {
             }))
         }
 
+        // ─── Fix OP 27 (MlsProposals): skip 3, not 11 ───
         DaveOpcode::MlsProposals => {
-            // Binary: seq(2) + opcode(1) + transition_id(8) + type(1) + proposal
-            let data = if payload.len() > 11 {
-                &payload[11..]
+            // Binary: seq(2) + opcode(1) + type(1) + proposal
+            let data = if payload.len() > 3 {
+                &payload[3..]     // ← was [11..], now correctly [3..]
             } else {
                 payload
             };

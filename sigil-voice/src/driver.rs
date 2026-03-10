@@ -1,3 +1,4 @@
+
 use futures_util::{SinkExt, StreamExt};
 use sigil_discord::SigilSession;
 use std::sync::Arc;
@@ -117,7 +118,6 @@ impl CoreDriver {
                                 )?;
                                 return Ok::<_, Box<dyn std::error::Error + Send + Sync>>(desc);
                             }
-                            // Skip other text opcodes while waiting
                         }
                         crate::gateway::WsMessage::Binary(bin) => {
                             debug!("Voice WS skipping binary len={} while waiting for OP 4", bin.len());
@@ -150,11 +150,11 @@ impl CoreDriver {
         let ssrc_map = Arc::new(Mutex::new(std::collections::HashMap::new()));
         let ssrc_map_clone = ssrc_map.clone();
         let sigil_clone = sigil.clone();
-        let my_ssrc = ready.ssrc; // Correctly capture handshake SSRC
+        let my_ssrc = ready.ssrc;
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(std::time::Duration::from_millis(heartbeat_interval as u64));
-            interval.tick().await; // skip first immediate tick
+            interval.tick().await;
             let mut seq_ack: Option<u64> = None;
             let mut binary_seq = 0u16;
             info!("🔄 Voice WS background task started (heartbeat={}ms)", heartbeat_interval);
@@ -257,74 +257,137 @@ impl CoreDriver {
                                                     info!("DAVE: ExecuteTransition (ID: {})", e.transition_id);
                                                 }
                                                 DaveEvent::MlsExternalSender(ext) => {
-                                                    let _ = s.set_external_sender(&ext.credential);
+                                                    match s.set_external_sender(&ext.credential) {
+                                                        Ok(()) => {
+                                                            info!("DAVE: ✅ Group created via External Sender");
+                                                        }
+                                                        Err(e) => {
+                                                            error!("DAVE: ❌ set_external_sender FAILED: {:?}", e);
+                                                            continue;
+                                                        }
+                                                    };
+                                                    
                                                     let uid = s.user_id;
-                                                    let _ = s.export_sender_keys(&[uid]);
-                                                    info!("DAVE: Processed OP 25 External Sender (Group Created, Keys Exported)");
+                                                    match s.export_sender_keys(&[uid]) {
+                                                        Ok(keys) => {
+                                                            if keys.contains_key(&uid) {
+                                                                info!("DAVE: ✅ Exported own sender key via External Sender (key: {:02x}...)", 
+                                                                    keys.get(&uid).unwrap()[0]);
+                                                            } else {
+                                                                error!("DAVE: ❌ export_sender_keys returned OK but missing own key!");
+                                                            }
+                                                        }
+                                                        Err(e) => {
+                                                            error!("DAVE: ❌ export_sender_keys FAILED: {:?}", e);
+                                                        }
+                                                    }
+                                                    info!("DAVE: Processed OP 25 External Sender");
                                                 }
                                                 DaveEvent::MlsProposals(prop) => {
-                                                    let _ = s.process_proposals(&[prop.data.clone()]);
-                                                    if let Ok((commit_bytes, opt_welcome)) = s.commit_and_welcome() {
-                                                        let uid = s.user_id;
-                                                        let _ = s.export_sender_keys(&[uid]);
-                                                        let mut payload = vec![0u8; 3];
-                                                        payload[0..2].copy_from_slice(&binary_seq.to_be_bytes());
-                                                        binary_seq = binary_seq.wrapping_add(1);
-                                                        payload[2] = 28;
-                                                        payload.extend_from_slice(&commit_bytes);
-                                                        if let Some(w) = opt_welcome {
-                                                            payload.extend_from_slice(&w);
+                                                    if let Err(e) = s.process_proposals(&[prop.data.clone()]) {
+                                                        error!("DAVE: ❌ process_proposals FAILED: {:?}", e);
+                                                        continue;
+                                                    }
+                                                    
+                                                    match s.commit_and_welcome() {
+                                                        Ok((commit_bytes, opt_welcome)) => {
+                                                            let uid = s.user_id;
+                                                            match s.export_sender_keys(&[uid]) {
+                                                                Ok(keys) => {
+                                                                    if keys.contains_key(&uid) {
+                                                                        info!("DAVE: ✅ Exported own sender key via Proposals (key: {:02x}...)", 
+                                                                            keys.get(&uid).unwrap()[0]);
+                                                                    }
+                                                                }
+                                                                Err(e) => {
+                                                                    error!("DAVE: ❌ export_sender_keys FAILED: {:?}", e);
+                                                                }
+                                                            }
+                                                            
+                                                            let mut payload = vec![0u8; 3];
+                                                            payload[0..2].copy_from_slice(&binary_seq.to_be_bytes());
+                                                            binary_seq = binary_seq.wrapping_add(1);
+                                                            payload[2] = 28;
+                                                            payload.extend_from_slice(&commit_bytes);
+                                                            if let Some(w) = opt_welcome {
+                                                                payload.extend_from_slice(&w);
+                                                            }
+                                                            let _ = ws_tx.send(tokio_tungstenite::tungstenite::Message::Binary(payload.into())).await;
+                                                            info!("DAVE: Sent OP 28 MlsCommitWelcome (Keys Exported)");
                                                         }
-                                                        let _ = ws_tx.send(tokio_tungstenite::tungstenite::Message::Binary(payload.into())).await;
-                                                        info!("DAVE: Sent OP 28 MlsCommitWelcome (Keys Exported)");
-
-                                                        // Send OP 12 Encryption Ready
-                                                        let ready_packet = VoicePacket {
-                                                            op: 12,
-                                                            d: Some(serde_json::json!({
-                                                                "audio_ssrc": my_ssrc,
-                                                                                                "video_ssrc": 0,
-                                                                "rtx_ssrc": 0,
-                                                                "encryption_ready": true
-                                                            })),
-                                                            s: None, t: None, seq_ack: None,
-                                                        };
-                                                        if let Ok(text) = serde_json::to_string(&ready_packet) {
-                                                            let _ = ws_tx.send(tokio_tungstenite::tungstenite::Message::Text(text.into())).await;
-                                                            info!("DAVE: Sent OP 12 Encryption Ready (SSRC={})", my_ssrc);
+                                                        Err(e) => {
+                                                            error!("DAVE: ❌ commit_and_welcome FAILED: {:?}", e);
                                                         }
                                                     }
                                                 }
                                                 DaveEvent::MlsWelcome(w) => {
-                                                    let _ = s.join_group(&w.welcome_bytes);
-                                                    let uid = s.user_id;
-                                                    let _ = s.export_sender_keys(&[uid]);
-                                                    info!("DAVE: ✅ Group joined via Welcome! (Keys Exported)");
-
-                                                    // Send OP 12 Encryption Ready
-                                                    let ready_packet = VoicePacket {
-                                                        op: 12,
-                                                        d: Some(serde_json::json!({
-                                                            "audio_ssrc": my_ssrc,
-                                                            "video_ssrc": 0,
-                                                            "rtx_ssrc": 0,
-                                                            "encryption_ready": true
-                                                        })),
-                                                        s: None, t: None, seq_ack: None,
-                                                    };
-                                                    if let Ok(text) = serde_json::to_string(&ready_packet) {
-                                                        let _ = ws_tx.send(tokio_tungstenite::tungstenite::Message::Text(text.into())).await;
-                                                        info!("DAVE: Sent OP 12 Encryption Ready (SSRC={})", my_ssrc);
+                                                    match s.join_group(&w.welcome_bytes) {
+                                                        Ok(()) => info!("DAVE: ✅ Group joined via Welcome"),
+                                                        Err(e) => {
+                                                            error!("DAVE: ❌ join_group FAILED: {:?}", e);
+                                                            continue;
+                                                        }
                                                     }
+                                                    
+                                                    let uid = s.user_id;
+                                                    match s.export_sender_keys(&[uid]) {
+                                                        Ok(keys) => {
+                                                            if keys.contains_key(&uid) {
+                                                                info!("DAVE: ✅ Exported own sender key via Welcome (key: {:02x}...)", 
+                                                                    keys.get(&uid).unwrap()[0]);
+                                                            } else {
+                                                                error!("DAVE: ❌ export_sender_keys returned OK but missing own key!");
+                                                            }
+                                                        }
+                                                        Err(e) => {
+                                                            error!("DAVE: ❌ export_sender_keys FAILED: {:?}", e);
+                                                        }
+                                                    }
+                                                    info!("DAVE: ✅ Group joined via Welcome! (Keys Exported)");
                                                 }
                                                 DaveEvent::MlsAnnounceCommitTransition(c) => {
-                                                    let _ = s.process_commit(&c.commit_bytes);
+                                                    match s.process_commit(&c.commit_bytes) {
+                                                        Ok(_) => info!("DAVE: ✅ Processed commit, epoch advanced"),
+                                                        Err(e) => {
+                                                            error!("DAVE: ❌ process_commit FAILED: {:?}", e);
+                                                            continue;
+                                                        }
+                                                    }
+                                                    
                                                     let uid = s.user_id;
-                                                    let _ = s.export_sender_keys(&[uid]);
+                                                    match s.export_sender_keys(&[uid]) {
+                                                        Ok(keys) => {
+                                                            if keys.contains_key(&uid) {
+                                                                info!("DAVE: ✅ Exported own sender key via Commit (key: {:02x}...)", 
+                                                                    keys.get(&uid).unwrap()[0]);
+                                                            } else {
+                                                                error!("DAVE: ❌ export_sender_keys returned OK but missing own key!");
+                                                            }
+                                                        }
+                                                        Err(e) => {
+                                                            error!("DAVE: ❌ export_sender_keys FAILED: {:?}", e);
+                                                        }
+                                                    }
                                                     info!("DAVE: Processed OP 29 Commit (Keys Exported)");
                                                 }
                                                 DaveEvent::PrepareEpoch(p) => {
                                                     info!("DAVE: PrepareEpoch {}", p.epoch);
+                                                    
+                                                    let uid = s.user_id;
+                                                    match s.export_sender_keys(&[uid]) {
+                                                        Ok(keys) => {
+                                                            if let Some(key) = keys.get(&uid) {
+                                                                info!("DAVE: ✅ Exported own sender key for epoch {} (key: {:02x}...)", 
+                                                                    p.epoch, key[0]);
+                                                            } else {
+                                                                warn!("DAVE: export_sender_keys returned OK but no key for own user_id!");
+                                                            }
+                                                        }
+                                                        Err(e) => {
+                                                            error!("DAVE: ❌ export_sender_keys FAILED at PrepareEpoch {}: {:?}", p.epoch, e);
+                                                        }
+                                                    }
+                                                    
                                                     if p.epoch == 1 {
                                                         if let Ok(kp) = s.generate_key_package() {
                                                             let mut payload = vec![0u8; 3];
@@ -390,7 +453,38 @@ impl CoreDriver {
     /// The primary audio engine loop.
     /// Runs every 20ms: poll tracks → mix PCM → Opus encode → DAVE encrypt → UDP send.
     /// The loop NEVER exits on per-frame errors — it logs and skips to keep the connection alive.
+    /// The primary audio engine loop.
+    /// Runs every 20ms: poll tracks → mix PCM → Opus encode → DAVE encrypt → UDP send.
+    /// The loop NEVER exits on per-frame errors — it logs and skips to keep the connection alive.
     pub async fn start_mixing(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // Wait for MLS group to be established before starting mixing
+        let mut retries = 0;
+        while retries < 30 {
+            {
+                let sigil_guard = self.sigil.lock().await;
+                if sigil_guard.is_established() && sigil_guard.has_own_key() {
+                    info!("✅ MLS group ready (established + keys exported)");
+                    break;
+                }
+            } // Lock released here
+
+            info!("Waiting for MLS group to be ready (established + keys exported) (attempt {}/30)...", retries + 1);
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            retries += 1;
+        }
+
+        // Verify readiness after loop
+        {
+            let sigil_guard = self.sigil.lock().await;
+            if !sigil_guard.is_established() || !sigil_guard.has_own_key() {
+                error!("MLS group not ready (group not established or keys not exported) — cannot start mixing loop");
+                return Err("MLS group not ready (group not established or keys not exported)".into());
+            }
+        }
+
+        // Note: WebSocket task should have already exported sender keys when processing DAVE opcodes
+        info!("✅ MLS group ready with exported sender keys — starting mixing loop");
+
         let secret_key = match self.secret_key.clone() {
             Some(k) => k,
             None => {
@@ -496,46 +590,41 @@ impl CoreDriver {
             let opus_data = &opus_buf[..opus_len];
 
             // --- 3. DAVE encrypt (may fail if MLS group not ready yet) ---
-            let dave_ciphertext = {
+            let audio_payload: Vec<u8> = {
                 let mut sigil_guard = self.sigil.lock().await;
-                
-                // Check if we have our own key before attempting encryption
-                if !sigil_guard.has_own_key() {
+
+                if sigil_guard.has_own_key() {
+                    // DAVE is ready — encrypt
+                    match sigil_guard.encrypt_own_frame(opus_data, sigil_discord::crypto::codec::Codec::Opus) {
+                        Ok(ct) => {
+                            if dave_skip_count > 0 {
+                                info!("🔊 DAVE encryption active! (skipped {} frames while MLS was pending)", dave_skip_count);
+                                dave_skip_count = 0;
+                            }
+                            if frames_sent == 0 {
+                                info!("🔊 First DAVE-encrypted audio frame produced! Sending via UDP...");
+                            }
+                            ct
+                        }
+                        Err(e) => {
+                            warn!("DAVE encrypt failed despite key present: {:?}", e);
+                            opus_data.to_vec() // fallback
+                        }
+                    }
+                } else {
+                    // MLS not ready yet — send raw Opus (unencrypted, Discord accepts this)
                     dave_skip_count += 1;
-                    if dave_skip_count == 1 || dave_skip_count % 250 == 0 {
-                        info!("🔒 DAVE: No own key yet ( MLS not ready ) — falling back to raw Opus (dropped {} frames so far)", 
-                            dave_skip_count);
+                    if dave_skip_count == 1 || dave_skip_count % 500 == 0 {
+                        info!("🔒 DAVE pending ({}), sending raw Opus frames", dave_skip_count);
                     }
-                    // Fall back to raw Opus frames when DAVE keys aren't ready
-                    continue;
-                }
-                
-                match sigil_guard.encrypt_own_frame(opus_data, sigil_discord::crypto::codec::Codec::Opus) {
-                    Ok(ct) => {
-                        if dave_skip_count > 0 {
-                            info!("🔊 DAVE encryption active! (skipped {} frames while MLS was pending)", dave_skip_count);
-                            dave_skip_count = 0;
-                        }
-                        if frames_sent == 0 {
-                            info!("🔊 First DAVE-encrypted audio frame produced! Sending via UDP...");
-                        }
-                        ct
-                    }
-                    Err(e) => {
-                        dave_skip_count += 1;
-                        if dave_skip_count == 1 || dave_skip_count % 250 == 0 {
-                            info!("🔒 DAVE encrypt failed/pending: {:?} (dropped {} frames so far — established: {})", 
-                                e, dave_skip_count, sigil_guard.is_established());
-                        }
-                        continue;
-                    }
+                    opus_data.to_vec()
                 }
             };
 
             // --- 4. Transport encrypt (AES-256-GCM) ---
             let rtp_header = crate::udp::build_rtp_header(seq, timestamp, self.ssrc);
             let udp_payload = match crate::udp::transport_encrypt_rtpsize(
-                &secret_key, &rtp_header, &dave_ciphertext, nonce_counter
+                &secret_key, &rtp_header, &audio_payload, nonce_counter
             ) {
                 Ok(p) => p,
                 Err(e) => {
@@ -564,6 +653,7 @@ impl CoreDriver {
             nonce_counter = nonce_counter.wrapping_add(1);
         }
     }
+
 
     /// Start the background UDP receiver task to handle incoming audio.
     pub async fn start_receiver(&self) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -629,3 +719,4 @@ impl CoreDriver {
         Ok(())
     }
 }
+
