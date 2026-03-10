@@ -1,7 +1,7 @@
 use futures_util::{SinkExt, StreamExt};
 use sigil_discord::SigilSession;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex, Notify};
 use tracing::{info, warn, error, debug};
@@ -15,6 +15,18 @@ use crate::udp::{receive_ip_discovery, send_ip_discovery};
 /// Opus silence frame — 3 bytes that decode to 20 ms of silence.
 /// Discord requires 5 of these when audio stops to avoid decoder artifacts.
 const OPUS_SILENCE: [u8; 3] = [0xF8, 0xFF, 0xFE];
+
+/// Maximum consecutive DAVE encrypt failures before logging a warning batch.
+const DAVE_FAIL_LOG_INTERVAL: u64 = 500;
+
+/// Maximum seconds to wait for DAVE key exchange before fallback.
+const DAVE_TIMEOUT_SECS: u64 = 10;
+
+/// Maximum seconds to wait for SessionDescription (OP 4).
+const SESSION_DESC_TIMEOUT_SECS: u64 = 10;
+
+/// Maximum consecutive missed heartbeat ACKs before considering the connection zombied.
+const MAX_MISSED_HEARTBEATS: u8 = 3;
 
 pub struct CoreDriver {
     pub udp:            Arc<UdpSocket>,
@@ -33,15 +45,22 @@ pub struct CoreDriver {
     pub dave_ready:     Arc<AtomicBool>,
     /// Wakes the mixing loop once after dave_ready flips to true.
     pub dave_notify:    Arc<Notify>,
+    /// Set to `false` when the WS background task dies (4006, network error, etc).
+    /// The mixing loop checks this every tick and exits cleanly when false.
+    pub ws_alive:       Arc<AtomicBool>,
+    /// Monotonic counter of total frames sent — useful for diagnostics from outside.
+    pub frames_sent:    Arc<AtomicU64>,
+    /// Set to `true` when the driver should shut down all loops.
+    pub shutdown:       Arc<AtomicBool>,
 }
 
 impl CoreDriver {
     pub async fn connect(
-        endpoint:   &str,
-        server_id:  &str,
-        user_id:    &str,
+        endpoint: &str,
+        server_id: &str,
+        user_id:   &str,
         session_id: &str,
-        token:      &str,
+        token:     &str,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         info!("⚡ Connecting [endpoint={}, server={}, user={}]", endpoint, server_id, user_id);
 
@@ -56,6 +75,8 @@ impl CoreDriver {
         ));
         let dave_ready  = Arc::new(AtomicBool::new(false));
         let dave_notify = Arc::new(Notify::new());
+        let ws_alive    = Arc::new(AtomicBool::new(true));
+        let shutdown    = Arc::new(AtomicBool::new(false));
         info!("✅ 1/7 SigilSession created");
 
         // ── 2. WS connect + handshake ─────────────────────────────────────
@@ -66,7 +87,7 @@ impl CoreDriver {
             .handshake(server_id, user_id, session_id, token)
             .await?;
         info!("✅ 2b/7 WS handshake [SSRC={}, {}:{}]",
-            ready.ssrc, ready.ip, ready.port);
+              ready.ssrc, ready.ip, ready.port);
 
         // ── 3. UDP bind ───────────────────────────────────────────────────
         let udp = Arc::new(UdpSocket::bind("0.0.0.0:0").await?);
@@ -83,15 +104,15 @@ impl CoreDriver {
             protocol: "udp".to_string(),
             data: ProtocolData {
                 address: external_ip,
-                port: external_port,
-                mode: "aead_aes256_gcm_rtpsize".to_string(),
+                port:    external_port,
+                mode:    "aead_aes256_gcm_rtpsize".to_string(),
             },
         }).await?;
         info!("✅ 5/7 SelectProtocol sent");
 
         // ── 6. Wait for SessionDescription (OP 4) ─────────────────────────
         let session_desc = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(SESSION_DESC_TIMEOUT_SECS),
             async {
                 loop {
                     match gateway.recv_packet().await?.ok_or("WS closed")? {
@@ -111,8 +132,8 @@ impl CoreDriver {
                 }
             }
         ).await
-            .map_err(|_| "Timed out waiting for SessionDescription")?
-            .map_err(|e| format!("SessionDescription error: {:?}", e))?;
+        .map_err(|_| "Timed out waiting for SessionDescription")?
+        .map_err(|e| format!("SessionDescription error: {:?}", e))?;
 
         if session_desc.secret_key.len() != 32 {
             return Err(format!(
@@ -120,6 +141,7 @@ impl CoreDriver {
                 session_desc.secret_key.len()
             ).into());
         }
+
         info!("✅ 6/7 SessionDescription [mode={}, key=32 bytes]", session_desc.mode);
 
         let mode       = Some(session_desc.mode);
@@ -127,24 +149,27 @@ impl CoreDriver {
 
         // ── 7. Background WS task (heartbeats + DAVE) ─────────────────────
         let (mut ws_tx, mut ws_rx) = gateway.ws.split();
-        let (cmd_tx, mut cmd_rx)   = mpsc::channel::<crate::gateway::WsMessage>(100);
-        let ssrc_map               = Arc::new(Mutex::new(std::collections::HashMap::new()));
-        let ssrc_map_clone         = ssrc_map.clone();
-        let sigil_clone            = sigil.clone();
-        let dave_ready_clone       = dave_ready.clone();
-        let dave_notify_clone      = dave_notify.clone();
-        let my_ssrc                = ready.ssrc;
+        let (cmd_tx, mut cmd_rx) = mpsc::channel::<crate::gateway::WsMessage>(100);
+        let ssrc_map       = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let ssrc_map_clone = ssrc_map.clone();
+        let sigil_clone       = sigil.clone();
+        let dave_ready_clone  = dave_ready.clone();
+        let dave_notify_clone = dave_notify.clone();
+        let ws_alive_clone    = ws_alive.clone();
+        let shutdown_clone    = shutdown.clone();
+        let my_ssrc           = ready.ssrc;
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(
                 std::time::Duration::from_millis(heartbeat_interval as u64)
             );
             interval.tick().await; // skip first immediate tick
-            let mut seq_ack:    Option<u64> = None;
-            let mut binary_seq: u16         = 0;
-            let mut hb_nonce:   u64         = 0;
-            let mut hb_acked                = true;
-            let mut encryption_ready_sent   = false;
+            let mut seq_ack: Option<u64>  = None;
+            let mut binary_seq: u16       = 0;
+            let mut hb_nonce: u64         = 0;
+            let mut hb_acked              = true;
+            let mut missed_acks: u8       = 0;
+            let mut encryption_ready_sent = false;
             info!("🔄 WS background task started (hb={}ms)", heartbeat_interval);
 
             macro_rules! send_bin {
@@ -154,9 +179,12 @@ impl CoreDriver {
                     binary_seq = binary_seq.wrapping_add(1);
                     buf[2] = $op;
                     buf.extend_from_slice(&$data);
-                    let _ = ws_tx.send(
+                    if ws_tx.send(
                         tokio_tungstenite::tungstenite::Message::Binary(buf.into())
-                    ).await;
+                    ).await.is_err() {
+                        warn!("Binary send failed — WS dropped");
+                        break;
+                    }
                 }};
             }
 
@@ -165,21 +193,23 @@ impl CoreDriver {
                     let mut pkt = VoicePacket { op: $op, d: Some($val), s: None, t: None, seq_ack: None };
                     pkt.seq_ack = seq_ack;
                     if let Ok(txt) = serde_json::to_string(&pkt) {
-                        let _ = ws_tx.send(
+                        if ws_tx.send(
                             tokio_tungstenite::tungstenite::Message::Text(txt.into())
-                        ).await;
+                        ).await.is_err() {
+                            warn!("Text send failed — WS dropped");
+                            break;
+                        }
                     }
                 }};
             }
 
-            /// Helper: send OP 12 EncryptionReady (idempotent — only sends once per epoch)
             macro_rules! send_encryption_ready {
                 () => {{
                     if !encryption_ready_sent {
                         send_text!(12, serde_json::json!({
                             "audio_ssrc": my_ssrc,
                             "video_ssrc": 0,
-                            "rtx_ssrc": 0,
+                            "rtx_ssrc":   0,
                             "encryption_ready": true
                         }));
                         encryption_ready_sent = true;
@@ -188,7 +218,6 @@ impl CoreDriver {
                 }};
             }
 
-            /// Helper: mark DAVE as ready (atomic flag + wake mixing loop)
             macro_rules! mark_dave_ready {
                 () => {{
                     if !dave_ready_clone.load(Ordering::Relaxed) {
@@ -199,11 +228,24 @@ impl CoreDriver {
             }
 
             loop {
+                // Check shutdown flag
+                if shutdown_clone.load(Ordering::Relaxed) {
+                    info!("WS task: shutdown requested");
+                    break;
+                }
+
                 tokio::select! {
                     // ── Heartbeat ────────────────────────────────────────
                     _ = interval.tick() => {
                         if !hb_acked {
-                            warn!("⚠️ Previous heartbeat not ACKed — connection may be zombied");
+                            missed_acks += 1;
+                            warn!("⚠️ Heartbeat not ACKed (missed {}×)", missed_acks);
+                            if missed_acks >= MAX_MISSED_HEARTBEATS {
+                                error!("💀 {} consecutive heartbeats missed — connection is dead, closing", MAX_MISSED_HEARTBEATS);
+                                break;
+                            }
+                        } else {
+                            missed_acks = 0;
                         }
 
                         hb_nonce = std::time::SystemTime::now()
@@ -265,11 +307,19 @@ impl CoreDriver {
                                 if let Some(seq) = pkt.s {
                                     seq_ack = Some(seq);
                                 }
+
                                 match pkt.op {
                                     6 => {
-                                        hb_acked = true;
-                                        debug!("Heartbeat ACK");
-                                    }
+    hb_acked = true;
+    if let Some(d) = &pkt.d {
+        if let Some(ack_nonce) = d.as_u64() {
+            if ack_nonce != hb_nonce {
+                warn!("Heartbeat ACK nonce mismatch: sent={}, got={}", hb_nonce, ack_nonce);
+            }
+        }
+    }
+    debug!("Heartbeat ACK");
+}
                                     5 => {
                                         if let Some(d) = pkt.d {
                                             if let Ok(spk) = serde_json::from_value::<
@@ -360,7 +410,7 @@ impl CoreDriver {
                                                 mark_dave_ready!();
                                                 send_encryption_ready!();
                                             }
-                                            Ok(_) => error!("DAVE: export_sender_keys missing own key"),
+                                            Ok(_)  => error!("DAVE: export_sender_keys missing own key"),
                                             Err(e) => error!("DAVE: export_sender_keys failed: {:?}", e),
                                         }
                                     }
@@ -384,10 +434,9 @@ impl CoreDriver {
                                                                 info!("DAVE: ✅ Own key exported (OP 27)");
                                                                 mark_dave_ready!();
                                                             }
-                                                            Ok(_) => error!("DAVE: missing own key after commit"),
+                                                            Ok(_)  => error!("DAVE: missing own key after commit"),
                                                             Err(e) => error!("DAVE: export failed: {:?}", e),
                                                         }
-
                                                         send_encryption_ready!();
                                                     }
                                                     Err(e) => error!("DAVE: commit_and_welcome failed: {:?}", e),
@@ -415,10 +464,9 @@ impl CoreDriver {
                                                 info!("DAVE: ✅ Own key exported (Welcome)");
                                                 mark_dave_ready!();
                                             }
-                                            Ok(_) => error!("DAVE: missing own key after welcome"),
+                                            Ok(_)  => error!("DAVE: missing own key after welcome"),
                                             Err(e) => error!("DAVE: export failed: {:?}", e),
                                         }
-
                                         use sigil_discord::gateway::opcodes::ReadyForTransition;
                                         send_text!(23, serde_json::to_value(
                                             ReadyForTransition { transition_id: w.transition_id }
@@ -436,7 +484,6 @@ impl CoreDriver {
                                                 error!("DAVE: process_commit failed: {:?}", e);
                                             }
                                         }
-
                                         use sigil_discord::gateway::opcodes::ReadyForTransition;
                                         send_text!(23, serde_json::to_value(
                                             ReadyForTransition { transition_id: c.transition_id }
@@ -450,7 +497,6 @@ impl CoreDriver {
                                                 mark_dave_ready!();
                                             }
                                         }
-
                                         send_encryption_ready!();
                                     }
                                 }
@@ -479,7 +525,10 @@ impl CoreDriver {
                     }
                 }
             }
-            warn!("WS background task ended");
+
+            // ── WS task is exiting — signal all loops to stop ─────────────
+            ws_alive_clone.store(false, Ordering::Release);
+            warn!("WS background task ended — ws_alive set to false");
         });
 
         info!("✅ 7/7 CoreDriver ready");
@@ -489,14 +538,17 @@ impl CoreDriver {
             mode,
             secret_key,
             ws_tx_channel: cmd_tx,
-            tracks: Arc::new(Mutex::new(Vec::new())),
-            ssrc: ready.ssrc,
+            tracks:        Arc::new(Mutex::new(Vec::new())),
+            ssrc:          ready.ssrc,
             target_addr,
             ssrc_map,
-            receiver_tx: None,
-            decoders: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            receiver_tx:   None,
+            decoders:      Arc::new(Mutex::new(std::collections::HashMap::new())),
             dave_ready,
             dave_notify,
+            ws_alive,
+            frames_sent:   Arc::new(AtomicU64::new(0)),
+            shutdown,
         })
     }
 
@@ -513,6 +565,18 @@ impl CoreDriver {
         tracks.clear();
     }
 
+    /// Request a full shutdown of this driver (WS task + mixing loop + receiver).
+    pub fn request_shutdown(&self) {
+        self.shutdown.store(true, Ordering::Release);
+        // Also signal ws_alive false so mixing loop exits immediately
+        self.ws_alive.store(false, Ordering::Release);
+    }
+
+    /// Returns true if the voice WebSocket is still connected.
+    pub fn is_ws_alive(&self) -> bool {
+        self.ws_alive.load(Ordering::Acquire)
+    }
+
     /// Audio engine loop — 20ms tick: mix PCM → Opus encode → DAVE encrypt → transport encrypt → UDP send.
     pub async fn start_mixing(
         &self,
@@ -525,27 +589,20 @@ impl CoreDriver {
         info!("🎙️ AudioEncoder created");
 
         // ── Wait for DAVE readiness ───────────────────────────────────────
-        // FIX: Use AtomicBool + Notify instead of bare Notify.
-        // Notify::notify_one() stores a permit that can be consumed by a
-        // future notified() that hasn't been registered yet — causing a race
-        // where the mixing loop skips the wait entirely.
-        //
-        // With AtomicBool we first check if DAVE is already ready (fast path),
-        // then wait on the Notify only if it isn't.
         info!("🔒 Waiting for DAVE key...");
         let dave_established = if self.dave_ready.load(Ordering::Acquire) {
             true
         } else {
             tokio::time::timeout(
-                std::time::Duration::from_secs(10),
+                std::time::Duration::from_secs(DAVE_TIMEOUT_SECS),
                 async {
                     loop {
-                        // Check flag first (might have been set between our load and here)
                         if self.dave_ready.load(Ordering::Acquire) {
                             return;
                         }
-                        // Wait for the WS task to wake us, with a short poll interval
-                        // as a safety net against missed notifications.
+                        if !self.ws_alive.load(Ordering::Acquire) {
+                            return; // WS died during wait — don't block forever
+                        }
                         tokio::select! {
                             _ = self.dave_notify.notified() => {
                                 if self.dave_ready.load(Ordering::Acquire) {
@@ -559,6 +616,12 @@ impl CoreDriver {
             ).await.is_ok()
         };
 
+        // Check if WS died during DAVE wait
+        if !self.ws_alive.load(Ordering::Acquire) {
+            error!("WS died during DAVE wait — aborting mixing loop");
+            return Err("WS connection lost before mixing could start".into());
+        }
+
         if dave_established {
             info!("✅ DAVE ready — audio will be E2EE encrypted");
         } else {
@@ -569,7 +632,7 @@ impl CoreDriver {
             if has_key {
                 info!("✅ DAVE key exists (late arrival) — proceeding with E2EE");
             } else {
-                warn!("⚠️ DAVE not ready after 10s — sending raw Opus (no E2EE)");
+                warn!("⚠️ DAVE not ready after {}s — sending raw Opus (no E2EE)", DAVE_TIMEOUT_SECS);
             }
         }
 
@@ -586,14 +649,17 @@ impl CoreDriver {
 
         info!("🎙️ Mixing loop started → {}", self.target_addr);
 
-        let mut seq:           u16 = 0;
-        let mut timestamp:     u32 = 0;
+        let mut seq: u16          = 0;
+        let mut timestamp: u32    = 0;
         let mut nonce_counter: u32 = 0;
-        let mut opus_buf           = [0u8; 4000];
-        let mut frames_sent:   u64 = 0;
+        let mut opus_buf          = [0u8; 4000];
+        let mut frames_sent: u64  = 0;
         let mut dave_failures: u64 = 0;
-        let mut was_active         = false;
-        let mut silence_sent:  u8  = 0;
+        let mut was_active        = false;
+        let mut silence_sent: u8  = 0;
+
+        // Pre-allocate mixing buffer — reused every tick to avoid allocation
+        let mut mixed = vec![0i32; 1920];
 
         let mut ticker = tokio::time::interval(std::time::Duration::from_millis(20));
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -601,9 +667,23 @@ impl CoreDriver {
         loop {
             ticker.tick().await;
 
+            // ── Check if WS is still alive ────────────────────────────────
+            if !self.ws_alive.load(Ordering::Acquire) {
+                warn!("🛑 WS connection lost — stopping mixing loop (sent {} frames)", frames_sent);
+                break;
+            }
+
+            // ── Check shutdown flag ───────────────────────────────────────
+            if self.shutdown.load(Ordering::Relaxed) {
+                info!("🛑 Shutdown requested — stopping mixing loop");
+                break;
+            }
+
             // ── 1. Mix PCM from all active tracks ─────────────────────────
-            let mut mixed = vec![0i32; 1920];
+            // Zero the buffer without reallocating
+            for s in mixed.iter_mut() { *s = 0; }
             let mut active = false;
+
             {
                 let mut tracks = self.tracks.lock().await;
                 tracks.retain(|h| {
@@ -615,6 +695,7 @@ impl CoreDriver {
                     if handle.get_state_atomic() != crate::track::PlayState::Playing {
                         continue;
                     }
+
                     if let Ok(mut t) = handle.inner().try_lock() {
                         match t.source.read_frame() {
                             Some(frame) => {
@@ -637,7 +718,7 @@ impl CoreDriver {
                             }
                         }
                     } else {
-                        active = true;
+                        active = true; // Lock contention — assume still active
                     }
                 }
             }
@@ -661,8 +742,9 @@ impl CoreDriver {
                 ) {
                     let _ = self.udp.send_to(&pkt, &self.target_addr).await;
                 }
-                seq           = seq.wrapping_add(1);
-                timestamp     = timestamp.wrapping_add(960);
+
+                seq = seq.wrapping_add(1);
+                timestamp = timestamp.wrapping_add(960);
                 nonce_counter = nonce_counter.wrapping_add(1);
                 silence_sent += 1;
 
@@ -728,7 +810,7 @@ impl CoreDriver {
                         }
                         Err(e) => {
                             dave_failures += 1;
-                            if dave_failures == 1 || dave_failures % 500 == 0 {
+                            if dave_failures == 1 || dave_failures % DAVE_FAIL_LOG_INTERVAL == 0 {
                                 warn!("DAVE encrypt failed ({}×): {:?}", dave_failures, e);
                             }
                             opus.to_vec()
@@ -755,6 +837,7 @@ impl CoreDriver {
             }
 
             frames_sent += 1;
+            self.frames_sent.store(frames_sent, Ordering::Relaxed);
             match frames_sent {
                 1    => info!("🔊 First frame sent!"),
                 50   => info!("🔊 1 second of audio sent"),
@@ -762,23 +845,28 @@ impl CoreDriver {
                 _    => {}
             }
 
-            seq           = seq.wrapping_add(1);
-            timestamp     = timestamp.wrapping_add(960);
+            seq = seq.wrapping_add(1);
+            timestamp = timestamp.wrapping_add(960);
             nonce_counter = nonce_counter.wrapping_add(1);
         }
+
+        info!("🎙️ Mixing loop exited (total frames: {})", frames_sent);
+        Ok(())
     }
 
     /// Background UDP receiver for incoming audio.
     pub async fn start_receiver(
         &self,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        let udp         = self.udp.clone();
-        let sigil       = self.sigil.clone();
-        let ssrc_map    = self.ssrc_map.clone();
-        let decoders    = self.decoders.clone();
+        let udp        = self.udp.clone();
+        let sigil      = self.sigil.clone();
+        let ssrc_map   = self.ssrc_map.clone();
+        let decoders   = self.decoders.clone();
+        let ws_alive   = self.ws_alive.clone();
+        let shutdown   = self.shutdown.clone();
         let receiver_tx = self.receiver_tx.clone()
             .ok_or("No receiver channel configured")?;
-        let secret_key  = self.secret_key.clone()
+        let secret_key = self.secret_key.clone()
             .ok_or("No secret key")?;
 
         tokio::spawn(async move {
@@ -786,6 +874,12 @@ impl CoreDriver {
             let mut pcm_out = [0i16; 1920];
 
             loop {
+                // Check if driver is shutting down
+                if !ws_alive.load(Ordering::Acquire) || shutdown.load(Ordering::Relaxed) {
+                    info!("Receiver loop: WS dead or shutdown — exiting");
+                    break;
+                }
+
                 let (n, _) = match udp.recv_from(&mut buf).await {
                     Ok(v)  => v,
                     Err(e) => { error!("UDP recv error: {:?}", e); break; }
