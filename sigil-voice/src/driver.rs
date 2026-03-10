@@ -28,6 +28,9 @@ const SESSION_DESC_TIMEOUT_SECS: u64 = 10;
 /// Maximum consecutive missed heartbeat ACKs before considering the connection zombied.
 const MAX_MISSED_HEARTBEATS: u8 = 3;
 
+/// How often to send a keepalive silence frame when idle (every 5 seconds = 250 ticks).
+const IDLE_KEEPALIVE_TICKS: u64 = 250;
+
 pub struct CoreDriver {
     pub udp: Arc<UdpSocket>,
     pub sigil: Arc<Mutex<SigilSession>>,
@@ -41,12 +44,10 @@ pub struct CoreDriver {
     pub receiver_tx: Option<mpsc::Sender<(u64, Vec<i16>)>>,
     pub decoders: Arc<Mutex<std::collections::HashMap<u64, crate::audio::AudioDecoder>>>,
     /// Set to `true` once the WS task has exported our own sender key.
-    /// The mixing loop polls this — no Notify race condition.
     pub dave_ready: Arc<AtomicBool>,
     /// Wakes the mixing loop once after dave_ready flips to true.
     pub dave_notify: Arc<Notify>,
     /// Set to `false` when the WS background task dies (4006, network error, etc).
-    /// The mixing loop checks this every tick and exits cleanly when false.
     pub ws_alive: Arc<AtomicBool>,
     /// Monotonic counter of total frames sent — useful for diagnostics from outside.
     pub frames_sent: Arc<AtomicU64>,
@@ -360,7 +361,6 @@ impl CoreDriver {
 
                                 use sigil_discord::gateway::handler::DaveEvent;
                                 match event {
-                                    // ── OP 21: PrepareTransition ──────────
                                     DaveEvent::PrepareTransition(p) => {
                                         use sigil_discord::gateway::opcodes::ReadyForTransition;
                                         send_text!(23, serde_json::to_value(
@@ -369,13 +369,11 @@ impl CoreDriver {
                                         info!("DAVE: → OP 23 ReadyForTransition (tid={})", p.transition_id);
                                     }
 
-                                    // ── OP 22: ExecuteTransition ──────────
                                     DaveEvent::ExecuteTransition(e) => {
                                         info!("DAVE: ExecuteTransition (tid={})", e.transition_id);
                                         encryption_ready_sent = false;
                                     }
 
-                                    // ── OP 24: PrepareEpoch ───────────────
                                     DaveEvent::PrepareEpoch(p) => {
                                         info!("DAVE: PrepareEpoch {}", p.epoch);
                                         if p.epoch == 1 {
@@ -389,7 +387,6 @@ impl CoreDriver {
                                         }
                                     }
 
-                                    // ── OP 25: MlsExternalSender ──────────
                                     DaveEvent::MlsExternalSender(ext) => {
                                         match s.set_external_sender(&ext.credential) {
                                             Ok(()) => info!("DAVE: ✅ Group created"),
@@ -410,7 +407,6 @@ impl CoreDriver {
                                         }
                                     }
 
-                                    // ── OP 27: MlsProposals ───────────────
                                     DaveEvent::MlsProposals(prop) => {
                                         match s.process_proposals(&[prop.data.clone()]) {
                                             Ok(()) => {
@@ -439,13 +435,11 @@ impl CoreDriver {
                                             }
                                             Err(e) => {
                                                 warn!("DAVE: Skipping unprocessable proposal: {:?}", e);
-                                                // Still send EncryptionReady — we have a key from OP 25
                                                 send_encryption_ready!();
                                             }
                                         }
                                     }
 
-                                    // ── OP 30: MlsWelcome ─────────────────
                                     DaveEvent::MlsWelcome(w) => {
                                         match s.join_group(&w.welcome_bytes) {
                                             Ok(()) => info!("DAVE: ✅ Joined via Welcome"),
@@ -472,7 +466,6 @@ impl CoreDriver {
                                         send_encryption_ready!();
                                     }
 
-                                    // ── OP 29: AnnounceCommitTransition ───
                                     DaveEvent::MlsAnnounceCommitTransition(c) => {
                                         match s.process_commit(&c.commit_bytes) {
                                             Ok(epoch) => info!("DAVE: ✅ Commit processed, epoch={}", epoch),
@@ -496,17 +489,14 @@ impl CoreDriver {
                                         send_encryption_ready!();
                                     }
                                 }
-                                // sigil lock dropped here
                             }
 
-                            // ── Ping → Pong (keep WS alive) ──────────────
                             tokio_tungstenite::tungstenite::Message::Ping(data) => {
                                 let _ = ws_tx.send(
                                     tokio_tungstenite::tungstenite::Message::Pong(data)
                                 ).await;
                             }
 
-                            // ── Close frame — log code and exit ───────────
                             tokio_tungstenite::tungstenite::Message::Close(frame) => {
                                 if let Some(f) = frame {
                                     warn!("Voice WS closed: code={}, reason={}", f.code, f.reason);
@@ -522,7 +512,6 @@ impl CoreDriver {
                 }
             }
 
-            // ── WS task is exiting — signal all loops to stop ─────────────
             ws_alive_clone.store(false, Ordering::Release);
             warn!("WS background task ended — ws_alive set to false");
         });
@@ -561,24 +550,21 @@ impl CoreDriver {
         tracks.clear();
     }
 
-    /// Request a full shutdown of this driver (WS task + mixing loop + receiver).
     pub fn request_shutdown(&self) {
         self.shutdown.store(true, Ordering::Release);
-        // Also signal ws_alive false so mixing loop exits immediately
         self.ws_alive.store(false, Ordering::Release);
     }
 
-    /// Returns true if the voice WebSocket is still connected.
     pub fn is_ws_alive(&self) -> bool {
         self.ws_alive.load(Ordering::Acquire)
     }
 
-    /// Audio engine loop — 20ms tick: mix PCM → Opus encode → DAVE encrypt → transport encrypt → UDP send.
+    /// Audio engine loop — 20ms tick.
     ///
-    /// KEY FIX: The mixing loop now checks ws_alive BEFORE sending any frames
-    /// and exits immediately when the WS dies. It also waits for the first track
-    /// to be added before entering the tight 20ms loop, preventing the yt-dlp
-    /// resolution delay from racing against the WS session timeout.
+    /// When tracks are active:  mix PCM → Opus encode → DAVE encrypt → transport encrypt → UDP send
+    /// When idle (no tracks):   send a silence frame every 5 seconds to keep the session alive
+    ///
+    /// This prevents Discord 4006 "Session is no longer valid" kills.
     pub async fn start_mixing(
         &self,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -602,7 +588,7 @@ impl CoreDriver {
                             return;
                         }
                         if !self.ws_alive.load(Ordering::Acquire) {
-                            return; // WS died during wait — don't block forever
+                            return;
                         }
                         tokio::select! {
                             _ = self.dave_notify.notified() => {
@@ -617,7 +603,6 @@ impl CoreDriver {
             ).await.is_ok()
         };
 
-        // Check if WS died during DAVE wait
         if !self.ws_alive.load(Ordering::Acquire) {
             error!("WS died during DAVE wait — aborting mixing loop");
             return Err("WS connection lost before mixing could start".into());
@@ -658,8 +643,8 @@ impl CoreDriver {
         let mut dave_failures: u64  = 0;
         let mut was_active          = false;
         let mut silence_sent: u8    = 0;
+        let mut idle_tick_count: u64 = 0;
 
-        // Pre-allocate mixing buffer — reused every tick to avoid allocation
         let mut mixed = vec![0i32; 1920];
 
         let mut ticker = tokio::time::interval(std::time::Duration::from_millis(20));
@@ -668,20 +653,17 @@ impl CoreDriver {
         loop {
             ticker.tick().await;
 
-            // ── Check if WS is still alive ────────────────────────────────
             if !self.ws_alive.load(Ordering::Acquire) {
                 warn!("🛑 WS connection lost — stopping mixing loop (sent {} frames)", frames_sent);
                 break;
             }
 
-            // ── Check shutdown flag ───────────────────────────────────────
             if self.shutdown.load(Ordering::Relaxed) {
                 info!("🛑 Shutdown requested — stopping mixing loop");
                 break;
             }
 
             // ── 1. Mix PCM from all active tracks ─────────────────────────
-            // Zero the buffer without reallocating
             for s in mixed.iter_mut() { *s = 0; }
             let mut active = false;
 
@@ -718,12 +700,48 @@ impl CoreDriver {
                             }
                         }
                     } else {
-                        active = true; // Lock contention — assume still active
+                        active = true;
                     }
                 }
-            } // tracks lock dropped here — NOT held during encode/encrypt/send
+            } // tracks lock dropped here
 
-            // ── Send 5 Opus silence frames when audio stops ───────────────
+            // ═══════════════════════════════════════════════════════════════
+            // IDLE KEEPALIVE: No tracks active → send silence every 5s
+            // This prevents Discord from killing the session with 4006.
+            // ═══════════════════════════════════════════════════════════════
+            if !active && !was_active {
+                idle_tick_count += 1;
+
+                if idle_tick_count % IDLE_KEEPALIVE_TICKS == 1 {
+                    // Send a single silence frame as keepalive
+                    let rtp_hdr = crate::udp::build_rtp_header(seq, timestamp, self.ssrc);
+                    let payload = {
+                        let mut s = self.sigil.lock().await;
+                        if s.has_own_key() {
+                            match s.encrypt_own_frame(&OPUS_SILENCE, sigil_discord::crypto::codec::Codec::Opus) {
+                                Ok(ct) => ct,
+                                Err(_) => OPUS_SILENCE.to_vec(),
+                            }
+                        } else {
+                            OPUS_SILENCE.to_vec()
+                        }
+                    };
+                    if let Ok(pkt) = crate::udp::transport_encrypt_rtpsize(
+                        &secret_key, &rtp_hdr, &payload, nonce_counter,
+                    ) {
+                        let _ = self.udp.send_to(&pkt, &self.target_addr).await;
+                    }
+                    seq = seq.wrapping_add(1);
+                    timestamp = timestamp.wrapping_add(960);
+                    nonce_counter = nonce_counter.wrapping_add(1);
+                    if idle_tick_count <= 1 {
+                        info!("💤 Idle keepalive started — sending silence every 5s");
+                    }
+                }
+                continue;
+            }
+
+            // ── Transition: active → idle: send 5 silence frames ──────────
             if !active && was_active && silence_sent < 5 {
                 let rtp_hdr = crate::udp::build_rtp_header(seq, timestamp, self.ssrc);
                 let payload = {
@@ -757,17 +775,23 @@ impl CoreDriver {
                             op: 5, d: Some(d), s: None, t: None, seq_ack: None,
                         })).await;
                     }
+                    was_active = false;
+                    idle_tick_count = 0; // start idle keepalive counter
                 }
                 continue;
             }
 
             if !active {
+                // was_active is still true but silence_sent >= 5, transition complete
+                was_active = false;
+                idle_tick_count = 0;
                 continue;
             }
 
-            // Reset silence counter when audio becomes active again
+            // ── Transition: idle → active: reset and re-announce Speaking ─
             if active && !was_active {
                 silence_sent = 0;
+                idle_tick_count = 0;
                 let resume_speaking = crate::gateway::Speaking {
                     speaking: 1, delay: 0, ssrc: self.ssrc, user_id: None,
                 };
@@ -873,7 +897,6 @@ impl CoreDriver {
             let mut pcm_out = [0i16; 1920];
 
             loop {
-                // Check if driver is shutting down
                 if !ws_alive.load(Ordering::Acquire) || shutdown.load(Ordering::Relaxed) {
                     info!("Receiver loop: WS dead or shutdown — exiting");
                     break;
