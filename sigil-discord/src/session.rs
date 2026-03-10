@@ -373,6 +373,14 @@ impl SigilSession {
         self.group.is_some()
     }
 
+    /// Returns `true` if we have our own encryption key (from export_sender_keys).
+    ///
+    /// This is distinct from `is_established()` because the group can exist
+    /// (created via set_external_sender) but our own key may not be exported yet.
+    pub fn has_own_key(&self) -> bool {
+        self.own_key.is_some()
+    }
+
     /// Returns the current MLS epoch, or `None` if no group is active.
     pub fn current_epoch(&self) -> Option<Epoch> {
         self.group.as_ref().map(|g| g.current_epoch)

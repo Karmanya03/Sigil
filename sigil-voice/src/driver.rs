@@ -498,6 +498,18 @@ impl CoreDriver {
             // --- 3. DAVE encrypt (may fail if MLS group not ready yet) ---
             let dave_ciphertext = {
                 let mut sigil_guard = self.sigil.lock().await;
+                
+                // Check if we have our own key before attempting encryption
+                if !sigil_guard.has_own_key() {
+                    dave_skip_count += 1;
+                    if dave_skip_count == 1 || dave_skip_count % 250 == 0 {
+                        info!("🔒 DAVE: No own key yet ( MLS not ready ) — falling back to raw Opus (dropped {} frames so far)", 
+                            dave_skip_count);
+                    }
+                    // Fall back to raw Opus frames when DAVE keys aren't ready
+                    continue;
+                }
+                
                 match sigil_guard.encrypt_own_frame(opus_data, sigil_discord::crypto::codec::Codec::Opus) {
                     Ok(ct) => {
                         if dave_skip_count > 0 {
