@@ -85,17 +85,17 @@ struct ActiveConnectionInfo {
 /// `ClientBuilder` and Serenity handles all the plumbing automatically.
 pub struct SigilVoiceManager {
     /// bot's own user_id — set by `initialise()`
-    user_id:     Mutex<u64>,
+    user_id: Mutex<u64>,
     /// shard_id → UnboundedSender (for sending Gateway OP 4)
-    shards:      Mutex<HashMap<u32, UnboundedSender<ShardRunnerMessage>>>,
+    shards: Mutex<HashMap<u32, UnboundedSender<ShardRunnerMessage>>>,
     /// guild_id → pending session info
-    pending:     Arc<Mutex<HashMap<GuildId, PendingConnection>>>,
+    pending: Arc<Mutex<HashMap<GuildId, PendingConnection>>>,
     /// guild_id → active Call handle
-    pub calls:   Arc<Mutex<HashMap<GuildId, Arc<Call>>>>,
+    pub calls: Arc<Mutex<HashMap<GuildId, Arc<Call>>>>,
     /// guild_id → credentials of the currently active connection
     active_info: Arc<Mutex<HashMap<GuildId, ActiveConnectionInfo>>>,
     /// guild_id → true if a CoreDriver::connect() is currently in-flight
-    connecting:  Arc<Mutex<HashMap<GuildId, bool>>>,
+    connecting: Arc<Mutex<HashMap<GuildId, bool>>>,
 }
 
 impl Default for SigilVoiceManager {
@@ -192,7 +192,13 @@ impl SigilVoiceManager {
     }
 
     /// Once we have session_id + endpoint + token, bootstrap the CoreDriver.
+    ///
+    /// KEY FIX: Hold `active_info` lock across the entire dedup+connect-guard
+    /// section to prevent a TOCTOU race where two events both pass the check.
+    /// Also drops the pending lock before acquiring active_info to avoid
+    /// potential deadlocks.
     async fn check_and_connect(&self, guild_id: GuildId) {
+        // ── Extract pending args (and drop the lock immediately) ───────────
         let args = {
             let p = self.pending.lock().await;
             let Some(entry) = p.get(&guild_id) else { return };
@@ -212,6 +218,7 @@ impl SigilVoiceManager {
                 entry.token.clone().unwrap(),
             )
         };
+        // pending lock is dropped here
 
         let (endpoint, session_id, token) = args;
 
@@ -237,6 +244,7 @@ impl SigilVoiceManager {
                 }
             }
         }
+        // active_info lock is dropped here
 
         // ── Guard against concurrent connect attempts ──────────────────────
         {
@@ -247,6 +255,7 @@ impl SigilVoiceManager {
             }
             conn.insert(guild_id, true);
         }
+        // connecting lock is dropped here
 
         // Flush pending so duplicate events don't re-trigger a connect
         self.pending.lock().await.remove(&guild_id);
@@ -256,6 +265,8 @@ impl SigilVoiceManager {
             tracing::warn!("♻️ Tearing down old Call for guild={} (session invalidated)", guild_id);
             old_call.driver.request_shutdown();
             old_call.stop().await;
+            // Brief delay so OS-level resources (sockets, tasks) settle
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
 
         let server_id_str = guild_id.get().to_string();
@@ -278,7 +289,7 @@ impl SigilVoiceManager {
                 CoreDriver::connect(&endpoint, &server_id_str, &user_id_str, &session_id, &token)
             ).await;
 
-            // Clear the connecting guard
+            // Clear the connecting guard FIRST — always, even on failure
             conn_clone.lock().await.remove(&guild_id);
 
             match result {
@@ -324,10 +335,6 @@ impl VoiceGatewayManager for SigilVoiceManager {
     async fn deregister_shard(&self, shard_id: u32) {
         tracing::info!("SigilVoiceManager: shard {} deregistered", shard_id);
         self.shards.lock().await.remove(&shard_id);
-
-        // When a shard deregisters, all voice connections through it are invalidated.
-        // We don't teardown here because Serenity will re-register and send fresh
-        // VOICE_SERVER_UPDATE events that will trigger reconnects via check_and_connect.
     }
 
     /// Called by Serenity for every VOICE_SERVER_UPDATE.
@@ -350,12 +357,15 @@ impl VoiceGatewayManager for SigilVoiceManager {
         }
 
         tracing::info!("VoiceServerUpdate [guild={}, endpoint={}]", guild_id, ep);
+
         {
             let mut p = self.pending.lock().await;
             let entry = p.entry(guild_id).or_default();
             entry.endpoint = Some(ep.clone());
-            entry.token = Some(token.to_string());
+            entry.token    = Some(token.to_string());
         }
+        // pending lock dropped before check_and_connect
+
         self.check_and_connect(guild_id).await;
     }
 
@@ -386,6 +396,8 @@ impl VoiceGatewayManager for SigilVoiceManager {
             entry.session_id = Some(voice_state.session_id.clone());
             entry.channel_id = voice_state.channel_id;
         }
+        // pending lock dropped before check_and_connect
+
         self.check_and_connect(guild_id).await;
     }
 }

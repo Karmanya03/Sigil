@@ -29,38 +29,38 @@ const SESSION_DESC_TIMEOUT_SECS: u64 = 10;
 const MAX_MISSED_HEARTBEATS: u8 = 3;
 
 pub struct CoreDriver {
-    pub udp:            Arc<UdpSocket>,
-    pub sigil:          Arc<Mutex<SigilSession>>,
-    pub mode:           Option<String>,
-    pub secret_key:     Option<Vec<u8>>,
-    pub ws_tx_channel:  mpsc::Sender<crate::gateway::WsMessage>,
-    pub tracks:         Arc<Mutex<Vec<crate::track::TrackHandle>>>,
-    pub ssrc:           u32,
-    pub target_addr:    String,
-    pub ssrc_map:       Arc<Mutex<std::collections::HashMap<u32, u64>>>,
-    pub receiver_tx:    Option<mpsc::UnboundedSender<(u64, Vec<i16>)>>,
-    pub decoders:       Arc<Mutex<std::collections::HashMap<u64, crate::audio::AudioDecoder>>>,
+    pub udp: Arc<UdpSocket>,
+    pub sigil: Arc<Mutex<SigilSession>>,
+    pub mode: Option<String>,
+    pub secret_key: Option<Vec<u8>>,
+    pub ws_tx_channel: mpsc::Sender<crate::gateway::WsMessage>,
+    pub tracks: Arc<Mutex<Vec<crate::track::TrackHandle>>>,
+    pub ssrc: u32,
+    pub target_addr: String,
+    pub ssrc_map: Arc<Mutex<std::collections::HashMap<u32, u64>>>,
+    pub receiver_tx: Option<mpsc::Sender<(u64, Vec<i16>)>>,
+    pub decoders: Arc<Mutex<std::collections::HashMap<u64, crate::audio::AudioDecoder>>>,
     /// Set to `true` once the WS task has exported our own sender key.
     /// The mixing loop polls this — no Notify race condition.
-    pub dave_ready:     Arc<AtomicBool>,
+    pub dave_ready: Arc<AtomicBool>,
     /// Wakes the mixing loop once after dave_ready flips to true.
-    pub dave_notify:    Arc<Notify>,
+    pub dave_notify: Arc<Notify>,
     /// Set to `false` when the WS background task dies (4006, network error, etc).
     /// The mixing loop checks this every tick and exits cleanly when false.
-    pub ws_alive:       Arc<AtomicBool>,
+    pub ws_alive: Arc<AtomicBool>,
     /// Monotonic counter of total frames sent — useful for diagnostics from outside.
-    pub frames_sent:    Arc<AtomicU64>,
+    pub frames_sent: Arc<AtomicU64>,
     /// Set to `true` when the driver should shut down all loops.
-    pub shutdown:       Arc<AtomicBool>,
+    pub shutdown: Arc<AtomicBool>,
 }
 
 impl CoreDriver {
     pub async fn connect(
         endpoint: &str,
         server_id: &str,
-        user_id:   &str,
+        user_id: &str,
         session_id: &str,
-        token:     &str,
+        token: &str,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         info!("⚡ Connecting [endpoint={}, server={}, user={}]", endpoint, server_id, user_id);
 
@@ -104,8 +104,8 @@ impl CoreDriver {
             protocol: "udp".to_string(),
             data: ProtocolData {
                 address: external_ip,
-                port:    external_port,
-                mode:    "aead_aes256_gcm_rtpsize".to_string(),
+                port: external_port,
+                mode: "aead_aes256_gcm_rtpsize".to_string(),
             },
         }).await?;
         info!("✅ 5/7 SelectProtocol sent");
@@ -141,7 +141,6 @@ impl CoreDriver {
                 session_desc.secret_key.len()
             ).into());
         }
-
         info!("✅ 6/7 SessionDescription [mode={}, key=32 bytes]", session_desc.mode);
 
         let mode       = Some(session_desc.mode);
@@ -150,14 +149,14 @@ impl CoreDriver {
         // ── 7. Background WS task (heartbeats + DAVE) ─────────────────────
         let (mut ws_tx, mut ws_rx) = gateway.ws.split();
         let (cmd_tx, mut cmd_rx) = mpsc::channel::<crate::gateway::WsMessage>(100);
-        let ssrc_map       = Arc::new(Mutex::new(std::collections::HashMap::new()));
-        let ssrc_map_clone = ssrc_map.clone();
-        let sigil_clone       = sigil.clone();
-        let dave_ready_clone  = dave_ready.clone();
-        let dave_notify_clone = dave_notify.clone();
-        let ws_alive_clone    = ws_alive.clone();
-        let shutdown_clone    = shutdown.clone();
-        let my_ssrc           = ready.ssrc;
+        let ssrc_map = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let ssrc_map_clone      = ssrc_map.clone();
+        let sigil_clone         = sigil.clone();
+        let dave_ready_clone    = dave_ready.clone();
+        let dave_notify_clone   = dave_notify.clone();
+        let ws_alive_clone      = ws_alive.clone();
+        let shutdown_clone      = shutdown.clone();
+        let my_ssrc             = ready.ssrc;
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(
@@ -209,7 +208,7 @@ impl CoreDriver {
                         send_text!(12, serde_json::json!({
                             "audio_ssrc": my_ssrc,
                             "video_ssrc": 0,
-                            "rtx_ssrc":   0,
+                            "rtx_ssrc": 0,
                             "encryption_ready": true
                         }));
                         encryption_ready_sent = true;
@@ -310,16 +309,17 @@ impl CoreDriver {
 
                                 match pkt.op {
                                     6 => {
-    hb_acked = true;
-    if let Some(d) = &pkt.d {
-        if let Some(ack_nonce) = d.as_u64() {
-            if ack_nonce != hb_nonce {
-                warn!("Heartbeat ACK nonce mismatch: sent={}, got={}", hb_nonce, ack_nonce);
-            }
-        }
-    }
-    debug!("Heartbeat ACK");
-}
+                                        hb_acked = true;
+                                        if let Some(d) = &pkt.d {
+                                            if let Some(ack_nonce) = d.as_u64() {
+                                                if ack_nonce != hb_nonce {
+                                                    warn!("Heartbeat ACK nonce mismatch: sent={}, got={}", hb_nonce, ack_nonce);
+                                                }
+                                            }
+                                        }
+                                        debug!("Heartbeat ACK");
+                                    }
+
                                     5 => {
                                         if let Some(d) = pkt.d {
                                             if let Ok(spk) = serde_json::from_value::<
@@ -335,16 +335,11 @@ impl CoreDriver {
                                             }
                                         }
                                     }
-                                    9 => {
-                                        info!("Voice WS resumed");
-                                    }
-                                    13 => {
-                                        debug!("Client connected (OP 13)");
-                                    }
-                                    18 => {
-                                        debug!("Client disconnected (OP 18)");
-                                    }
-                                    _ => debug!("Text OP {}", pkt.op),
+
+                                    9  => { info!("Voice WS resumed"); }
+                                    13 => { debug!("Client connected (OP 13)"); }
+                                    18 => { debug!("Client disconnected (OP 18)"); }
+                                    _  => debug!("Text OP {}", pkt.op),
                                 }
                             }
 
@@ -444,6 +439,7 @@ impl CoreDriver {
                                             }
                                             Err(e) => {
                                                 warn!("DAVE: Skipping unprocessable proposal: {:?}", e);
+                                                // Still send EncryptionReady — we have a key from OP 25
                                                 send_encryption_ready!();
                                             }
                                         }
@@ -538,16 +534,16 @@ impl CoreDriver {
             mode,
             secret_key,
             ws_tx_channel: cmd_tx,
-            tracks:        Arc::new(Mutex::new(Vec::new())),
-            ssrc:          ready.ssrc,
+            tracks: Arc::new(Mutex::new(Vec::new())),
+            ssrc: ready.ssrc,
             target_addr,
             ssrc_map,
-            receiver_tx:   None,
-            decoders:      Arc::new(Mutex::new(std::collections::HashMap::new())),
+            receiver_tx: None,
+            decoders: Arc::new(Mutex::new(std::collections::HashMap::new())),
             dave_ready,
             dave_notify,
             ws_alive,
-            frames_sent:   Arc::new(AtomicU64::new(0)),
+            frames_sent: Arc::new(AtomicU64::new(0)),
             shutdown,
         })
     }
@@ -578,6 +574,11 @@ impl CoreDriver {
     }
 
     /// Audio engine loop — 20ms tick: mix PCM → Opus encode → DAVE encrypt → transport encrypt → UDP send.
+    ///
+    /// KEY FIX: The mixing loop now checks ws_alive BEFORE sending any frames
+    /// and exits immediately when the WS dies. It also waits for the first track
+    /// to be added before entering the tight 20ms loop, preventing the yt-dlp
+    /// resolution delay from racing against the WS session timeout.
     pub async fn start_mixing(
         &self,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -649,14 +650,14 @@ impl CoreDriver {
 
         info!("🎙️ Mixing loop started → {}", self.target_addr);
 
-        let mut seq: u16          = 0;
-        let mut timestamp: u32    = 0;
-        let mut nonce_counter: u32 = 0;
-        let mut opus_buf          = [0u8; 4000];
-        let mut frames_sent: u64  = 0;
-        let mut dave_failures: u64 = 0;
-        let mut was_active        = false;
-        let mut silence_sent: u8  = 0;
+        let mut seq: u16            = 0;
+        let mut timestamp: u32      = 0;
+        let mut nonce_counter: u32  = 0;
+        let mut opus_buf            = [0u8; 4000];
+        let mut frames_sent: u64    = 0;
+        let mut dave_failures: u64  = 0;
+        let mut was_active          = false;
+        let mut silence_sent: u8    = 0;
 
         // Pre-allocate mixing buffer — reused every tick to avoid allocation
         let mut mixed = vec![0i32; 1920];
@@ -695,7 +696,6 @@ impl CoreDriver {
                     if handle.get_state_atomic() != crate::track::PlayState::Playing {
                         continue;
                     }
-
                     if let Ok(mut t) = handle.inner().try_lock() {
                         match t.source.read_frame() {
                             Some(frame) => {
@@ -721,7 +721,7 @@ impl CoreDriver {
                         active = true; // Lock contention — assume still active
                     }
                 }
-            }
+            } // tracks lock dropped here — NOT held during encode/encrypt/send
 
             // ── Send 5 Opus silence frames when audio stops ───────────────
             if !active && was_active && silence_sent < 5 {
@@ -742,7 +742,6 @@ impl CoreDriver {
                 ) {
                     let _ = self.udp.send_to(&pkt, &self.target_addr).await;
                 }
-
                 seq = seq.wrapping_add(1);
                 timestamp = timestamp.wrapping_add(960);
                 nonce_counter = nonce_counter.wrapping_add(1);
@@ -870,7 +869,7 @@ impl CoreDriver {
             .ok_or("No secret key")?;
 
         tokio::spawn(async move {
-            let mut buf     = [0u8; 4096];
+            let mut buf = [0u8; 4096];
             let mut pcm_out = [0i16; 1920];
 
             loop {
@@ -887,7 +886,7 @@ impl CoreDriver {
 
                 if n < 12 + 16 + 4 { continue; }
 
-                let pkt  = &buf[..n];
+                let pkt = &buf[..n];
                 let ssrc = u32::from_be_bytes([pkt[8], pkt[9], pkt[10], pkt[11]]);
 
                 let decrypted = match crate::udp::transport_decrypt_rtpsize(&secret_key, pkt) {
@@ -903,7 +902,7 @@ impl CoreDriver {
                 let dave_plain = {
                     let s = sigil.lock().await;
                     match s.decrypt_from_sender(uid, &decrypted) {
-                        Ok(d)  => d,
+                        Ok(d) => d,
                         Err(_) => continue,
                     }
                 };
@@ -913,7 +912,7 @@ impl CoreDriver {
                     crate::audio::AudioDecoder::new().expect("AudioDecoder::new")
                 });
                 if let Ok(n) = dec.decode_opus(&dave_plain, &mut pcm_out) {
-                    let _ = receiver_tx.send((uid, pcm_out[..n].to_vec()));
+                    let _ = receiver_tx.send((uid, pcm_out[..n].to_vec())).await;
                 }
             }
         });
