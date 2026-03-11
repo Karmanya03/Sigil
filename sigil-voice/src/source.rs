@@ -96,10 +96,13 @@ impl YtDlpSource {
 
         let mut cmd = Command::new("yt-dlp");
         cmd.args(&[
-            "-f", "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio",
+            // Accept any audio format — ffmpeg transcodes to s16le regardless
+            "-f", "bestaudio/best",
             "--no-playlist",
             "-J",
             "--no-warnings",
+            "--no-check-certificates",
+            "--extractor-args", "youtube:player_client=ios,web",
         ]);
 
         if let Some(cookie_path) = get_cookies_file_path() {
