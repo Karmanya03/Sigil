@@ -21,39 +21,29 @@ const CHANNEL_DEPTH: usize = 512;
 
 // ── Cookie helpers ───────────────────────────────────────────────────────────
 
-/// Return a filesystem path suitable for `yt-dlp --cookies <path>`.
-/// Checks `YOUTUBE_COOKIES_FILE` env first, then `YT_COOKIES` (if it points to
-/// a file), then falls back to `./cookies.txt`.
 fn get_cookies_file_path() -> Option<String> {
-    // Explicit file path env
     if let Ok(path) = std::env::var("YOUTUBE_COOKIES_FILE") {
         if std::path::Path::new(&path).exists() {
             return Some(path);
         }
     }
-    // YT_COOKIES might be a path (legacy)
     if let Ok(val) = std::env::var("YT_COOKIES") {
         if !val.is_empty() && std::path::Path::new(&val).exists() {
             return Some(val);
         }
     }
-    // Default
     if std::path::Path::new("cookies.txt").exists() {
         return Some("cookies.txt".to_string());
     }
     None
 }
 
-/// Return a `Cookie: …` value for ffmpeg's `-headers`. Parses Netscape-format
-/// cookie files into `name=value; …` pairs.
 fn get_cookies_for_ffmpeg() -> Option<String> {
-    // If YT_COOKIES is a raw cookie string (not a file), use it directly
     if let Ok(c) = std::env::var("YT_COOKIES") {
         if !c.is_empty() && !std::path::Path::new(&c).exists() {
             return Some(c);
         }
     }
-    // Otherwise parse from a file
     let path = get_cookies_file_path()?;
     parse_cookies_file(&path)
 }
@@ -79,12 +69,117 @@ fn parse_cookies_file(path: &str) -> Option<String> {
     Some(pairs.join("; "))
 }
 
+// ── Format selection helpers ────────────────────────────────────────────────
+
+/// Pick the best audio URL from yt-dlp's JSON output.
+///
+/// Strategy (same as most Discord music bots):
+/// 1. If the top-level `url` field exists and is non-empty, use it
+///    (yt-dlp already selected the best format).
+/// 2. Otherwise, scan the `formats` array:
+///    a. Prefer audio-only formats (vcodec == "none") sorted by abr/tbr
+///    b. Fall back to any format with an audio codec
+/// 3. For search results, unwrap `entries[0]` first.
+fn pick_best_audio(
+    parsed: &serde_json::Value,
+) -> Option<(String, serde_json::Value)> {
+    // Unwrap search results
+    let entry = if parsed.get("formats").is_some() {
+        parsed
+    } else if let Some(first) = parsed.get("entries").and_then(|e| e.get(0)) {
+        first
+    } else {
+        parsed
+    };
+
+    // Try top-level URL first (present when yt-dlp auto-selects)
+    if let Some(url) = entry.get("url").and_then(|u| u.as_str()) {
+        if !url.is_empty() && url.starts_with("http") {
+            let headers = entry
+                .get("http_headers")
+                .cloned()
+                .unwrap_or(serde_json::Value::Null);
+            return Some((url.to_string(), headers));
+        }
+    }
+
+    // Scan formats array
+    let formats = entry.get("formats")?.as_array()?;
+
+    // Audio-only formats: vcodec == "none" and has a URL
+    let mut audio_only: Vec<&serde_json::Value> = formats
+        .iter()
+        .filter(|f| {
+            let vcodec = f.get("vcodec").and_then(|v| v.as_str()).unwrap_or("");
+            let acodec = f.get("acodec").and_then(|v| v.as_str()).unwrap_or("none");
+            let has_url = f.get("url").and_then(|u| u.as_str()).map(|u| !u.is_empty()).unwrap_or(false);
+            (vcodec == "none" || vcodec.is_empty()) && acodec != "none" && has_url
+        })
+        .collect();
+
+    // Sort by audio bitrate descending (prefer higher quality)
+    audio_only.sort_by(|a, b| {
+        let abr_a = a.get("abr").and_then(|v| v.as_f64())
+            .or_else(|| a.get("tbr").and_then(|v| v.as_f64()))
+            .unwrap_or(0.0);
+        let abr_b = b.get("abr").and_then(|v| v.as_f64())
+            .or_else(|| b.get("tbr").and_then(|v| v.as_f64()))
+            .unwrap_or(0.0);
+        abr_b.partial_cmp(&abr_a).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    if let Some(best) = audio_only.first() {
+        let url = best.get("url")?.as_str()?.to_string();
+        let headers = best
+            .get("http_headers")
+            .or_else(|| entry.get("http_headers"))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        return Some((url, headers));
+    }
+
+    // Fallback: any format with audio
+    let mut with_audio: Vec<&serde_json::Value> = formats
+        .iter()
+        .filter(|f| {
+            let acodec = f.get("acodec").and_then(|v| v.as_str()).unwrap_or("none");
+            let has_url = f.get("url").and_then(|u| u.as_str()).map(|u| !u.is_empty()).unwrap_or(false);
+            acodec != "none" && has_url
+        })
+        .collect();
+
+    with_audio.sort_by(|a, b| {
+        let abr_a = a.get("abr").and_then(|v| v.as_f64())
+            .or_else(|| a.get("tbr").and_then(|v| v.as_f64()))
+            .unwrap_or(0.0);
+        let abr_b = b.get("abr").and_then(|v| v.as_f64())
+            .or_else(|| b.get("tbr").and_then(|v| v.as_f64()))
+            .unwrap_or(0.0);
+        abr_b.partial_cmp(&abr_a).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    if let Some(best) = with_audio.first() {
+        let url = best.get("url")?.as_str()?.to_string();
+        let headers = best
+            .get("http_headers")
+            .or_else(|| entry.get("http_headers"))
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        return Some((url, headers));
+    }
+
+    None
+}
+
 // ── YtDlpSource ──────────────────────────────────────────────────────────────
 
 impl YtDlpSource {
-    /// Resolve a URL **or** search query to a direct audio stream URL via
-    /// `yt-dlp -J`. For `ytsearch1:` queries the real URL lives inside
-    /// `entries[0]` — not at the root level.
+    /// Resolve a URL or search query to a direct audio stream URL.
+    ///
+    /// Uses `yt-dlp -J` WITHOUT `-f` to dump all format metadata,
+    /// then picks the best audio format from the formats array.
+    /// This avoids the "Requested format is not available" error
+    /// that occurs when yt-dlp's format selector can't find a match.
     pub async fn get_direct_url_and_headers(
         query: &str,
     ) -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>> {
@@ -95,11 +190,12 @@ impl YtDlpSource {
         };
 
         let mut cmd = Command::new("yt-dlp");
+        // NO -f flag — dump all formats, we pick the best audio ourselves
         cmd.args(&[
-            "-f", "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio",
             "--no-playlist",
             "-J",
             "--no-warnings",
+            "--no-check-certificates",
         ]);
 
         if let Some(cookie_path) = get_cookies_file_path() {
@@ -116,36 +212,20 @@ impl YtDlpSource {
         let json_str = String::from_utf8(output.stdout)?;
         let parsed: serde_json::Value = serde_json::from_str(&json_str)?;
 
-        // ── FIX: for `ytsearch1:` results the URL is inside entries[0] ───
-        let entry = if parsed["url"].as_str().filter(|s| !s.is_empty()).is_some() {
-            &parsed                        // direct URL / single video
-        } else if let Some(first) = parsed["entries"].get(0) {
-            first                          // search result → unwrap entries
-        } else {
-            return Err("yt-dlp returned no URL and no entries".into());
-        };
+        let (url, headers_val) = pick_best_audio(&parsed)
+            .ok_or("yt-dlp: no suitable audio format found in JSON output")?;
 
-        let url = entry["url"]
-            .as_str()
-            .filter(|s| !s.is_empty())
-            .ok_or("yt-dlp: resolved entry has empty URL")?
-            .to_string();
-
-        // Headers may live in the entry or at root level
+        // Convert headers JSON object to "Key: Value\r\n" string for ffmpeg
         let mut header_str = String::new();
-        let hdrs = entry
-            .get("http_headers")
-            .and_then(|v| v.as_object())
-            .or_else(|| parsed.get("http_headers").and_then(|v| v.as_object()));
-        if let Some(h) = hdrs {
-            for (k, v) in h {
+        if let Some(obj) = headers_val.as_object() {
+            for (k, v) in obj {
                 if let Some(vs) = v.as_str() {
                     header_str.push_str(&format!("{}: {}\r\n", k, vs));
                 }
             }
         }
 
-        info!("Resolved URL ({}...)", &url[..url.len().min(80)]);
+        info!("Resolved audio URL ({}...)", &url[..url.len().min(80)]);
         Ok((url, header_str))
     }
 
@@ -157,7 +237,6 @@ impl YtDlpSource {
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let mut cmd = Command::new("ffmpeg");
 
-        // ── Input options ─────────────────────────────────────────────────
         cmd.args(&[
             "-reconnect",           "1",
             "-reconnect_streamed",  "1",
@@ -167,7 +246,6 @@ impl YtDlpSource {
             "-hide_banner",
         ]);
 
-        // Combine yt-dlp headers + cookies into one `-headers` value
         let mut full_headers = headers.to_string();
         if let Some(cookie) = get_cookies_for_ffmpeg() {
             if !full_headers.is_empty() && !full_headers.ends_with("\r\n") {
@@ -181,11 +259,9 @@ impl YtDlpSource {
 
         cmd.args(&["-i", direct_url]);
 
-        // ── Output options ────────────────────────────────────────────────
-        // Single -af chain: resample → format (avoids the silent-override bug
-        // where a second -af flag discards the first).
         cmd.args(&[
             "-af", "aresample=48000,aformat=sample_fmts=s16:channel_layouts=stereo",
+            "-vn",
             "-f",  "s16le",
             "-ar", "48000",
             "-ac", "2",
@@ -205,7 +281,6 @@ impl YtDlpSource {
         let got_audio = Arc::new(AtomicBool::new(false));
         let got_audio_clone = got_audio.clone();
 
-        // ── stderr logger ─────────────────────────────────────────────────
         tokio::spawn(async move {
             let mut reader = BufReader::new(stderr);
             let mut line = String::new();
@@ -235,17 +310,15 @@ impl YtDlpSource {
             }
         });
 
-        // ── PCM reader ────────────────────────────────────────────────────
         let mut reader = BufReader::with_capacity(READER_BUF, stdout);
 
         tokio::spawn(async move {
-            let _child = child; // child is killed when this task exits
+            let _child = child;
 
             let mut chunk = vec![0u8; FRAME_BYTES];
             let mut frames_produced: u64 = 0;
 
             loop {
-                // Fill exactly one 20 ms frame
                 let mut cursor = 0;
                 loop {
                     match reader.read(&mut chunk[cursor..]).await {
@@ -295,7 +368,6 @@ impl YtDlpSource {
         Ok(())
     }
 
-    /// Convenience: resolve + spawn ffmpeg → return a Track ready for playback.
     pub async fn create_track(
         query: &str,
     ) -> Result<crate::track::Track, Box<dyn std::error::Error + Send + Sync>> {
