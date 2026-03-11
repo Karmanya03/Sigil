@@ -399,7 +399,7 @@ impl CoreDriver {
                                                     info!("DAVE: PrepareEpoch (epoch={}, proto={})",
                                                         pe.epoch, pe.protocol_version);
                                                     if pe.epoch == 1 {
-                                                        let mut s = sigil_clone.lock().await;
+                                                        let s = sigil_clone.lock().await;
                                                         match s.generate_key_package() {
                                                             Ok(kp) => {
                                                                 send_bin!(26, kp);

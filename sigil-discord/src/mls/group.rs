@@ -159,10 +159,7 @@ impl DaveGroup {
                     match processed_msg.into_content() {
                         ProcessedMessageContent::ProposalMessage(staged_proposal) => {
                             // OpenMLS 0.6.0 requires storage provider as first arg
-                            self.mls_group.store_pending_proposal(
-                                provider.storage(),
-                                *staged_proposal,
-                            );
+                            let _ = self.mls_group.store_pending_proposal(provider.storage(), *staged_proposal);
                             processed_count += 1;
                             tracing::debug!(
                                 "Stored pending proposal at index {} (total pending: {})",
