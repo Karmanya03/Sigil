@@ -297,7 +297,12 @@ impl CoreDriver {
                         };
 
                         match msg {
-                            // ── Text (JSON opcodes) ───────────────────────
+                            // ══════════════════════════════════════════════
+                            // TEXT (JSON opcodes)
+                            // Handles: 5, 6, 9, 13, 18, and DAVE JSON
+                            // opcodes 21 (PrepareTransition), 22
+                            // (ExecuteTransition), 24 (PrepareEpoch).
+                            // ══════════════════════════════════════════════
                             tokio_tungstenite::tungstenite::Message::Text(text) => {
                                 let Ok(pkt) = serde_json::from_str::<VoicePacket>(&text) else {
                                     continue;
@@ -336,6 +341,81 @@ impl CoreDriver {
                                             }
                                         }
                                     }
+
+                                    // ── OP 21: PrepareTransition (JSON) ───
+                                    //
+                                    // Server tells us to prepare for a DAVE
+                                    // protocol transition. We respond with
+                                    // OP 23 ReadyForTransition.
+                                    21 => {
+                                        if let Some(d) = pkt.d {
+                                            use sigil_discord::gateway::opcodes::{PrepareTransition, ReadyForTransition};
+                                            match serde_json::from_value::<PrepareTransition>(d) {
+                                                Ok(pt) => {
+                                                    info!("DAVE: PrepareTransition (tid={}, proto={})",
+                                                        pt.transition_id, pt.protocol_version);
+                                                    send_text!(23, serde_json::to_value(
+                                                        ReadyForTransition { transition_id: pt.transition_id }
+                                                    ).unwrap_or_default());
+                                                    info!("DAVE: → OP 23 ReadyForTransition (tid={})", pt.transition_id);
+                                                }
+                                                Err(e) => {
+                                                    warn!("DAVE: Failed to parse PrepareTransition: {:?}", e);
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // ── OP 22: ExecuteTransition (JSON) ───
+                                    //
+                                    // Server tells us to execute the transition.
+                                    // Reset encryption_ready_sent so we can
+                                    // re-send OP 12 after the new epoch is ready.
+                                    22 => {
+                                        if let Some(d) = pkt.d {
+                                            use sigil_discord::gateway::opcodes::ExecuteTransition;
+                                            match serde_json::from_value::<ExecuteTransition>(d) {
+                                                Ok(et) => {
+                                                    info!("DAVE: ExecuteTransition (tid={})", et.transition_id);
+                                                    encryption_ready_sent = false;
+                                                }
+                                                Err(e) => {
+                                                    warn!("DAVE: Failed to parse ExecuteTransition: {:?}", e);
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    // ── OP 24: PrepareEpoch (JSON) ────────
+                                    //
+                                    // Server tells us to prepare for a new MLS
+                                    // epoch. When epoch == 1, we generate and
+                                    // send a fresh key package (OP 26 binary).
+                                    24 => {
+                                        if let Some(d) = pkt.d {
+                                            use sigil_discord::gateway::opcodes::PrepareEpoch;
+                                            match serde_json::from_value::<PrepareEpoch>(d) {
+                                                Ok(pe) => {
+                                                    info!("DAVE: PrepareEpoch (epoch={}, proto={})",
+                                                        pe.epoch, pe.protocol_version);
+                                                    if pe.epoch == 1 {
+                                                        let mut s = sigil_clone.lock().await;
+                                                        match s.generate_key_package() {
+                                                            Ok(kp) => {
+                                                                send_bin!(26, kp);
+                                                                info!("DAVE: → OP 26 KeyPackage");
+                                                            }
+                                                            Err(e) => error!("DAVE: KeyPackage failed: {:?}", e),
+                                                        }
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    warn!("DAVE: Failed to parse PrepareEpoch: {:?}", e);
+                                                }
+                                            }
+                                        }
+                                    }
+
                                     9  => { info!("Voice WS resumed"); }
                                     13 => { debug!("Client connected (OP 13)"); }
                                     18 => { debug!("Client disconnected (OP 18)"); }
@@ -343,7 +423,13 @@ impl CoreDriver {
                                 }
                             }
 
-                            // ── Binary (DAVE opcodes) ─────────────────────
+                            // ══════════════════════════════════════════════
+                            // BINARY (DAVE opcodes 25, 27, 29, 30)
+                            //
+                            // Per Discord Voice Opcodes Table, only these
+                            // opcodes arrive as binary WebSocket frames.
+                            // OP 21, 22, 24 are JSON — handled above.
+                            // ══════════════════════════════════════════════
                             tokio_tungstenite::tungstenite::Message::Binary(bin) => {
                                 if bin.len() < 3 { continue; }
                                 let opcode = bin[2];
@@ -360,35 +446,6 @@ impl CoreDriver {
 
                                 use sigil_discord::gateway::handler::DaveEvent;
                                 match event {
-                                    // ── OP 21: PrepareTransition ──────────
-                                    DaveEvent::PrepareTransition(p) => {
-                                        use sigil_discord::gateway::opcodes::ReadyForTransition;
-                                        send_text!(23, serde_json::to_value(
-                                            ReadyForTransition { transition_id: p.transition_id }
-                                        ).unwrap_or_default());
-                                        info!("DAVE: → OP 23 ReadyForTransition (tid={})", p.transition_id);
-                                    }
-
-                                    // ── OP 22: ExecuteTransition ─────────
-                                    DaveEvent::ExecuteTransition(e) => {
-                                        info!("DAVE: ExecuteTransition (tid={})", e.transition_id);
-                                        encryption_ready_sent = false;
-                                    }
-
-                                    // ── OP 24: PrepareEpoch ──────────────
-                                    DaveEvent::PrepareEpoch(p) => {
-                                        info!("DAVE: PrepareEpoch {}", p.epoch);
-                                        if p.epoch == 1 {
-                                            match s.generate_key_package() {
-                                                Ok(kp) => {
-                                                    send_bin!(26, kp);
-                                                    info!("DAVE: → OP 26 KeyPackage");
-                                                }
-                                                Err(e) => error!("DAVE: KeyPackage failed: {:?}", e),
-                                            }
-                                        }
-                                    }
-
                                     // ── OP 25: MlsExternalSender ─────────
                                     DaveEvent::MlsExternalSender(ext) => {
                                         match s.set_external_sender(&ext.credential) {
@@ -412,12 +469,6 @@ impl CoreDriver {
                                     }
 
                                     // ── OP 27: MlsProposals ──────────────
-                                    //
-                                    // FIX: process_proposals() now skips unknown proposal types
-                                    // internally. We only attempt commit_and_welcome() if there
-                                    // are actually pending proposals in the MLS group. This
-                                    // prevents empty commits when all proposals were skipped
-                                    // (e.g., Discord's custom type 16 extension proposals).
                                     DaveEvent::MlsProposals { operation_type: _operation_type, proposals } => {
                                         if proposals.is_empty() {
                                             debug!("DAVE: Empty proposal data, skipping");
