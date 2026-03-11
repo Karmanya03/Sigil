@@ -67,6 +67,10 @@ async fn get_available_formats(query: &str) -> Result<Vec<serde_json::Value>, Bo
         "-F",
         "--no-warnings",
         "--no-check-certificates",
+        // Add user-agent to avoid bot detection
+        "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        // Add referer for YouTube
+        "--referer", "https://www.youtube.com/",
     ]);
 
     if let Some(cookie_path) = get_cookies_file_path() {
@@ -219,6 +223,12 @@ impl YtDlpSource {
             "-J",
             "--no-warnings",
             "--no-check-certificates",
+            // Add user-agent to avoid bot detection
+            "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            // Add referer for YouTube
+            "--referer", "https://www.youtube.com/",
+            // Extract audio format explicitly
+            "-f", "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best",
         ]);
 
         if let Some(cookie_path) = get_cookies_file_path() {
