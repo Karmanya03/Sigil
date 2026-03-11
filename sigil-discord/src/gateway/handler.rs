@@ -2,6 +2,15 @@
 //!
 //! Parses raw binary/JSON payloads from the voice gateway into
 //! structured [`DaveEvent`] variants for the driver to act on.
+//!
+//! ## Opcode Transport Types
+//!
+//! Per Discord's Voice Opcodes Table:
+//! - **JSON text**: OP 21, 22, 23, 24, 31
+//! - **Binary**: OP 25, 26, 27, 28, 29, 30
+//!
+//! Only binary opcodes are dispatched through this module. JSON opcodes
+//! (21, 22, 24) are handled directly in the driver's text message handler.
 
 use crate::error::SigilError;
 use crate::gateway::opcodes::*;
@@ -9,12 +18,6 @@ use crate::gateway::opcodes::*;
 /// A parsed DAVE gateway event ready for driver consumption.
 #[derive(Debug, Clone)]
 pub enum DaveEvent {
-    /// OP 21: Server announces an upcoming protocol transition.
-    PrepareTransition(PrepareTransition),
-    /// OP 22: Server instructs us to execute a transition.
-    ExecuteTransition(ExecuteTransition),
-    /// OP 24: Server announces a new epoch (binary).
-    PrepareEpoch(PrepareEpoch),
     /// OP 25: External sender credential (binary).
     MlsExternalSender(MlsExternalSenderPayload),
     /// OP 27: One or more proposals (binary). Each inner Vec<u8> is one
@@ -33,84 +36,20 @@ pub enum DaveEvent {
 ///
 /// Binary layout common prefix: `[seq_be(2)][opcode(1)][payload...]`
 ///
+/// Only binary opcodes (25, 27, 29, 30) are handled here. JSON opcodes
+/// (21, 22, 24) are handled in the driver's text message handler.
+///
 /// # Errors
 ///
 /// Returns [`SigilError::UnknownOpcode`] for unrecognized opcodes, or
 /// [`SigilError::Mls`] for malformed payloads.
 pub fn dispatch(opcode: u8, payload: &[u8]) -> Result<DaveEvent, SigilError> {
     match opcode {
-        21 => parse_prepare_transition(payload),
-        22 => parse_execute_transition(payload),
-        24 => parse_prepare_epoch(payload),
         25 => parse_mls_external_sender(payload),
         27 => parse_mls_proposals(payload),
         29 => parse_mls_announce_commit(payload),
         30 => parse_mls_welcome(payload),
         _ => Err(SigilError::UnknownOpcode(opcode)),
-    }
-}
-
-// ── OP 21: PrepareTransition (JSON or binary) ──────────────────────
-
-fn parse_prepare_transition(payload: &[u8]) -> Result<DaveEvent, SigilError> {
-    // Binary: [seq(2)][op(1)][protocol_version(2 LE)]
-    // The payload passed here is AFTER the seq+op strip in driver, so:
-    //   payload = [protocol_version(2 LE)]
-    // But it may also be the full binary including seq+op if driver passes raw.
-    // Handle both cases:
-    let data = skip_header_if_present(payload, 21);
-
-    if data.len() >= 2 {
-        let protocol_version = u16::from_le_bytes([data[0], data[1]]);
-        Ok(DaveEvent::PrepareTransition(PrepareTransition {
-            protocol_version,
-            transition_id: 0, // transition_id comes with ExecuteTransition
-        }))
-    } else {
-        Err(SigilError::Mls(format!(
-            "PrepareTransition payload too short: {} bytes",
-            payload.len()
-        )))
-    }
-}
-
-// ── OP 22: ExecuteTransition (binary) ──────────────────────────────
-
-fn parse_execute_transition(payload: &[u8]) -> Result<DaveEvent, SigilError> {
-    // Binary: [seq(2)][op(1)][transition_id(4 LE)]
-    let data = skip_header_if_present(payload, 22);
-
-    if data.len() >= 4 {
-        let transition_id =
-            u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as u64;
-        Ok(DaveEvent::ExecuteTransition(ExecuteTransition {
-            transition_id,
-        }))
-    } else {
-        Err(SigilError::Mls(format!(
-            "ExecuteTransition payload too short: {} bytes",
-            payload.len()
-        )))
-    }
-}
-
-// ── OP 24: PrepareEpoch (binary) ───────────────────────────────────
-
-fn parse_prepare_epoch(payload: &[u8]) -> Result<DaveEvent, SigilError> {
-    // Binary: [seq(2)][op(1)][epoch(4 LE)]
-    let data = skip_header_if_present(payload, 24);
-
-    if data.len() >= 4 {
-        let epoch = u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as u64;
-        Ok(DaveEvent::PrepareEpoch(PrepareEpoch {
-            protocol_version: 1,
-            epoch,
-        }))
-    } else {
-        Err(SigilError::Mls(format!(
-            "PrepareEpoch payload too short: {} bytes",
-            payload.len()
-        )))
     }
 }
 
@@ -136,13 +75,21 @@ fn parse_mls_external_sender(payload: &[u8]) -> Result<DaveEvent, SigilError> {
 
 // ── OP 27: MlsProposals (binary) ──────────────────────────────────
 //
-// Discord sends proposals as:
-//   [seq(2)][op(1)][operation_type(1)][proposal_bytes...]
+// Per the DAVE protocol whitepaper, the binary format is:
 //
-// CRITICAL: The proposal_bytes may contain MULTIPLE TLS-serialized
-// MLS messages concatenated. Each is a complete MlsMessage with its
-// own TLS length prefix. We must split them into individual messages
-// so that process_proposals() can deserialize each one separately.
+//   struct {
+//     uint16 sequence_number;
+//     uint8 opcode = 27;
+//     ProposalsOperationType operation_type;
+//     select (operation_type) {
+//       case append: MLSMessage proposal_messages<V>;
+//       case revoke: ProposalRef proposal_refs<V>;
+//     }
+//   }
+//
+// Discord sends one OP 27 per proposal, or may batch by sending
+// multiple OP 27 messages. Each OP 27 contains one complete
+// TLS-serialized MLS message after the operation_type byte.
 
 fn parse_mls_proposals(payload: &[u8]) -> Result<DaveEvent, SigilError> {
     let data = skip_header_if_present(payload, 27);
@@ -156,10 +103,14 @@ fn parse_mls_proposals(payload: &[u8]) -> Result<DaveEvent, SigilError> {
     let operation_type = data[0]; // 0 = append, 1 = revoke
     let proposal_blob = &data[1..];
 
-    // Split the concatenated TLS-serialized proposals into individual messages.
-    // Each TLS-serialized MlsMessage is prefixed with a 4-byte big-endian length.
-    // If we can't split (no length prefix pattern), treat the entire blob as one.
-    let proposals = split_tls_messages(proposal_blob);
+    // Each OP 27 message contains one complete proposal.
+    // Multiple proposals arrive as separate OP 27 binary messages.
+    // The driver accumulates them before committing.
+    let proposals = if proposal_blob.is_empty() {
+        Vec::new()
+    } else {
+        vec![proposal_blob.to_vec()]
+    };
 
     Ok(DaveEvent::MlsProposals {
         operation_type,
@@ -167,44 +118,37 @@ fn parse_mls_proposals(payload: &[u8]) -> Result<DaveEvent, SigilError> {
     })
 }
 
-/// Split a buffer of concatenated TLS-serialized MLS messages.
-///
-/// MLS messages are TLS-serialized with a variable-length header. For
-/// simplicity and robustness, if we can't reliably split, we return the
-/// entire blob as a single proposal — `process_proposals` will attempt
-/// deserialization and report any errors.
-fn split_tls_messages(data: &[u8]) -> Vec<Vec<u8>> {
-    // Try to split using TLS 3-byte length prefix (MlsMessage uses u24 length).
-    // Format: [msg_type(1 or 2 bytes)][length(varies)][content...]
-    //
-    // However, the exact framing depends on the TLS codec. In practice,
-    // Discord sends each OP 27 with exactly ONE proposal per message.
-    // Multiple proposals arrive as separate OP 27 binary messages.
-    //
-    // So the safest approach: return the entire blob as one proposal.
-    // The driver accumulates multiple OP 27 events into a Vec before committing.
-    if data.is_empty() {
-        return Vec::new();
-    }
-    vec![data.to_vec()]
-}
-
 // ── OP 29: MlsAnnounceCommitTransition (binary) ───────────────────
+//
+// Per the DAVE protocol whitepaper:
+//
+//   struct {
+//     uint16 sequence_number;
+//     uint8 opcode = 29;
+//     uint16 transition_id;          // ← uint16, NOT uint32!
+//     MLSMessage commit_message;
+//   }
 
 fn parse_mls_announce_commit(payload: &[u8]) -> Result<DaveEvent, SigilError> {
-    // Binary: [seq(2)][op(1)][transition_id(4 LE)][commit_bytes...]
     let data = skip_header_if_present(payload, 29);
 
-    if data.len() < 4 {
+    // Need at least 2 bytes for transition_id
+    if data.len() < 2 {
         return Err(SigilError::Mls(format!(
             "AnnounceCommitTransition payload too short: {} bytes",
             data.len()
         )));
     }
 
-    let transition_id =
-        u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as u64;
-    let commit_bytes = data[4..].to_vec();
+    // transition_id is uint16 little-endian (2 bytes)
+    let transition_id = u16::from_le_bytes([data[0], data[1]]) as u64;
+    let commit_bytes = data[2..].to_vec();
+
+    if commit_bytes.is_empty() {
+        return Err(SigilError::Mls(
+            "AnnounceCommitTransition has empty commit data".to_string(),
+        ));
+    }
 
     Ok(DaveEvent::MlsAnnounceCommitTransition(
         MlsAnnounceCommitTransition {
@@ -215,21 +159,36 @@ fn parse_mls_announce_commit(payload: &[u8]) -> Result<DaveEvent, SigilError> {
 }
 
 // ── OP 30: MlsWelcome (binary) ────────────────────────────────────
+//
+// Per the DAVE protocol whitepaper:
+//
+//   struct {
+//     uint16 sequence_number;
+//     uint8 opcode = 30;
+//     uint16 transition_id;          // ← uint16, NOT uint32!
+//     Welcome welcome_message;
+//   }
 
 fn parse_mls_welcome(payload: &[u8]) -> Result<DaveEvent, SigilError> {
-    // Binary: [seq(2)][op(1)][transition_id(4 LE)][welcome_bytes...]
     let data = skip_header_if_present(payload, 30);
 
-    if data.len() < 4 {
+    // Need at least 2 bytes for transition_id
+    if data.len() < 2 {
         return Err(SigilError::Mls(format!(
             "MlsWelcome payload too short: {} bytes",
             data.len()
         )));
     }
 
-    let transition_id =
-        u32::from_le_bytes([data[0], data[1], data[2], data[3]]) as u64;
-    let welcome_bytes = data[4..].to_vec();
+    // transition_id is uint16 little-endian (2 bytes)
+    let transition_id = u16::from_le_bytes([data[0], data[1]]) as u64;
+    let welcome_bytes = data[2..].to_vec();
+
+    if welcome_bytes.is_empty() {
+        return Err(SigilError::Mls(
+            "MlsWelcome has empty welcome data".to_string(),
+        ));
+    }
 
     Ok(DaveEvent::MlsWelcome(MlsWelcomePayload {
         transition_id,
