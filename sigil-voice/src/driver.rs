@@ -13,7 +13,6 @@ use crate::gateway::{
 use crate::udp::{receive_ip_discovery, send_ip_discovery};
 
 /// Opus silence frame — 3 bytes that decode to 20 ms of silence.
-/// Discord requires 5 of these when audio stops to avoid decoder artifacts.
 const OPUS_SILENCE: [u8; 3] = [0xF8, 0xFF, 0xFE];
 
 /// Maximum consecutive DAVE encrypt failures before logging a warning batch.
@@ -43,15 +42,10 @@ pub struct CoreDriver {
     pub ssrc_map: Arc<Mutex<std::collections::HashMap<u32, u64>>>,
     pub receiver_tx: Option<mpsc::Sender<(u64, Vec<i16>)>>,
     pub decoders: Arc<Mutex<std::collections::HashMap<u64, crate::audio::AudioDecoder>>>,
-    /// Set to `true` once the WS task has exported our own sender key.
     pub dave_ready: Arc<AtomicBool>,
-    /// Wakes the mixing loop once after dave_ready flips to true.
     pub dave_notify: Arc<Notify>,
-    /// Set to `false` when the WS background task dies (4006, network error, etc).
     pub ws_alive: Arc<AtomicBool>,
-    /// Monotonic counter of total frames sent — useful for diagnostics from outside.
     pub frames_sent: Arc<AtomicU64>,
-    /// Set to `true` when the driver should shut down all loops.
     pub shutdown: Arc<AtomicBool>,
 }
 
@@ -163,7 +157,7 @@ impl CoreDriver {
             let mut interval = tokio::time::interval(
                 std::time::Duration::from_millis(heartbeat_interval as u64)
             );
-            interval.tick().await; // skip first immediate tick
+            interval.tick().await;
             let mut seq_ack: Option<u64> = None;
             let mut binary_seq: u16 = 0;
             let mut hb_nonce: u64 = 0;
@@ -228,7 +222,6 @@ impl CoreDriver {
             }
 
             loop {
-                // Check shutdown flag
                 if shutdown_clone.load(Ordering::Relaxed) {
                     info!("WS task: shutdown requested");
                     break;
@@ -253,7 +246,6 @@ impl CoreDriver {
                             .unwrap_or_default()
                             .as_millis() as u64;
 
-                        // V8 heartbeat: seq_ack goes INSIDE d, not at top level
                         let mut hb_d = serde_json::json!({"t": hb_nonce});
                         if let Some(sa) = seq_ack {
                             hb_d["seq_ack"] = serde_json::json!(sa);
@@ -262,7 +254,7 @@ impl CoreDriver {
                         let hb = VoicePacket {
                             op: 3,
                             d: Some(hb_d),
-                            s: None, t: None, seq_ack: None, // NOT at top level for OP 3
+                            s: None, t: None, seq_ack: None,
                         };
                         if let Ok(txt) = serde_json::to_string(&hb) {
                             if ws_tx.send(
@@ -380,7 +372,6 @@ impl CoreDriver {
                                     // ── OP 22: ExecuteTransition ─────────
                                     DaveEvent::ExecuteTransition(e) => {
                                         info!("DAVE: ExecuteTransition (tid={})", e.transition_id);
-                                        // Reset encryption_ready so we re-send it for the new epoch
                                         encryption_ready_sent = false;
                                     }
 
@@ -421,6 +412,12 @@ impl CoreDriver {
                                     }
 
                                     // ── OP 27: MlsProposals ──────────────
+                                    //
+                                    // FIX: process_proposals() now skips unknown proposal types
+                                    // internally. We only attempt commit_and_welcome() if there
+                                    // are actually pending proposals in the MLS group. This
+                                    // prevents empty commits when all proposals were skipped
+                                    // (e.g., Discord's custom type 16 extension proposals).
                                     DaveEvent::MlsProposals { operation_type: _operation_type, proposals } => {
                                         if proposals.is_empty() {
                                             debug!("DAVE: Empty proposal data, skipping");
@@ -428,39 +425,44 @@ impl CoreDriver {
                                             continue;
                                         }
 
-                                        // proposals is already &[Vec<u8>]
                                         match s.process_proposals(&proposals) {
                                             Ok(()) => {
-                                                // FIX: commit_and_welcome now internally calls
-                                                // merge_own_pending_commit() before returning,
-                                                // so export_sender_keys sees the NEW epoch's secret.
-                                                match s.commit_and_welcome() {
-                                                    Ok((commit, welcome)) => {
-                                                        // OP 28 payload: commit bytes, then welcome bytes
-                                                        let mut payload = commit;
-                                                        if let Some(w) = welcome {
-                                                            payload.extend_from_slice(&w);
-                                                        }
-                                                        send_bin!(28, payload);
-                                                        info!("DAVE: → OP 28 CommitWelcome");
+                                                let has_pending = s.has_pending_proposals();
 
-                                                        let uid = s.user_id;
-                                                        match s.export_sender_keys(&[uid]) {
-                                                            Ok(keys) if keys.contains_key(&uid) => {
-                                                                info!("DAVE: ✅ Own key exported (post-commit, new epoch)");
-                                                                mark_dave_ready!();
+                                                if has_pending {
+                                                    match s.commit_and_welcome() {
+                                                        Ok((commit, welcome)) => {
+                                                            let mut payload = commit;
+                                                            if let Some(w) = welcome {
+                                                                payload.extend_from_slice(&w);
                                                             }
-                                                            Ok(_) => error!("DAVE: missing own key after commit"),
-                                                            Err(e) => error!("DAVE: export failed: {:?}", e),
-                                                        }
+                                                            send_bin!(28, payload);
+                                                            info!("DAVE: → OP 28 CommitWelcome");
 
-                                                        send_encryption_ready!();
+                                                            let uid = s.user_id;
+                                                            match s.export_sender_keys(&[uid]) {
+                                                                Ok(keys) if keys.contains_key(&uid) => {
+                                                                    info!("DAVE: ✅ Own key exported (post-commit, new epoch)");
+                                                                    mark_dave_ready!();
+                                                                }
+                                                                Ok(_) => error!("DAVE: missing own key after commit"),
+                                                                Err(e) => error!("DAVE: export failed: {:?}", e),
+                                                            }
+
+                                                            send_encryption_ready!();
+                                                        }
+                                                        Err(e) => {
+                                                            warn!("DAVE: commit_and_welcome failed: {:?}", e);
+                                                            send_encryption_ready!();
+                                                        }
                                                     }
-                                                    Err(e) => error!("DAVE: commit_and_welcome failed: {:?}", e),
+                                                } else {
+                                                    debug!("DAVE: No processable proposals in batch, acknowledging");
+                                                    send_encryption_ready!();
                                                 }
                                             }
                                             Err(e) => {
-                                                warn!("DAVE: Skipping unprocessable proposal: {:?}", e);
+                                                warn!("DAVE: process_proposals failed: {:?}", e);
                                                 send_encryption_ready!();
                                             }
                                         }
@@ -510,7 +512,6 @@ impl CoreDriver {
                                         ).unwrap_or_default());
                                         info!("DAVE: → OP 23 ReadyForTransition (commit tid={})", c.transition_id);
 
-                                        // Re-export keys for the new epoch
                                         let uid = s.user_id;
                                         if let Ok(keys) = s.export_sender_keys(&[uid]) {
                                             if keys.contains_key(&uid) {
@@ -676,7 +677,6 @@ impl CoreDriver {
         let mut silence_sent: u8 = 0;
         let mut idle_tick_count: u64 = 0;
 
-        // Pre-allocated mixing buffer (reused every 20ms tick)
         let mut mixed = vec![0i32; 1920];
 
         let mut ticker = tokio::time::interval(std::time::Duration::from_millis(20));
@@ -736,7 +736,7 @@ impl CoreDriver {
                         active = true;
                     }
                 }
-            } // tracks lock dropped here
+            }
 
             // ═══════════════════════════════════════════════════════════════
             // IDLE KEEPALIVE: No tracks active → send silence every 5s
@@ -834,7 +834,6 @@ impl CoreDriver {
             }
             was_active = active;
 
-            // Clamp i32 accumulator → i16
             let pcm: Vec<i16> = mixed.iter()
                 .map(|&s| s.clamp(i16::MIN as i32, i16::MAX as i32) as i16)
                 .collect();

@@ -107,6 +107,14 @@ impl SigilSession {
         Ok(())
     }
 
+    /// Check if the MLS group has pending proposals waiting to be committed.
+    pub fn has_pending_proposals(&self) -> bool {
+        self.group
+            .as_ref()
+            .map(|g| g.has_pending_proposals())
+            .unwrap_or(false)
+    }
+
     /// Resolve pending proposals by committing and issuing a Welcome buffer.
     ///
     /// **FIX (critical)**: After creating the commit, we call `merge_pending_commit()`
@@ -119,10 +127,6 @@ impl SigilSession {
         let signer = &self.identity.signature_keys;
         let (commit_bytes, welcome_bytes) = group.commit_pending(&self.provider, signer)?;
 
-        // FIX: Merge our own pending commit so we advance to the new epoch
-        // OpenMLS leaves the group in PendingCommit state after commit_to_pending_proposals().
-        // We must merge it before exporting secrets, otherwise the exporter secret
-        // is from the pre-commit epoch and doesn't match what receivers derive.
         group.merge_own_pending_commit(&self.provider)?;
 
         Ok((commit_bytes, welcome_bytes))
@@ -156,14 +160,12 @@ impl SigilSession {
             keys.insert(sender_id, key);
         }
 
-        // Cache our own key for encrypt_own_frame()
         if let Some(key) = keys.get(&self.user_id) {
             self.own_key = Some(*key);
         }
 
         self.sender_keys = keys.clone();
 
-        // FIX: Install ratchets and establish the DaveSession
         let epoch = group.current_epoch;
         let mut ratchets = HashMap::new();
         for (&sid, &base_secret) in &keys {
@@ -221,10 +223,8 @@ impl SigilSession {
         let nonce = self.gateway_session.next_nonce();
         let generation = nonce >> 24;
 
-        // For generation > 0, derive the ratcheted key
         let actual_key = if generation > 0 {
             if let Some(ratchet) = self.gateway_session.ratchet_mut(self.user_id) {
-
                 ratchet.get(generation)?
             } else {
                 *key

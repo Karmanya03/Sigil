@@ -3,6 +3,9 @@
 //! Each sender in a DAVE session has a key ratchet initialized with a
 //! base secret exported from the MLS group. The ratchet derives a unique
 //! AES-128 key for each generation using HKDF-Expand.
+//!
+//! **FIX**: Uses `"SFRatchetKey"` as the HKDF info string with generation
+//! as LE u32 salt, matching Discord's official libdave key derivation.
 
 use std::collections::HashMap;
 
@@ -15,7 +18,7 @@ use crate::types::KEY_LENGTH;
 /// Per-sender key ratchet for DAVE frame encryption.
 ///
 /// Generation 0 uses the base secret directly. Subsequent generations
-/// are derived via `HKDF-Expand(previous_key, "sigil-ratchet-{gen}", 16)`.
+/// are derived via `HKDF(salt=generation_le, ikm=previous_key, info="SFRatchetKey", len=16)`.
 ///
 /// Old generations can be erased once they are no longer needed, and
 /// attempting to retrieve an erased generation returns an error.
@@ -49,12 +52,10 @@ impl KeyRatchet {
     /// Returns [`SigilError::GenerationErased`] if the requested generation
     /// has been erased via [`erase_before`](Self::erase_before).
     pub fn get(&mut self, generation: u32) -> Result<[u8; KEY_LENGTH], SigilError> {
-        // If already cached, return it
         if let Some(&key) = self.cache.get(&generation) {
             return Ok(key);
         }
 
-        // If the generation is below anything we still have, it was erased
         let min_cached = self.cache.keys().copied().min().unwrap_or(0);
         if generation < min_cached {
             return Err(SigilError::GenerationErased {
@@ -63,7 +64,6 @@ impl KeyRatchet {
             });
         }
 
-        // Ratchet forward from current_generation to the requested generation
         let mut g = self.current_generation;
         while g < generation {
             let prev_key = self
@@ -91,8 +91,6 @@ impl KeyRatchet {
     }
 
     /// Erase all cached keys for generations strictly less than `min_generation`.
-    ///
-    /// Once erased, those generations can no longer be retrieved.
     pub fn erase_before(&mut self, min_generation: u32) {
         self.cache.retain(|&g, _| g >= min_generation);
     }
@@ -117,19 +115,18 @@ impl KeyRatchet {
 
     /// Derive the next generation key via HKDF.
     ///
-    /// Uses the previous key as the IKM and `"sigil-ratchet-{gen}"` as the info.
+    /// Uses the previous key as the IKM, the generation number as LE u32
+    /// salt, and `"SFRatchetKey"` as the info string — matching Discord's
+    /// official libdave implementation.
     fn derive_next(
         prev_key: &[u8; KEY_LENGTH],
         generation: u32,
     ) -> Result<[u8; KEY_LENGTH], SigilError> {
-        let info = format!("sigil-ratchet-{}", generation);
-        // Use Hkdf::new (Extract + Expand) rather than from_prk, because
-        // from_prk requires the PRK to be at least hash-length (32 bytes)
-        // but our AES-128 key is only 16 bytes.
-        let hk = Hkdf::<Sha256>::new(None, prev_key);
+        let salt = generation.to_le_bytes();
+        let hk = Hkdf::<Sha256>::new(Some(&salt), prev_key);
 
         let mut okm = [0u8; KEY_LENGTH];
-        hk.expand(info.as_bytes(), &mut okm)
+        hk.expand(b"SFRatchetKey", &mut okm)
             .map_err(|e| SigilError::Mls(format!("HKDF-Expand error: {}", e)))?;
 
         Ok(okm)

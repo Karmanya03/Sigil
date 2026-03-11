@@ -30,19 +30,23 @@ pub struct DaveGroup {
 const GROUP_ID: &[u8] = b"sigil-dave";
 
 impl DaveGroup {
+    /// Merge our own pending commit so the local group state advances
+    /// to the new epoch.
+    pub fn merge_own_pending_commit(
+        &mut self,
+        provider: &OpenMlsRustCrypto,
+    ) -> Result<(), SigilError> {
+        self.mls_group
+            .merge_pending_commit(provider)
+            .map_err(|e| SigilError::Mls(format!("merge_pending_commit: {:?}", e)))?;
+        self.current_epoch = self.mls_group.epoch().as_u64();
+        Ok(())
+    }
+
     /// Create a new MLS group as the initial member.
     ///
     /// # Errors
     ///
-    pub fn merge_own_pending_commit(
-    &mut self,
-    provider: &OpenMlsRustCrypto,
-) -> Result<(), SigilError> {
-    self.mls_group.merge_pending_commit(provider)
-        .map_err(|e| SigilError::Mls(format!("merge_pending_commit: {:?}", e)))?;
-    self.current_epoch = self.mls_group.epoch().as_u64();
-    Ok(())
-}
     /// Returns [`SigilError::Mls`] if group creation fails.
     pub fn create(
         identity: &DaveIdentity,
@@ -88,7 +92,7 @@ impl DaveGroup {
             provider,
             &MlsGroupJoinConfig::default(),
             welcome_msg,
-            None, // no ratchet tree needed, included in Welcome
+            None,
         )
         .map_err(|e| SigilError::Mls(format!("staged welcome: {}", e)))?
         .into_group(provider)
@@ -105,29 +109,50 @@ impl DaveGroup {
 
     /// Process incoming proposals from the delivery service.
     ///
-    /// Each proposal is deserialized from bytes and processed by the group.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`SigilError::Mls`] if deserialization or processing fails.
+    /// **FIX**: Each proposal is deserialized individually. If a proposal
+    /// uses an unknown MLS extension type (e.g., Discord's custom proposal
+    /// type 16), it is skipped gracefully instead of failing the entire batch.
+    /// This is critical because Discord sends extension proposals that
+    /// standard OpenMLS does not recognize, and failing the whole batch
+    /// prevents epoch advancement — causing key mismatch and silent audio.
     pub fn process_proposals(
         &mut self,
         proposals_bytes: &[Vec<u8>],
         provider: &OpenMlsRustCrypto,
     ) -> Result<(), SigilError> {
         for proposal_data in proposals_bytes {
-            let mls_msg_in = MlsMessageIn::tls_deserialize_exact_bytes(proposal_data)
-                .map_err(|e| SigilError::Mls(format!("proposal deserialize: {}", e)))?;
+            let mls_msg_in = match MlsMessageIn::tls_deserialize_exact_bytes(proposal_data) {
+                Ok(msg) => msg,
+                Err(e) => {
+                    tracing::debug!("Skipping unrecognized proposal (deserialize): {}", e);
+                    continue;
+                }
+            };
 
-            let protocol_message: ProtocolMessage = mls_msg_in
-                .try_into_protocol_message()
-                .map_err(|e| SigilError::Mls(format!("not a protocol message: {}", e)))?;
+            let protocol_message = match mls_msg_in.try_into_protocol_message() {
+                Ok(pm) => pm,
+                Err(e) => {
+                    tracing::debug!("Skipping non-protocol proposal: {}", e);
+                    continue;
+                }
+            };
 
-            self.mls_group
-                .process_message(provider, protocol_message)
-                .map_err(|e| SigilError::Mls(format!("process proposal: {}", e)))?;
+            match self.mls_group.process_message(provider, protocol_message) {
+                Ok(_) => {
+                    tracing::debug!("Processed MLS proposal successfully");
+                }
+                Err(e) => {
+                    tracing::debug!("Skipping proposal that failed processing: {}", e);
+                    continue;
+                }
+            }
         }
         Ok(())
+    }
+
+    /// Check if there are pending proposals waiting to be committed.
+    pub fn has_pending_proposals(&self) -> bool {
+        self.mls_group.pending_proposals().next().is_some()
     }
 
     /// Create a commit for pending proposals.
@@ -184,7 +209,6 @@ impl DaveGroup {
             .process_message(provider, protocol_message)
             .map_err(|e| SigilError::Mls(format!("process commit: {}", e)))?;
 
-        // If it's a staged commit, merge it
         if let ProcessedMessageContent::StagedCommitMessage(staged_commit) =
             processed.into_content()
         {
@@ -214,9 +238,6 @@ impl DaveGroup {
     ) -> Result<[u8; KEY_LENGTH], SigilError> {
         let context = sender_id.to_le_bytes();
 
-        // SENDER_KEY_LABEL is &[u8] = b"Discord Secure Frames v0" (from types.rs)
-        // This MUST match Discord's expected label exactly!
-        // export_secret expects &str, so convert
         let label = std::str::from_utf8(SENDER_KEY_LABEL)
             .map_err(|e| SigilError::Mls(format!("label conversion: {}", e)))?;
 
@@ -231,8 +252,6 @@ impl DaveGroup {
     }
 
     /// Returns the epoch authenticator for the current epoch.
-    ///
-    /// This is used for out-of-band epoch verification between participants.
     pub fn epoch_authenticator(&self) -> &[u8] {
         self.mls_group.epoch_authenticator().as_slice()
     }
