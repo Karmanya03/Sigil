@@ -109,15 +109,15 @@ impl DaveGroup {
 
     /// Process incoming proposals from the delivery service.
     ///
-    /// **FIX**: Each proposal is deserialized individually. If a proposal
-    /// uses an unknown MLS extension type (e.g., Discord's custom proposal
-    /// type 16), it is skipped gracefully instead of failing the entire batch.
+    /// Each proposal is deserialized individually. If a proposal uses an
+    /// unknown MLS extension type (e.g., Discord's custom proposal type 16),
+    /// it is skipped gracefully instead of failing the entire batch.
     ///
-    /// **CRITICAL FIX**: After `process_message()` succeeds, the result is
-    /// checked for `ProcessedMessageContent::ProposalMessage`. If found, it
-    /// is stored via `store_pending_proposal()` so that `has_pending_proposals()`
-    /// returns `true` and `commit_to_pending_proposals()` actually has something
-    /// to commit. Without this, the group never advances past epoch 0.
+    /// After `process_message()` succeeds, the result is checked for
+    /// `ProcessedMessageContent::ProposalMessage`. If found, it is stored
+    /// via `store_pending_proposal(provider.storage(), ...)` so that
+    /// `has_pending_proposals()` returns `true` and
+    /// `commit_to_pending_proposals()` actually has something to commit.
     pub fn process_proposals(
         &mut self,
         proposals_bytes: &[Vec<u8>],
@@ -156,12 +156,13 @@ impl DaveGroup {
 
             match self.mls_group.process_message(provider, protocol_message) {
                 Ok(processed_msg) => {
-                    // CRITICAL: Extract and store the proposal so it becomes pending.
-                    // Without this, has_pending_proposals() returns false and
-                    // commit_to_pending_proposals() has nothing to commit.
                     match processed_msg.into_content() {
                         ProcessedMessageContent::ProposalMessage(staged_proposal) => {
-                            self.mls_group.store_pending_proposal(*staged_proposal);
+                            // OpenMLS 0.6.0 requires storage provider as first arg
+                            self.mls_group.store_pending_proposal(
+                                provider.storage(),
+                                *staged_proposal,
+                            );
                             processed_count += 1;
                             tracing::debug!(
                                 "Stored pending proposal at index {} (total pending: {})",
@@ -170,7 +171,7 @@ impl DaveGroup {
                         }
                         ProcessedMessageContent::StagedCommitMessage(_) => {
                             tracing::debug!(
-                                "Received commit as proposal at index {} — unexpected but not fatal", i
+                                "Received commit as proposal at index {} -- unexpected but not fatal", i
                             );
                             processed_count += 1;
                         }
