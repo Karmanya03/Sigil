@@ -112,19 +112,35 @@ impl DaveGroup {
     /// **FIX**: Each proposal is deserialized individually. If a proposal
     /// uses an unknown MLS extension type (e.g., Discord's custom proposal
     /// type 16), it is skipped gracefully instead of failing the entire batch.
-    /// This is critical because Discord sends extension proposals that
-    /// standard OpenMLS does not recognize, and failing the whole batch
-    /// prevents epoch advancement — causing key mismatch and silent audio.
+    ///
+    /// **CRITICAL FIX**: After `process_message()` succeeds, the result is
+    /// checked for `ProcessedMessageContent::ProposalMessage`. If found, it
+    /// is stored via `store_pending_proposal()` so that `has_pending_proposals()`
+    /// returns `true` and `commit_to_pending_proposals()` actually has something
+    /// to commit. Without this, the group never advances past epoch 0.
     pub fn process_proposals(
         &mut self,
         proposals_bytes: &[Vec<u8>],
         provider: &OpenMlsRustCrypto,
     ) -> Result<(), SigilError> {
-        for proposal_data in proposals_bytes {
+        let mut processed_count = 0u32;
+        let mut skipped_count = 0u32;
+
+        for (i, proposal_data) in proposals_bytes.iter().enumerate() {
+            if proposal_data.is_empty() {
+                tracing::debug!("Skipping empty proposal at index {}", i);
+                skipped_count += 1;
+                continue;
+            }
+
             let mls_msg_in = match MlsMessageIn::tls_deserialize_exact_bytes(proposal_data) {
                 Ok(msg) => msg,
                 Err(e) => {
-                    tracing::debug!("Skipping unrecognized proposal (deserialize): {}", e);
+                    tracing::debug!(
+                        "Skipping unrecognized proposal at index {} (deserialize): {} [first bytes: {:02x?}]",
+                        i, e, &proposal_data[..proposal_data.len().min(8)]
+                    );
+                    skipped_count += 1;
                     continue;
                 }
             };
@@ -132,21 +148,52 @@ impl DaveGroup {
             let protocol_message = match mls_msg_in.try_into_protocol_message() {
                 Ok(pm) => pm,
                 Err(e) => {
-                    tracing::debug!("Skipping non-protocol proposal: {}", e);
+                    tracing::debug!("Skipping non-protocol proposal at index {}: {}", i, e);
+                    skipped_count += 1;
                     continue;
                 }
             };
 
             match self.mls_group.process_message(provider, protocol_message) {
-                Ok(_) => {
-                    tracing::debug!("Processed MLS proposal successfully");
+                Ok(processed_msg) => {
+                    // CRITICAL: Extract and store the proposal so it becomes pending.
+                    // Without this, has_pending_proposals() returns false and
+                    // commit_to_pending_proposals() has nothing to commit.
+                    match processed_msg.into_content() {
+                        ProcessedMessageContent::ProposalMessage(staged_proposal) => {
+                            self.mls_group.store_pending_proposal(*staged_proposal);
+                            processed_count += 1;
+                            tracing::debug!(
+                                "Stored pending proposal at index {} (total pending: {})",
+                                i, processed_count
+                            );
+                        }
+                        ProcessedMessageContent::StagedCommitMessage(_) => {
+                            tracing::debug!(
+                                "Received commit as proposal at index {} — unexpected but not fatal", i
+                            );
+                            processed_count += 1;
+                        }
+                        other => {
+                            tracing::debug!(
+                                "Proposal at index {} yielded unexpected content type: {:?}", i,
+                                std::mem::discriminant(&other)
+                            );
+                        }
+                    }
                 }
                 Err(e) => {
-                    tracing::debug!("Skipping proposal that failed processing: {}", e);
+                    tracing::debug!("Skipping proposal at index {} that failed processing: {}", i, e);
+                    skipped_count += 1;
                     continue;
                 }
             }
         }
+
+        tracing::info!(
+            "process_proposals: {} processed, {} skipped out of {} total",
+            processed_count, skipped_count, proposals_bytes.len()
+        );
         Ok(())
     }
 
@@ -249,6 +296,11 @@ impl DaveGroup {
         let mut key = [0u8; KEY_LENGTH];
         key.copy_from_slice(&exported[..KEY_LENGTH]);
         Ok(key)
+    }
+
+    /// Returns the current MLS epoch number.
+    pub fn epoch(&self) -> Epoch {
+        self.current_epoch
     }
 
     /// Returns the epoch authenticator for the current epoch.
