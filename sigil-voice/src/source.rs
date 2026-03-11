@@ -60,6 +60,48 @@ fn parse_cookies_file(path: &str) -> Option<String> {
     Some(pairs.join("; "))
 }
 
+async fn get_available_formats(query: &str) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut cmd = Command::new("yt-dlp");
+    cmd.args(&[
+        "--no-playlist",
+        "-F",
+        "--no-warnings",
+        "--no-check-certificates",
+    ]);
+
+    if let Some(cookie_path) = get_cookies_file_path() {
+        cmd.arg("--cookies").arg(&cookie_path);
+    }
+    cmd.arg(query);
+
+    let output = cmd.output().await?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!("yt-dlp failed: {}", stderr.trim()).into());
+    }
+
+    let stdout = String::from_utf8(output.stdout)?;
+    let mut formats = Vec::new();
+
+    for line in stdout.lines().skip(2) {
+        if line.trim().is_empty() || line.contains("format code") {
+            continue;
+        }
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 5 {
+            continue;
+        }
+        let format_code = parts[0];
+        let format = serde_json::json!({
+            "format_code": format_code,
+            "format": line.trim().to_string()
+        });
+        formats.push(format);
+    }
+
+    Ok(formats)
+}
+
 fn pick_best_audio(
     parsed: &serde_json::Value,
 ) -> Option<(String, serde_json::Value)> {
@@ -156,6 +198,21 @@ impl YtDlpSource {
             format!("ytsearch1:{}", query)
         };
 
+        // First get available formats
+        let formats = get_available_formats(&resolved).await?;
+        if formats.is_empty() {
+            return Err("No formats available for this video".into());
+        }
+
+        // Show available formats for debugging
+        info!("Available formats:");
+        for format in &formats {
+            if let Some(format_str) = format.get("format").and_then(|f| f.as_str()) {
+                info!("{}", format_str);
+            }
+        }
+
+        // Now get the JSON data with the selected format
         let mut cmd = Command::new("yt-dlp");
         cmd.args(&[
             "--no-playlist",
