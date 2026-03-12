@@ -299,9 +299,6 @@ impl CoreDriver {
                         match msg {
                             // ══════════════════════════════════════════════
                             // TEXT (JSON opcodes)
-                            // Handles: 5, 6, 9, 13, 18, and DAVE JSON
-                            // opcodes 21 (PrepareTransition), 22
-                            // (ExecuteTransition), 24 (PrepareEpoch).
                             // ══════════════════════════════════════════════
                             tokio_tungstenite::tungstenite::Message::Text(text) => {
                                 let Ok(pkt) = serde_json::from_str::<VoicePacket>(&text) else {
@@ -343,10 +340,6 @@ impl CoreDriver {
                                     }
 
                                     // ── OP 21: PrepareTransition (JSON) ───
-                                    //
-                                    // Server tells us to prepare for a DAVE
-                                    // protocol transition. We respond with
-                                    // OP 23 ReadyForTransition.
                                     21 => {
                                         if let Some(d) = pkt.d {
                                             use sigil_discord::gateway::opcodes::{PrepareTransition, ReadyForTransition};
@@ -367,10 +360,6 @@ impl CoreDriver {
                                     }
 
                                     // ── OP 22: ExecuteTransition (JSON) ───
-                                    //
-                                    // Server tells us to execute the transition.
-                                    // Reset encryption_ready_sent so we can
-                                    // re-send OP 12 after the new epoch is ready.
                                     22 => {
                                         if let Some(d) = pkt.d {
                                             use sigil_discord::gateway::opcodes::ExecuteTransition;
@@ -389,9 +378,12 @@ impl CoreDriver {
 
                                     // ── OP 24: PrepareEpoch (JSON) ────────
                                     //
-                                    // Server tells us to prepare for a new MLS
-                                    // epoch. When epoch == 1, we generate and
-                                    // send a fresh key package (OP 26 binary).
+                                    // FIX #2: Per DAVE protocol spec §Key Packages:
+                                    // "The client must send a new key package after
+                                    //  OP 24 with epoch_id = 1"
+                                    // Only send KeyPackage on epoch == 1. Sending on
+                                    // every epoch replaces cached key packages mid-
+                                    // session and corrupts MLS group state.
                                     24 => {
                                         if let Some(d) = pkt.d {
                                             use sigil_discord::gateway::opcodes::PrepareEpoch;
@@ -399,21 +391,18 @@ impl CoreDriver {
                                                 Ok(pe) => {
                                                     info!("DAVE: ← OP 24 PrepareEpoch (epoch={}, proto={})",
                                                         pe.epoch, pe.protocol_version);
-                                                    // BUG FIX: Always send a KeyPackage for ANY epoch.
-                                                    // Discord can start a new MLS session at epoch > 1
-                                                    // (e.g. reconnects, channel resets). Checking for
-                                                    // epoch == 1 caused the bot to never join sessions
-                                                    // that began at a higher epoch number.
-                                                    {
+                                                    if pe.epoch == 1 {
                                                         let s = sigil_clone.lock().await;
                                                         match s.generate_key_package() {
                                                             Ok(kp) => {
-                                                                info!("DAVE: Generated KeyPackage ({} bytes) for epoch {}", kp.len(), pe.epoch);
+                                                                info!("DAVE: Generated KeyPackage ({} bytes) for epoch reset", kp.len());
                                                                 send_bin!(26, kp);
-                                                                info!("DAVE: → OP 26 KeyPackage sent (epoch={})", pe.epoch);
+                                                                info!("DAVE: → OP 26 KeyPackage sent (epoch=1 reset)");
                                                             }
                                                             Err(e) => error!("DAVE: KeyPackage generation failed: {:?}", e),
                                                         }
+                                                    } else {
+                                                        info!("DAVE: Skipping KeyPackage for epoch={} (only required on epoch=1)", pe.epoch);
                                                     }
                                                 }
                                                 Err(e) => {
@@ -432,10 +421,6 @@ impl CoreDriver {
 
                             // ══════════════════════════════════════════════
                             // BINARY (DAVE opcodes 25, 27, 29, 30)
-                            //
-                            // Per Discord Voice Opcodes Table, only these
-                            // opcodes arrive as binary WebSocket frames.
-                            // OP 21, 22, 24 are JSON — handled above.
                             // ══════════════════════════════════════════════
                             tokio_tungstenite::tungstenite::Message::Binary(bin) => {
                                 if bin.len() < 3 { continue; }
@@ -460,16 +445,6 @@ impl CoreDriver {
                                             Ok(()) => {
                                                 info!("DAVE: ✅ MLS group created with external sender");
                                                 info!("DAVE: Group established (sole member): {}", s.is_established());
-                                                // BUG FIX: Do NOT call mark_dave_ready!() or
-                                                // send_encryption_ready!() here.
-                                                //
-                                                // At this point the bot is the ONLY member of its
-                                                // own local MLS group — no other peers have been
-                                                // added yet.  Emitting OP 12 here causes the server
-                                                // to think E2EE is live while no shared epoch key
-                                                // exists.  The correct place to emit these signals
-                                                // is in the OP 29 / OP 30 handlers, once the bot
-                                                // has actually joined the shared group.
                                             }
                                             Err(e) => {
                                                 error!("DAVE: ❌ set_external_sender failed: {:?}", e);
@@ -496,8 +471,6 @@ impl CoreDriver {
                                                     info!("DAVE: Committing proposals...");
                                                     match s.commit_and_welcome() {
                                                         Ok((commit, welcome)) => {
-                                                            // OP 28 wire format:
-                                                            //   [transition_id(2 LE)][commit][optional welcome]
                                                             let mut payload = (transition_id as u16)
                                                                 .to_le_bytes()
                                                                 .to_vec();
@@ -529,19 +502,10 @@ impl CoreDriver {
                                                         }
                                                     }
                                                 } else {
-                                                    // Discord sent proposals we could not process
-                                                    // (e.g. custom type 16). We still MUST send
-                                                    // OP 28 with the correct transition_id and a
-                                                    // self-update commit so Discord advances the
-                                                    // epoch and delivers the epoch key.
-                                                    //
-                                                    // Root cause of silence: OP 28 was missing
-                                                    // the transition_id prefix, causing Discord
-                                                    // to close with 4005 or ignore our commit.
+                                                    // No processable proposals: send self-update commit
                                                     info!("DAVE: No processable proposals — sending self-update commit with tid={} to unblock epoch", transition_id);
                                                     match s.commit_and_welcome() {
                                                         Ok((commit, welcome)) => {
-                                                            // OP 28: [transition_id(2 LE)][commit][welcome?]
                                                             let mut payload = (transition_id as u16)
                                                                 .to_le_bytes()
                                                                 .to_vec();
@@ -553,11 +517,30 @@ impl CoreDriver {
                                                             send_bin!(28, payload);
                                                             info!("DAVE: → OP 28 self-update CommitWelcome sent (tid={})", transition_id);
 
+                                                            // FIX #4: Send OP 23 ReadyForTransition after self-update commit.
+                                                            // Per DAVE spec: "upon successful processing of the commit,
+                                                            // the client notifies the voice gateway that they are ready
+                                                            // for the associated transition via OP 23."
+                                                            // This was missing from the sole-member path entirely,
+                                                            // causing Discord to never advance the epoch for this bot.
+                                                            use sigil_discord::gateway::opcodes::ReadyForTransition;
+                                                            send_text!(23, serde_json::to_value(
+                                                                ReadyForTransition { transition_id }
+                                                            ).unwrap_or_default());
+                                                            info!("DAVE: → OP 23 ReadyForTransition (self-update tid={})", transition_id);
+
                                                             let member_ids = s.group_member_ids();
                                                             match s.export_sender_keys(&member_ids) {
                                                                 Ok(keys) if keys.contains_key(&s.user_id) => {
                                                                     info!("DAVE: ✅ Keys exported after self-update ({} keys)", keys.len());
                                                                     mark_dave_ready!();
+                                                                    // FIX #3: send_encryption_ready!() was missing here.
+                                                                    // Per DAVE spec: client must signal EncryptionReady
+                                                                    // (OP 12) once E2EE keys are established so the voice
+                                                                    // gateway begins routing E2EE audio to/from the bot.
+                                                                    // Without this, the gateway never delivers audio frames
+                                                                    // to the bot and other clients can't hear it.
+                                                                    send_encryption_ready!();
                                                                 }
                                                                 Ok(keys) => {
                                                                     info!("DAVE: Keys exported ({} keys), waiting for OP 29", keys.len());
@@ -593,10 +576,6 @@ impl CoreDriver {
                                             }
                                         }
 
-                                        // BUG FIX: Export keys for ALL group members, not just own.
-                                        // This is the primary fix for "no sound from Discord voice":
-                                        // every participant's sender key must be stored so that
-                                        // decrypt_from_sender(uid, frame) can succeed for each speaker.
                                         let member_ids = s.group_member_ids();
                                         info!("DAVE: Exporting keys for {} group members (Welcome)", member_ids.len());
                                         match s.export_sender_keys(&member_ids) {
@@ -636,10 +615,6 @@ impl CoreDriver {
                                         ).unwrap_or_default());
                                         info!("DAVE: → OP 23 ReadyForTransition (commit tid={})", c.transition_id);
 
-                                        // BUG FIX: After an epoch advance, refresh keys for ALL
-                                        // group members. The old epoch's keys are now invalid;
-                                        // failing to rotate them for other users causes every
-                                        // subsequent decrypt_from_sender() to use a stale key and fail.
                                         let member_ids = s.group_member_ids();
                                         info!("DAVE: Refreshing keys for {} members after epoch advance", member_ids.len());
                                         if let Ok(keys) = s.export_sender_keys(&member_ids) {
@@ -766,8 +741,15 @@ impl CoreDriver {
             ).await.is_ok()
         };
 
+        // FIX #1: Check WS liveness UNCONDITIONALLY after the DAVE wait,
+        // not just on the timeout/error path. The original code only had
+        // this check inside the `!dave_established` branch. If DAVE keys
+        // were exported just before the WS close frame arrived (e.g. 4005),
+        // dave_established would be `true` but ws_alive already `false`.
+        // Without this check, OP 5 Speaking was sent into a closed channel
+        // and the mixing loop would exit immediately with 0 frames → silence.
         if !self.ws_alive.load(Ordering::Acquire) {
-            error!("WS died during DAVE wait — aborting mixing loop");
+            error!("🛑 WS died during DAVE negotiation — aborting mixing loop");
             return Err("WS connection lost before mixing could start".into());
         }
 

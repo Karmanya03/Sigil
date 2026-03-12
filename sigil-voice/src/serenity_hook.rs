@@ -207,10 +207,10 @@ impl SigilVoiceManager {
 
     /// Once we have session_id + endpoint + token, bootstrap the CoreDriver.
     ///
-    /// KEY FIX: Hold `active_info` lock across the entire dedup+connect-guard
-    /// section to prevent a TOCTOU race where two events both pass the check.
-    /// Also drops the pending lock before acquiring active_info to avoid
-    /// potential deadlocks.
+    /// FIX: Reordered to set the `connecting` guard BEFORE the `active_info`
+    /// dedup check, closing the TOCTOU race that allowed two concurrent calls
+    /// to both pass the check and send duplicate Identify (OP 0) payloads,
+    /// causing Discord to close with code=4005 "Already authenticated".
     async fn check_and_connect(&self, guild_id: GuildId) {
         // ── Extract pending args (and drop the lock immediately) ───────────
         let args = {
@@ -236,31 +236,12 @@ impl SigilVoiceManager {
 
         let (endpoint, session_id, token) = args;
 
-        // ── Deduplicate: skip if already connecting with same credentials ──
-        {
-            let active = self.active_info.lock().await;
-            if let Some(info) = active.get(&guild_id) {
-                if info.endpoint == endpoint
-                    && info.token == token
-                    && info.session_id == session_id
-                {
-                    // Check if the existing connection is still alive
-                    if let Some(call) = self.calls.lock().await.get(&guild_id) {
-                        if call.driver.is_ws_alive() {
-                            tracing::debug!(
-                                "Duplicate connect attempt with same credentials — skipping [guild={}]",
-                                guild_id
-                            );
-                            self.pending.lock().await.remove(&guild_id);
-                            return;
-                        }
-                    }
-                }
-            }
-        }
-        // active_info lock is dropped here
-
-        // ── Guard against concurrent connect attempts ──────────────────────
+        // FIX #1: Set the connecting guard FIRST, before the active_info
+        // dedup check. Previously this was done AFTER, which left a TOCTOU
+        // window where two concurrent check_and_connect() calls (one from
+        // VoiceStateUpdate, one from VoiceServerUpdate) could both pass the
+        // dedup check before either had set the guard — producing two
+        // Identify (OP 0) payloads and causing Discord close code=4005.
         {
             let mut conn = self.connecting.lock().await;
             if conn.get(&guild_id).copied().unwrap_or(false) {
@@ -269,7 +250,39 @@ impl SigilVoiceManager {
             }
             conn.insert(guild_id, true);
         }
-        // connecting lock is dropped here
+        // connecting lock is dropped here — guard is now set
+
+        // ── Deduplicate: skip if already connected with same credentials ──
+        // FIX #2: This check now runs AFTER the connecting guard is set.
+        // Also: we drop the active_info lock before acquiring the calls lock
+        // to prevent potential lock-order deadlock.
+        {
+            let active = self.active_info.lock().await;
+            if let Some(info) = active.get(&guild_id) {
+                if info.endpoint == endpoint
+                    && info.token == token
+                    && info.session_id == session_id
+                {
+                    // Drop active_info lock before acquiring calls lock
+                    drop(active);
+                    let still_alive = self.calls.lock().await
+                        .get(&guild_id)
+                        .map(|c| c.driver.is_ws_alive())
+                        .unwrap_or(false);
+                    if still_alive {
+                        tracing::debug!(
+                            "Duplicate connect attempt with same credentials — skipping [guild={}]",
+                            guild_id
+                        );
+                        self.pending.lock().await.remove(&guild_id);
+                        // FIX: Clear the connecting guard we set above
+                        self.connecting.lock().await.remove(&guild_id);
+                        return;
+                    }
+                }
+            }
+        }
+        // active_info lock is dropped here
 
         // Flush pending so duplicate events don't re-trigger a connect
         self.pending.lock().await.remove(&guild_id);
@@ -308,6 +321,20 @@ impl SigilVoiceManager {
 
             match result {
                 Ok(Ok(driver)) => {
+                    // FIX #3: Verify the WS is still alive before inserting
+                    // the Call. The WS background task may have received a
+                    // close frame (e.g. 4005) during or immediately after
+                    // connect(). Inserting a dead Call causes start_mixing()
+                    // to immediately exit with 0 frames → silence.
+                    if !driver.is_ws_alive() {
+                        tracing::error!(
+                            "❌ CoreDriver WS died immediately after connect [guild={}] — not inserting Call",
+                            guild_id
+                        );
+                        driver.request_shutdown();
+                        active_clone.lock().await.remove(&guild_id);
+                        return;
+                    }
                     tracing::info!("✅ CoreDriver ready for guild={}", guild_id);
                     let call = Arc::new(Call::new(driver));
                     calls_clone.lock().await.insert(guild_id, call);
