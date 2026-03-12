@@ -83,6 +83,8 @@ async fn get_available_formats(query: &str) -> Result<Vec<serde_json::Value>, Bo
         "--socket-timeout", "30",
         // YouTube-specific optimizations - use android client for better reliability
         "--extractor-args", "youtube:player_client=android,web",
+        // Use pot-bgutilhttp proxy to bypass YouTube restrictions
+        "--extractor-args", "youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416",
     ]);
 
     if let Some(cookie_path) = get_cookies_file_path() {
@@ -336,6 +338,8 @@ impl YtDlpSource {
             "--socket-timeout", "30",
             // YouTube-specific optimizations - use android client for better reliability
             "--extractor-args", "youtube:player_client=android,web",
+            // Use pot-bgutilhttp proxy to bypass YouTube restrictions
+            "--extractor-args", "youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416",
             // Extract audio format explicitly
             "-f", "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best",
         ]);
