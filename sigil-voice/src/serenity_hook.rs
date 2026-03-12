@@ -146,6 +146,16 @@ impl SigilVoiceManager {
     /// Move the bot into `channel_id` in `guild_id`.
     /// Sends Gateway OP 4 via the shard's messenger.
     pub async fn join(&self, guild_id: GuildId, channel_id: ChannelId) {
+        // ── Always disconnect first to nuke any stale Discord-side session ──
+        // Discord's voice SFU keeps sessions alive even after a bot crash/restart.
+        // If we Identify on a voice WS while Discord still holds a session for our
+        // user_id, it closes with 4005 "Already authenticated". Cycling OP 4
+        // (disconnect → wait → reconnect) forces Discord to tear down the stale
+        // session before we try to authenticate a new one.
+        self.teardown_guild(guild_id).await;
+        self.update_voice_state(guild_id, None).await;
+        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+
         // Track the channel for auto-reconnect
         self.last_channel.lock().await.insert(guild_id, channel_id);
         // Reset reconnect counter on fresh user-initiated join
@@ -476,14 +486,14 @@ impl VoiceGatewayManager for SigilVoiceManager {
          tracing::warn!("VoiceServerUpdate [guild={}, endpoint={}] — CALLER TRACE", guild_id, ep);
     tracing::warn!("VoiceServerUpdate backtrace: {:?}", std::backtrace::Backtrace::force_capture());
 
-        // FIX: Scope the pending lock so it drops BEFORE check_and_connect()
+        // Scope the pending lock so it drops BEFORE check_and_connect()
         {
             let mut p = self.pending.lock().await;
             let entry = p.entry(guild_id).or_default();
             entry.endpoint = Some(ep.clone());
             entry.token = Some(token.to_string());
         }
-        // pending lock is dropped here
+        // pending lock is NOW actually dropped
 
         self.check_and_connect(guild_id).await;
     }
@@ -514,14 +524,14 @@ impl VoiceGatewayManager for SigilVoiceManager {
             self.last_channel.lock().await.insert(guild_id, ch);
         }
 
-        // FIX: Scope the pending lock so it drops BEFORE check_and_connect()
+        // Scope the pending lock so it drops BEFORE check_and_connect()
         {
             let mut p = self.pending.lock().await;
             let entry = p.entry(guild_id).or_default();
             entry.session_id = Some(voice_state.session_id.clone());
             entry.channel_id = voice_state.channel_id;
         }
-        // pending lock is dropped here
+        // pending lock is NOW actually dropped
 
         self.check_and_connect(guild_id).await;
     }
