@@ -101,7 +101,7 @@ pub struct SigilVoiceManager {
     /// bot's own user_id — set by `initialise()`
     user_id: Mutex<u64>,
     /// shard_id → UnboundedSender (for sending Gateway OP 4)
-    shards: Mutex<HashMap<u32, UnboundedSender<ShardRunnerMessage>>>,
+    shards: Arc<Mutex<HashMap<u32, UnboundedSender<ShardRunnerMessage>>>>,
     /// guild_id → pending session info
     pending: Arc<Mutex<HashMap<GuildId, PendingConnection>>>,
     /// guild_id → active Call handle
@@ -129,7 +129,7 @@ impl Default for SigilVoiceManager {
     fn default() -> Self {
         Self {
             user_id: Mutex::new(0),
-            shards: Mutex::new(HashMap::new()),
+            shards: Arc::new(Mutex::new(HashMap::new())),
             pending: Arc::new(Mutex::new(HashMap::new())),
             calls: Arc::new(Mutex::new(HashMap::new())),
             active_info: Arc::new(Mutex::new(HashMap::new())),
@@ -499,7 +499,7 @@ fn spawn_rejoin(
     guild_id: GuildId,
     last_channel: Arc<Mutex<HashMap<GuildId, ChannelId>>>,
     reconnect_count: Arc<Mutex<HashMap<GuildId, u8>>>,
-    shards: Mutex<HashMap<u32, UnboundedSender<ShardRunnerMessage>>>,
+    shards: Arc<Mutex<HashMap<u32, UnboundedSender<ShardRunnerMessage>>>>,
     pending: Arc<Mutex<HashMap<GuildId, PendingConnection>>>,
     connecting: Arc<Mutex<HashMap<GuildId, bool>>>,
     calls: Arc<Mutex<HashMap<GuildId, Arc<Call>>>>,
