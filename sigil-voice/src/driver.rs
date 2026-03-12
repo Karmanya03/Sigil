@@ -352,7 +352,7 @@ impl CoreDriver {
                                             use sigil_discord::gateway::opcodes::{PrepareTransition, ReadyForTransition};
                                             match serde_json::from_value::<PrepareTransition>(d) {
                                                 Ok(pt) => {
-                                                    info!("DAVE: PrepareTransition (tid={}, proto={})",
+                                                    info!("DAVE: ← OP 21 PrepareTransition (tid={}, proto={})",
                                                         pt.transition_id, pt.protocol_version);
                                                     send_text!(23, serde_json::to_value(
                                                         ReadyForTransition { transition_id: pt.transition_id }
@@ -360,7 +360,7 @@ impl CoreDriver {
                                                     info!("DAVE: → OP 23 ReadyForTransition (tid={})", pt.transition_id);
                                                 }
                                                 Err(e) => {
-                                                    warn!("DAVE: Failed to parse PrepareTransition: {:?}", e);
+                                                    error!("DAVE: Failed to parse PrepareTransition: {:?}", e);
                                                 }
                                             }
                                         }
@@ -376,11 +376,12 @@ impl CoreDriver {
                                             use sigil_discord::gateway::opcodes::ExecuteTransition;
                                             match serde_json::from_value::<ExecuteTransition>(d) {
                                                 Ok(et) => {
-                                                    info!("DAVE: ExecuteTransition (tid={})", et.transition_id);
+                                                    info!("DAVE: ← OP 22 ExecuteTransition (tid={})", et.transition_id);
                                                     encryption_ready_sent = false;
+                                                    info!("DAVE: Reset encryption_ready_sent flag for new epoch");
                                                 }
                                                 Err(e) => {
-                                                    warn!("DAVE: Failed to parse ExecuteTransition: {:?}", e);
+                                                    error!("DAVE: Failed to parse ExecuteTransition: {:?}", e);
                                                 }
                                             }
                                         }
@@ -396,21 +397,24 @@ impl CoreDriver {
                                             use sigil_discord::gateway::opcodes::PrepareEpoch;
                                             match serde_json::from_value::<PrepareEpoch>(d) {
                                                 Ok(pe) => {
-                                                    info!("DAVE: PrepareEpoch (epoch={}, proto={})",
+                                                    info!("DAVE: ← OP 24 PrepareEpoch (epoch={}, proto={})",
                                                         pe.epoch, pe.protocol_version);
                                                     if pe.epoch == 1 {
                                                         let s = sigil_clone.lock().await;
                                                         match s.generate_key_package() {
                                                             Ok(kp) => {
+                                                                info!("DAVE: Generated KeyPackage ({} bytes)", kp.len());
                                                                 send_bin!(26, kp);
-                                                                info!("DAVE: → OP 26 KeyPackage");
+                                                                info!("DAVE: → OP 26 KeyPackage sent");
                                                             }
-                                                            Err(e) => error!("DAVE: KeyPackage failed: {:?}", e),
+                                                            Err(e) => error!("DAVE: KeyPackage generation failed: {:?}", e),
                                                         }
+                                                    } else {
+                                                        info!("DAVE: Skipping KeyPackage generation (epoch != 1)");
                                                     }
                                                 }
                                                 Err(e) => {
-                                                    warn!("DAVE: Failed to parse PrepareEpoch: {:?}", e);
+                                                    error!("DAVE: Failed to parse PrepareEpoch: {:?}", e);
                                                 }
                                             }
                                         }
@@ -433,13 +437,13 @@ impl CoreDriver {
                             tokio_tungstenite::tungstenite::Message::Binary(bin) => {
                                 if bin.len() < 3 { continue; }
                                 let opcode = bin[2];
-                                debug!("DAVE binary OP {} ({} bytes)", opcode, bin.len());
+                                info!("DAVE: ← Binary OP {} ({} bytes)", opcode, bin.len());
 
                                 let mut s = sigil_clone.lock().await;
                                 let event = match s.handle_gateway_event(opcode, &bin) {
                                     Ok(e) => e,
                                     Err(e) => {
-                                        debug!("DAVE OP {} parse error: {:?}", opcode, e);
+                                        error!("DAVE: OP {} parse error: {:?}", opcode, e);
                                         continue;
                                     }
                                 };
@@ -448,72 +452,92 @@ impl CoreDriver {
                                 match event {
                                     // ── OP 25: MlsExternalSender ─────────
                                     DaveEvent::MlsExternalSender(ext) => {
+                                        info!("DAVE: Processing MlsExternalSender (credential {} bytes)", ext.credential.len());
                                         match s.set_external_sender(&ext.credential) {
-                                            Ok(()) => info!("DAVE: ✅ Group created"),
+                                            Ok(()) => {
+                                                info!("DAVE: ✅ MLS group created successfully");
+                                                let is_est = s.is_established();
+                                                info!("DAVE: Group established: {}", is_est);
+                                            }
                                             Err(e) => {
-                                                error!("DAVE: set_external_sender failed: {:?}", e);
+                                                error!("DAVE: ❌ set_external_sender failed: {:?}", e);
                                                 continue;
                                             }
                                         }
 
                                         let uid = s.user_id;
+                                        info!("DAVE: Attempting to export own key (user_id={})", uid);
                                         match s.export_sender_keys(&[uid]) {
                                             Ok(keys) if keys.contains_key(&uid) => {
-                                                info!("DAVE: ✅ Own key exported (OP 25)");
+                                                info!("DAVE: ✅ Own key exported successfully (OP 25)");
                                                 mark_dave_ready!();
                                                 send_encryption_ready!();
                                             }
-                                            Ok(_) => error!("DAVE: export_sender_keys missing own key"),
-                                            Err(e) => error!("DAVE: export_sender_keys failed: {:?}", e),
+                                            Ok(keys) => {
+                                                error!("DAVE: ❌ export_sender_keys missing own key (got {} keys)", keys.len());
+                                                for (k, _) in keys.iter() {
+                                                    error!("DAVE: Available key for user_id={}", k);
+                                                }
+                                            }
+                                            Err(e) => error!("DAVE: ❌ export_sender_keys failed: {:?}", e),
                                         }
                                     }
 
                                     // ── OP 27: MlsProposals ──────────────
                                     DaveEvent::MlsProposals { operation_type: _operation_type, proposals } => {
+                                        info!("DAVE: Processing MlsProposals ({} proposals)", proposals.len());
                                         if proposals.is_empty() {
-                                            debug!("DAVE: Empty proposal data, skipping");
+                                            info!("DAVE: Empty proposal data, sending EncryptionReady");
                                             send_encryption_ready!();
                                             continue;
                                         }
 
                                         match s.process_proposals(&proposals) {
                                             Ok(()) => {
+                                                info!("DAVE: ✅ Proposals processed successfully");
                                                 let has_pending = s.has_pending_proposals();
+                                                info!("DAVE: Has pending proposals: {}", has_pending);
 
                                                 if has_pending {
+                                                    info!("DAVE: Committing proposals...");
                                                     match s.commit_and_welcome() {
                                                         Ok((commit, welcome)) => {
-                                                            let mut payload = commit;
+                                                            let mut payload = commit.clone();
+                                                            let has_welcome = welcome.is_some();
                                                             if let Some(w) = welcome {
                                                                 payload.extend_from_slice(&w);
                                                             }
+                                                            info!("DAVE: Generated commit ({} bytes, welcome={})", payload.len(), has_welcome);
                                                             send_bin!(28, payload);
-                                                            info!("DAVE: → OP 28 CommitWelcome");
+                                                            info!("DAVE: → OP 28 CommitWelcome sent");
 
                                                             let uid = s.user_id;
+                                                            info!("DAVE: Exporting own key after commit (user_id={})", uid);
                                                             match s.export_sender_keys(&[uid]) {
                                                                 Ok(keys) if keys.contains_key(&uid) => {
                                                                     info!("DAVE: ✅ Own key exported (post-commit, new epoch)");
                                                                     mark_dave_ready!();
                                                                 }
-                                                                Ok(_) => error!("DAVE: missing own key after commit"),
-                                                                Err(e) => error!("DAVE: export failed: {:?}", e),
+                                                                Ok(keys) => {
+                                                                    error!("DAVE: ❌ Missing own key after commit (got {} keys)", keys.len());
+                                                                }
+                                                                Err(e) => error!("DAVE: ❌ Export failed after commit: {:?}", e),
                                                             }
 
                                                             send_encryption_ready!();
                                                         }
                                                         Err(e) => {
-                                                            warn!("DAVE: commit_and_welcome failed: {:?}", e);
+                                                            error!("DAVE: ❌ commit_and_welcome failed: {:?}", e);
                                                             send_encryption_ready!();
                                                         }
                                                     }
                                                 } else {
-                                                    debug!("DAVE: No processable proposals in batch, acknowledging");
+                                                    info!("DAVE: No processable proposals in batch, acknowledging");
                                                     send_encryption_ready!();
                                                 }
                                             }
                                             Err(e) => {
-                                                warn!("DAVE: process_proposals failed: {:?}", e);
+                                                error!("DAVE: ❌ process_proposals failed: {:?}", e);
                                                 send_encryption_ready!();
                                             }
                                         }
@@ -521,22 +545,30 @@ impl CoreDriver {
 
                                     // ── OP 30: MlsWelcome ───────────────
                                     DaveEvent::MlsWelcome(w) => {
+                                        info!("DAVE: Processing MlsWelcome (tid={}, {} bytes)", w.transition_id, w.welcome_bytes.len());
                                         match s.join_group(&w.welcome_bytes) {
-                                            Ok(()) => info!("DAVE: ✅ Joined via Welcome"),
+                                            Ok(()) => {
+                                                info!("DAVE: ✅ Joined group via Welcome");
+                                                let is_est = s.is_established();
+                                                info!("DAVE: Group established: {}", is_est);
+                                            }
                                             Err(e) => {
-                                                error!("DAVE: join_group failed: {:?}", e);
+                                                error!("DAVE: ❌ join_group failed: {:?}", e);
                                                 continue;
                                             }
                                         }
 
                                         let uid = s.user_id;
+                                        info!("DAVE: Exporting own key after Welcome (user_id={})", uid);
                                         match s.export_sender_keys(&[uid]) {
                                             Ok(keys) if keys.contains_key(&uid) => {
                                                 info!("DAVE: ✅ Own key exported (Welcome)");
                                                 mark_dave_ready!();
                                             }
-                                            Ok(_) => error!("DAVE: missing own key after welcome"),
-                                            Err(e) => error!("DAVE: export failed: {:?}", e),
+                                            Ok(keys) => {
+                                                error!("DAVE: ❌ Missing own key after welcome (got {} keys)", keys.len());
+                                            }
+                                            Err(e) => error!("DAVE: ❌ Export failed after welcome: {:?}", e),
                                         }
 
                                         use sigil_discord::gateway::opcodes::ReadyForTransition;
@@ -550,10 +582,12 @@ impl CoreDriver {
 
                                     // ── OP 29: MlsAnnounceCommitTransition
                                     DaveEvent::MlsAnnounceCommitTransition(c) => {
+                                        info!("DAVE: Processing MlsAnnounceCommitTransition (tid={}, {} bytes)", 
+                                            c.transition_id, c.commit_bytes.len());
                                         match s.process_commit(&c.commit_bytes) {
-                                            Ok(epoch) => info!("DAVE: ✅ Commit processed, epoch={}", epoch),
+                                            Ok(epoch) => info!("DAVE: ✅ Commit processed successfully, new epoch={}", epoch),
                                             Err(e) => {
-                                                error!("DAVE: process_commit failed: {:?}", e);
+                                                error!("DAVE: ❌ process_commit failed: {:?}", e);
                                             }
                                         }
 
@@ -564,10 +598,13 @@ impl CoreDriver {
                                         info!("DAVE: → OP 23 ReadyForTransition (commit tid={})", c.transition_id);
 
                                         let uid = s.user_id;
+                                        info!("DAVE: Refreshing own key after epoch advance (user_id={})", uid);
                                         if let Ok(keys) = s.export_sender_keys(&[uid]) {
                                             if keys.contains_key(&uid) {
                                                 info!("DAVE: ✅ Own key refreshed (epoch advance)");
                                                 mark_dave_ready!();
+                                            } else {
+                                                error!("DAVE: ❌ Missing own key after epoch advance (got {} keys)", keys.len());
                                             }
                                         }
 

@@ -173,8 +173,14 @@ impl VoiceGatewayClient {
             token: token.to_string(),
             max_dave_protocol_version: Some(1), // We support DAVE v1.1
         };
+        
+        // Log the serialized Identify payload to verify max_dave_protocol_version is included
+        if let Ok(json) = serde_json::to_string_pretty(&identify) {
+            info!("Sending Identify (OP 0) payload:\n{}", json);
+        }
+        
         self.send_packet(0, identify).await?;
-        info!("Sent Identify");
+        info!("Sent Identify with max_dave_protocol_version=1");
 
         // 3. Wait for Ready (OP 2)
         let ready_msg = self
