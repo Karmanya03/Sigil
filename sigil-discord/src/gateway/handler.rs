@@ -22,7 +22,12 @@ pub enum DaveEvent {
     MlsExternalSender(MlsExternalSenderPayload),
     /// OP 27: One or more proposals (binary). Each inner Vec<u8> is one
     ///        complete TLS-serialized MLS message.
+    ///
+    /// `transition_id` must be echoed back in the OP 28 CommitWelcome
+    /// response so Discord can correlate the commit with the proposal batch.
     MlsProposals {
+        /// The transition ID from the OP 27 payload — echo in OP 28.
+        transition_id: u64,
         operation_type: u8,
         proposals: Vec<Vec<u8>>,
     },
@@ -53,7 +58,7 @@ pub fn dispatch(opcode: u8, payload: &[u8]) -> Result<DaveEvent, SigilError> {
     }
 }
 
-// ── OP 25: MlsExternalSender (binary) ──────────────────────────────
+// ── OP 25: MlsExternalSender (binary) ──────────────────────────────────────
 
 fn parse_mls_external_sender(payload: &[u8]) -> Result<DaveEvent, SigilError> {
     // Binary: [seq(2)][op(1)][credential + signature_key bytes...]
@@ -73,39 +78,52 @@ fn parse_mls_external_sender(payload: &[u8]) -> Result<DaveEvent, SigilError> {
     }))
 }
 
-// ── OP 27: MlsProposals (binary) ──────────────────────────────────
+// ── OP 27: MlsProposals (binary) ───────────────────────────────────────────
 //
-// Per the DAVE protocol whitepaper, the binary format is:
+// Per the DAVE protocol, the binary format after the common 3-byte header is:
 //
 //   struct {
-//     uint16 sequence_number;
-//     uint8 opcode = 27;
-//     ProposalsOperationType operation_type;
+//     uint16 sequence_number;          // ← common header, stripped
+//     uint8  opcode = 27;              // ← common header, stripped
+//     uint16 transition_id;            // MUST be echoed in OP 28 response
+//     ProposalsOperationType operation_type;   // 0 = append, 1 = revoke
 //     select (operation_type) {
 //       case append: MLSMessage proposal_messages<V>;
 //       case revoke: ProposalRef proposal_refs<V>;
 //     }
 //   }
 //
-// Discord sends one OP 27 per proposal, or may batch by sending
-// multiple OP 27 messages. Each OP 27 contains one complete
-// TLS-serialized MLS message after the operation_type byte.
+// The transition_id is little-endian u16, consistent with OP 29/30.
+// Discord requires OP 28 to carry the same transition_id so it can
+// match the commit to the proposal batch. Without it Discord closes
+// the voice WS with code 4005.
+//
+// IMPORTANT: The two transition_id bytes immediately follow the header.
+// Previous parsing consumed data[0] as operation_type, which meant
+// we fed the first byte of transition_id + all remaining bytes as the
+// MLS message — causing tls_deserialize to fail with UnknownValue because
+// the MLS message was offset by 2 bytes.
 
 fn parse_mls_proposals(payload: &[u8]) -> Result<DaveEvent, SigilError> {
     let data = skip_header_if_present(payload, 27);
 
-    if data.is_empty() {
-        return Err(SigilError::Mls(
-            "MlsProposals payload is empty".to_string(),
-        ));
+    // Need at least: transition_id(2) + operation_type(1) = 3 bytes
+    if data.len() < 3 {
+        return Err(SigilError::Mls(format!(
+            "MlsProposals payload too short: {} bytes (need ≥3)",
+            data.len()
+        )));
     }
 
-    let operation_type = data[0]; // 0 = append, 1 = revoke
-    let proposal_blob = &data[1..];
+    // transition_id: u16 little-endian — echo back in OP 28
+    let transition_id = u16::from_le_bytes([data[0], data[1]]) as u64;
 
-    // Each OP 27 message contains one complete proposal.
-    // Multiple proposals arrive as separate OP 27 binary messages.
-    // The driver accumulates them before committing.
+    // operation_type: 0 = append, 1 = revoke
+    let operation_type = data[2];
+
+    // Remaining bytes are the actual MLS message(s)
+    let proposal_blob = &data[3..];
+
     let proposals = if proposal_blob.is_empty() {
         Vec::new()
     } else {
@@ -113,12 +131,13 @@ fn parse_mls_proposals(payload: &[u8]) -> Result<DaveEvent, SigilError> {
     };
 
     Ok(DaveEvent::MlsProposals {
+        transition_id,
         operation_type,
         proposals,
     })
 }
 
-// ── OP 29: MlsAnnounceCommitTransition (binary) ───────────────────
+// ── OP 29: MlsAnnounceCommitTransition (binary) ────────────────────────────
 //
 // Per the DAVE protocol whitepaper:
 //
@@ -158,7 +177,7 @@ fn parse_mls_announce_commit(payload: &[u8]) -> Result<DaveEvent, SigilError> {
     ))
 }
 
-// ── OP 30: MlsWelcome (binary) ────────────────────────────────────
+// ── OP 30: MlsWelcome (binary) ─────────────────────────────────────────────
 //
 // Per the DAVE protocol whitepaper:
 //
@@ -196,7 +215,7 @@ fn parse_mls_welcome(payload: &[u8]) -> Result<DaveEvent, SigilError> {
     }))
 }
 
-// ── Helpers ────────────────────────────────────────────────────────
+// ── Helpers ─────────────────────────────────────────────────────────────────
 
 /// If the payload still contains the [seq(2)][op(1)] header, skip it.
 ///

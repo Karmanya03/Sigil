@@ -101,10 +101,18 @@ impl SigilSession {
     /// Process incoming OP 27 proposals (Append / Revoke) from the Voice server.
     ///
     /// `operations` is a slice of raw MLS proposal byte vectors.
-    pub fn process_proposals(&mut self, operations: &[Vec<u8>]) -> Result<(), SigilError> {
+    ///
+    /// Returns `Ok(true)` when Discord sent non-empty proposals that could not
+    /// be deserialized (e.g. custom type 16) AND none were stored as pending.
+    /// The caller must check `has_pending_proposals()`:
+    /// - If true  → call `commit_and_welcome()` to commit the processable ones.
+    /// - If false AND return value is true → the driver should still send a
+    ///   self-update commit (OP 28) with the correct transition_id so Discord
+    ///   advances the epoch and delivers the epoch key.
+    pub fn process_proposals(&mut self, operations: &[Vec<u8>]) -> Result<bool, SigilError> {
         let group = self.group.as_mut().ok_or(SigilError::GroupNotEstablished)?;
-        group.process_proposals(operations, &self.provider)?;
-        Ok(())
+        let needs_commit = group.process_proposals(operations, &self.provider)?;
+        Ok(needs_commit)
     }
 
     /// Check if the MLS group has pending proposals waiting to be committed.

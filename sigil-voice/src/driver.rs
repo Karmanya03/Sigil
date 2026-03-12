@@ -479,8 +479,8 @@ impl CoreDriver {
                                     }
 
                                     // ── OP 27: MlsProposals ──────────────
-                                    DaveEvent::MlsProposals { operation_type: _operation_type, proposals } => {
-                                        info!("DAVE: Processing MlsProposals ({} proposals)", proposals.len());
+                                    DaveEvent::MlsProposals { operation_type: _operation_type, transition_id, proposals } => {
+                                        info!("DAVE: Processing MlsProposals ({} proposals, tid={})", proposals.len(), transition_id);
                                         if proposals.is_empty() {
                                             info!("DAVE: Empty proposal data, acknowledging");
                                             send_encryption_ready!();
@@ -488,7 +488,7 @@ impl CoreDriver {
                                         }
 
                                         match s.process_proposals(&proposals) {
-                                            Ok(()) => {
+                                            Ok(_needs_commit) => {
                                                 info!("DAVE: ✅ Proposals processed successfully");
                                                 let has_pending = s.has_pending_proposals();
                                                 info!("DAVE: Has pending proposals: {}", has_pending);
@@ -497,20 +497,20 @@ impl CoreDriver {
                                                     info!("DAVE: Committing proposals...");
                                                     match s.commit_and_welcome() {
                                                         Ok((commit, welcome)) => {
-                                                            let mut payload = commit.clone();
+                                                            // OP 28 wire format:
+                                                            //   [transition_id(2 LE)][commit][optional welcome]
+                                                            let mut payload = (transition_id as u16)
+                                                                .to_le_bytes()
+                                                                .to_vec();
+                                                            payload.extend_from_slice(&commit);
                                                             let has_welcome = welcome.is_some();
                                                             if let Some(w) = welcome {
                                                                 payload.extend_from_slice(&w);
                                                             }
-                                                            info!("DAVE: Generated commit ({} bytes, welcome={})", payload.len(), has_welcome);
+                                                            info!("DAVE: Generated commit ({} bytes, welcome={}, tid={})", payload.len(), has_welcome, transition_id);
                                                             send_bin!(28, payload);
-                                                            info!("DAVE: → OP 28 CommitWelcome sent");
+                                                            info!("DAVE: → OP 28 CommitWelcome sent (tid={})", transition_id);
 
-                                                            // BUG FIX: Export keys for ALL group members,
-                                                            // not just the bot's own user ID.
-                                                            // Without this, decrypt_from_sender() returns
-                                                            // NoSenderKey for every other participant,
-                                                            // silently dropping all incoming audio.
                                                             let member_ids = s.group_member_ids();
                                                             info!("DAVE: Exporting keys for {} group members (post-commit)", member_ids.len());
                                                             match s.export_sender_keys(&member_ids) {
@@ -532,26 +532,52 @@ impl CoreDriver {
                                                         }
                                                     }
                                                 } else {
-                                                    // Discord sent proposals we cannot process
-                                                    // (e.g. custom type 16). The bot is the sole
-                                                    // member — no shared MLS epoch exists between
-                                                    // the bot and Discord's relay.
+                                                    // Discord sent proposals we could not process
+                                                    // (e.g. custom type 16). We still MUST send
+                                                    // OP 28 with the correct transition_id and a
+                                                    // self-update commit so Discord advances the
+                                                    // epoch and delivers the epoch key.
                                                     //
-                                                    // If we export our own sender key here,
-                                                    // has_own_key() returns true and the mixing
-                                                    // loop DAVE-encrypts every frame. Discord's
-                                                    // relay has no epoch key to give listeners,
-                                                    // so they hear nothing even though frames
-                                                    // are being sent with non-zero amplitude.
-                                                    //
-                                                    // Fix: do NOT export the key. has_own_key()
-                                                    // stays false, the mixing loop sends raw Opus,
-                                                    // and Discord relays it to listeners normally.
-                                                    // We still mark dave_ready so the 10s timeout
-                                                    // doesn't fire and the WS stays alive.
-                                                    info!("DAVE: Sole member with unrecognized proposals — skipping key export, will send raw Opus (no shared epoch)");
-                                                    mark_dave_ready!();
-                                                    send_encryption_ready!();
+                                                    // Root cause of silence: OP 28 was missing
+                                                    // the transition_id prefix, causing Discord
+                                                    // to close with 4005 or ignore our commit.
+                                                    info!("DAVE: No processable proposals — sending self-update commit with tid={} to unblock epoch", transition_id);
+                                                    match s.commit_and_welcome() {
+                                                        Ok((commit, welcome)) => {
+                                                            // OP 28: [transition_id(2 LE)][commit][welcome?]
+                                                            let mut payload = (transition_id as u16)
+                                                                .to_le_bytes()
+                                                                .to_vec();
+                                                            payload.extend_from_slice(&commit);
+                                                            if let Some(w) = welcome {
+                                                                payload.extend_from_slice(&w);
+                                                            }
+                                                            info!("DAVE: Sending OP 28 self-update ({} bytes, tid={})", payload.len(), transition_id);
+                                                            send_bin!(28, payload);
+                                                            info!("DAVE: → OP 28 self-update CommitWelcome sent (tid={})", transition_id);
+
+                                                            let member_ids = s.group_member_ids();
+                                                            match s.export_sender_keys(&member_ids) {
+                                                                Ok(keys) if keys.contains_key(&s.user_id) => {
+                                                                    info!("DAVE: ✅ Keys exported after self-update ({} keys)", keys.len());
+                                                                    mark_dave_ready!();
+                                                                    send_encryption_ready!();
+                                                                }
+                                                                Ok(keys) => {
+                                                                    info!("DAVE: Keys exported ({} keys), waiting for OP 29", keys.len());
+                                                                    send_encryption_ready!();
+                                                                }
+                                                                Err(e) => {
+                                                                    warn!("DAVE: Key export after self-update failed: {:?}", e);
+                                                                    send_encryption_ready!();
+                                                                }
+                                                            }
+                                                        }
+                                                        Err(e) => {
+                                                            warn!("DAVE: Self-update commit failed: {:?} — acknowledging anyway", e);
+                                                            send_encryption_ready!();
+                                                        }
+                                                    }
                                                 }
                                             }
                                             Err(e) => {
