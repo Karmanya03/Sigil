@@ -162,7 +162,7 @@ impl SigilVoiceManager {
         // 3. Wait for Discord to fully tear down the old voice session on the SFU.
         //    500ms is NOT enough — Discord needs ~1.5s to propagate the disconnect
         //    to the voice server and clean up the session entry.
-        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        tokio::time::sleep(std::time::Duration::from_millis(8000)).await;
         
         // 4. Now join fresh
         self.last_channel.lock().await.insert(guild_id, channel_id);

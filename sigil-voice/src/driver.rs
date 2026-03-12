@@ -207,7 +207,9 @@ impl CoreDriver {
                             "encryption_ready": true
                         }));
                         encryption_ready_sent = true;
-                        info!("DAVE: → OP 12 EncryptionReady");
+                       info!("DAVE: → OP 12 EncryptionReady (delaying 8s to test...)");
+tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
+info!("DAVE: → OP 12 EncryptionReady (sending now)");
                     }
                 }};
             }
