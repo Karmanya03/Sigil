@@ -532,8 +532,55 @@ impl CoreDriver {
                                                         }
                                                     }
                                                 } else {
-                                                    info!("DAVE: No processable proposals in batch, acknowledging");
-                                                    send_encryption_ready!();
+                                                    // Discord sent proposals we cannot process
+                                                    // (e.g. custom type 16 which OpenMLS doesn't
+                                                    // know about). We must still send an empty
+                                                    // commit so that:
+                                                    //   1. The MLS epoch advances on both sides.
+                                                    //   2. Discord knows we acknowledged the batch.
+                                                    //   3. Discord delivers the epoch key.
+                                                    // Without this commit the DAVE key never
+                                                    // arrives and audio falls back to raw Opus.
+                                                    info!("DAVE: No processable proposals — sending empty commit to unblock epoch key delivery");
+                                                    match s.commit_and_welcome() {
+                                                        Ok((commit, welcome)) => {
+                                                            let mut payload = commit.clone();
+                                                            let has_welcome = welcome.is_some();
+                                                            if let Some(w) = welcome {
+                                                                payload.extend_from_slice(&w);
+                                                            }
+                                                            info!("DAVE: Generated empty commit ({} bytes, welcome={})", payload.len(), has_welcome);
+                                                            send_bin!(28, payload);
+                                                            info!("DAVE: → OP 28 empty CommitWelcome sent");
+
+                                                            let member_ids = s.group_member_ids();
+                                                            info!("DAVE: Exporting keys for {} members (post empty-commit)", member_ids.len());
+                                                            match s.export_sender_keys(&member_ids) {
+                                                                Ok(keys) if keys.contains_key(&s.user_id) => {
+                                                                    info!("DAVE: ✅ Keys exported after empty commit ({} keys)", keys.len());
+                                                                    mark_dave_ready!();
+                                                                }
+                                                                Ok(keys) => {
+                                                                    // Sole member — own key may not
+                                                                    // be present yet, still proceed.
+                                                                    warn!("DAVE: Own key missing after empty commit ({} keys) — marking ready (sole member)", keys.len());
+                                                                    mark_dave_ready!();
+                                                                }
+                                                                Err(e) => {
+                                                                    warn!("DAVE: Key export after empty commit failed: {:?} — marking ready", e);
+                                                                    mark_dave_ready!();
+                                                                }
+                                                            }
+                                                            send_encryption_ready!();
+                                                        }
+                                                        Err(e) => {
+                                                            // commit_and_welcome failed — don't
+                                                            // block audio forever, fall through.
+                                                            warn!("DAVE: Empty commit failed: {:?} — marking ready anyway (sole member)", e);
+                                                            mark_dave_ready!();
+                                                            send_encryption_ready!();
+                                                        }
+                                                    }
                                                 }
                                             }
                                             Err(e) => {
