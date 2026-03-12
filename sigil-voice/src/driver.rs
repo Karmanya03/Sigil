@@ -533,33 +533,24 @@ impl CoreDriver {
                                                     }
                                                 } else {
                                                     // Discord sent proposals we cannot process
-                                                    // (e.g. custom type 16 which OpenMLS doesn't
-                                                    // know about). The bot is the sole member of
-                                                    // its own MLS group and already has its own
-                                                    // sender key — we do NOT send OP 28 here.
+                                                    // (e.g. custom type 16). The bot is the sole
+                                                    // member — no shared MLS epoch exists between
+                                                    // the bot and Discord's relay.
                                                     //
-                                                    // Sending an empty commit on a sole-member
-                                                    // group causes Discord to close the WS with
-                                                    // code 4005 (Already authenticated), killing
-                                                    // the connection before any audio is sent.
+                                                    // If we export our own sender key here,
+                                                    // has_own_key() returns true and the mixing
+                                                    // loop DAVE-encrypts every frame. Discord's
+                                                    // relay has no epoch key to give listeners,
+                                                    // so they hear nothing even though frames
+                                                    // are being sent with non-zero amplitude.
                                                     //
-                                                    // Instead: export the own sender key, mark
-                                                    // DAVE ready, and send EncryptionReady.
-                                                    // Outgoing audio will be DAVE-encrypted with
-                                                    // the bot's own key; the WS stays alive.
-                                                    info!("DAVE: Unrecognized proposals (sole member) — exporting own key without commit");
-                                                    let member_ids = s.group_member_ids();
-                                                    info!("DAVE: Exporting keys for {} members (sole member path)", member_ids.len());
-                                                    match s.export_sender_keys(&member_ids) {
-                                                        Ok(keys) => {
-                                                            info!("DAVE: ✅ Keys exported ({} keys) — marking DAVE ready", keys.len());
-                                                            mark_dave_ready!();
-                                                        }
-                                                        Err(e) => {
-                                                            warn!("DAVE: Key export failed: {:?} — marking ready anyway (will fall back to raw Opus)", e);
-                                                            mark_dave_ready!();
-                                                        }
-                                                    }
+                                                    // Fix: do NOT export the key. has_own_key()
+                                                    // stays false, the mixing loop sends raw Opus,
+                                                    // and Discord relays it to listeners normally.
+                                                    // We still mark dave_ready so the 10s timeout
+                                                    // doesn't fire and the WS stays alive.
+                                                    info!("DAVE: Sole member with unrecognized proposals — skipping key export, will send raw Opus (no shared epoch)");
+                                                    mark_dave_ready!();
                                                     send_encryption_ready!();
                                                 }
                                             }
