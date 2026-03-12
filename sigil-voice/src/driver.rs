@@ -245,12 +245,10 @@ impl CoreDriver {
                             .duration_since(std::time::UNIX_EPOCH)
                             .unwrap_or_default()
                             .as_millis() as u64;
-
                         let mut hb_d = serde_json::json!({"t": hb_nonce});
                         if let Some(sa) = seq_ack {
                             hb_d["seq_ack"] = serde_json::json!(sa);
                         }
-
                         let hb = VoicePacket {
                             op: 3,
                             d: Some(hb_d),
@@ -323,6 +321,7 @@ impl CoreDriver {
                                         }
                                         debug!("Heartbeat ACK");
                                     }
+
                                     5 => {
                                         if let Some(d) = pkt.d {
                                             if let Ok(spk) = serde_json::from_value::<
@@ -377,13 +376,7 @@ impl CoreDriver {
                                     }
 
                                     // ── OP 24: PrepareEpoch (JSON) ────────
-                                    //
-                                    // FIX #2: Per DAVE protocol spec §Key Packages:
-                                    // "The client must send a new key package after
-                                    //  OP 24 with epoch_id = 1"
-                                    // Only send KeyPackage on epoch == 1. Sending on
-                                    // every epoch replaces cached key packages mid-
-                                    // session and corrupts MLS group state.
+                                    // Only send KeyPackage on epoch == 1.
                                     24 => {
                                         if let Some(d) = pkt.d {
                                             use sigil_discord::gateway::opcodes::PrepareEpoch;
@@ -412,10 +405,10 @@ impl CoreDriver {
                                         }
                                     }
 
-                                    9  => { info!("Voice WS resumed"); }
+                                    9 => { info!("Voice WS resumed"); }
                                     13 => { debug!("Client connected (OP 13)"); }
                                     18 => { debug!("Client disconnected (OP 18)"); }
-                                    _  => debug!("Text OP {}", pkt.op),
+                                    _ => debug!("Text OP {}", pkt.op),
                                 }
                             }
 
@@ -495,7 +488,6 @@ impl CoreDriver {
                                                                 }
                                                                 Err(e) => error!("DAVE: ❌ Export failed after commit: {:?}", e),
                                                             }
-
                                                         }
                                                         Err(e) => {
                                                             error!("DAVE: ❌ commit_and_welcome failed: {:?}", e);
@@ -517,12 +509,7 @@ impl CoreDriver {
                                                             send_bin!(28, payload);
                                                             info!("DAVE: → OP 28 self-update CommitWelcome sent (tid={})", transition_id);
 
-                                                            // FIX #4: Send OP 23 ReadyForTransition after self-update commit.
-                                                            // Per DAVE spec: "upon successful processing of the commit,
-                                                            // the client notifies the voice gateway that they are ready
-                                                            // for the associated transition via OP 23."
-                                                            // This was missing from the sole-member path entirely,
-                                                            // causing Discord to never advance the epoch for this bot.
+                                                            // FIX: Send OP 23 ReadyForTransition after self-update commit
                                                             use sigil_discord::gateway::opcodes::ReadyForTransition;
                                                             send_text!(23, serde_json::to_value(
                                                                 ReadyForTransition { transition_id }
@@ -534,12 +521,7 @@ impl CoreDriver {
                                                                 Ok(keys) if keys.contains_key(&s.user_id) => {
                                                                     info!("DAVE: ✅ Keys exported after self-update ({} keys)", keys.len());
                                                                     mark_dave_ready!();
-                                                                    // FIX #3: send_encryption_ready!() was missing here.
-                                                                    // Per DAVE spec: client must signal EncryptionReady
-                                                                    // (OP 12) once E2EE keys are established so the voice
-                                                                    // gateway begins routing E2EE audio to/from the bot.
-                                                                    // Without this, the gateway never delivers audio frames
-                                                                    // to the bot and other clients can't hear it.
+                                                                    // FIX: Send OP 12 EncryptionReady after self-update
                                                                     send_encryption_ready!();
                                                                 }
                                                                 Ok(keys) => {
@@ -600,7 +582,7 @@ impl CoreDriver {
 
                                     // ── OP 29: MlsAnnounceCommitTransition
                                     DaveEvent::MlsAnnounceCommitTransition(c) => {
-                                        info!("DAVE: Processing MlsAnnounceCommitTransition (tid={}, {} bytes)", 
+                                        info!("DAVE: Processing MlsAnnounceCommitTransition (tid={}, {} bytes)",
                                             c.transition_id, c.commit_bytes.len());
                                         match s.process_commit(&c.commit_bytes) {
                                             Ok(epoch) => info!("DAVE: ✅ Commit processed successfully, new epoch={}", epoch),
@@ -741,13 +723,7 @@ impl CoreDriver {
             ).await.is_ok()
         };
 
-        // FIX #1: Check WS liveness UNCONDITIONALLY after the DAVE wait,
-        // not just on the timeout/error path. The original code only had
-        // this check inside the `!dave_established` branch. If DAVE keys
-        // were exported just before the WS close frame arrived (e.g. 4005),
-        // dave_established would be `true` but ws_alive already `false`.
-        // Without this check, OP 5 Speaking was sent into a closed channel
-        // and the mixing loop would exit immediately with 0 frames → silence.
+        // FIX: Check WS liveness UNCONDITIONALLY after DAVE wait
         if !self.ws_alive.load(Ordering::Acquire) {
             error!("🛑 WS died during DAVE negotiation — aborting mixing loop");
             return Err("WS connection lost before mixing could start".into());
@@ -812,42 +788,40 @@ impl CoreDriver {
             for s in mixed.iter_mut() { *s = 0; }
             let mut active = false;
 
-            {
-                let mut tracks = self.tracks.lock().await;
-                tracks.retain(|h| {
-                    use crate::track::PlayState;
-                    matches!(h.get_state_atomic(), PlayState::Playing | PlayState::Paused)
-                });
+            let mut tracks = self.tracks.lock().await;
+            tracks.retain(|h| {
+                use crate::track::PlayState;
+                matches!(h.get_state_atomic(), PlayState::Playing | PlayState::Paused)
+            });
 
-                for handle in tracks.iter() {
-                    if handle.get_state_atomic() != crate::track::PlayState::Playing {
-                        continue;
-                    }
+            for handle in tracks.iter() {
+                if handle.get_state_atomic() != crate::track::PlayState::Playing {
+                    continue;
+                }
 
-                    if let Ok(mut t) = handle.inner().try_lock() {
-                        match t.source.read_frame() {
-                            Some(frame) => {
-                                active = true;
-                                let vol = t.volume;
-                                for (i, &s) in frame.iter().enumerate() {
-                                    if i < mixed.len() {
-                                        mixed[i] += (s as f32 * vol) as i32;
-                                    }
-                                }
-                            }
-                            None => {
-                                t.state.store(
-                                    crate::track::PlayState::Stopped as u8,
-                                    std::sync::atomic::Ordering::Relaxed,
-                                );
-                                if let Some(tx) = &t.event_tx {
-                                    let _ = tx.send(crate::track::TrackEvent::End);
+                if let Ok(mut t) = handle.inner().try_lock() {
+                    match t.source.read_frame() {
+                        Some(frame) => {
+                            active = true;
+                            let vol = t.volume;
+                            for (i, &s) in frame.iter().enumerate() {
+                                if i < mixed.len() {
+                                    mixed[i] += (s as f32 * vol) as i32;
                                 }
                             }
                         }
-                    } else {
-                        active = true;
+                        None => {
+                            t.state.store(
+                                crate::track::PlayState::Stopped as u8,
+                                std::sync::atomic::Ordering::Relaxed,
+                            );
+                            if let Some(tx) = &t.event_tx {
+                                let _ = tx.send(crate::track::TrackEvent::End);
+                            }
+                        }
                     }
+                } else {
+                    active = true;
                 }
             }
 
@@ -882,6 +856,7 @@ impl CoreDriver {
                         info!("💤 Idle keepalive started — sending silence every 5s");
                     }
                 }
+
                 continue;
             }
 
@@ -922,6 +897,7 @@ impl CoreDriver {
                     was_active = false;
                     idle_tick_count = 0;
                 }
+
                 continue;
             }
 
@@ -1004,10 +980,10 @@ impl CoreDriver {
             frames_sent += 1;
             self.frames_sent.store(frames_sent, Ordering::Relaxed);
             match frames_sent {
-                1    => info!("🔊 First frame sent!"),
-                50   => info!("🔊 1 second of audio sent"),
+                1 => info!("🔊 First frame sent!"),
+                50 => info!("🔊 1 second of audio sent"),
                 2500 => info!("🔊 50 seconds of audio sent"),
-                _    => {}
+                _ => {}
             }
 
             seq = seq.wrapping_add(1);

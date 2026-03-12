@@ -67,8 +67,8 @@ use crate::driver::CoreDriver;
 #[derive(Default)]
 struct PendingConnection {
     session_id: Option<String>,
-    endpoint:   Option<String>,
-    token:      Option<String>,
+    endpoint: Option<String>,
+    token: Option<String>,
     channel_id: Option<ChannelId>,
 }
 
@@ -86,8 +86,8 @@ impl PendingConnection {
 /// when Discord invalidates the session and sends fresh credentials.
 #[derive(Default, Clone)]
 struct ActiveConnectionInfo {
-    endpoint:   String,
-    token:      String,
+    endpoint: String,
+    token: String,
     session_id: String,
 }
 
@@ -110,17 +110,32 @@ pub struct SigilVoiceManager {
     active_info: Arc<Mutex<HashMap<GuildId, ActiveConnectionInfo>>>,
     /// guild_id → true if a CoreDriver::connect() is currently in-flight
     connecting: Arc<Mutex<HashMap<GuildId, bool>>>,
+    /// guild_id → channel the bot last joined (for auto-reconnect)
+    last_channel: Arc<Mutex<HashMap<GuildId, ChannelId>>>,
+    /// guild_id → number of consecutive reconnect attempts
+    reconnect_count: Arc<Mutex<HashMap<GuildId, u8>>>,
 }
+
+/// Maximum consecutive auto-reconnect attempts before giving up.
+const MAX_RECONNECT_ATTEMPTS: u8 = 3;
+
+/// Delay between disconnect and reconnect OP 4 sends.
+const RECONNECT_GAP_MS: u64 = 500;
+
+/// How long to wait after Call insertion to check if driver died immediately.
+const LIVENESS_CHECK_DELAY_MS: u64 = 300;
 
 impl Default for SigilVoiceManager {
     fn default() -> Self {
         Self {
-            user_id:     Mutex::new(0),
-            shards:      Mutex::new(HashMap::new()),
-            pending:     Arc::new(Mutex::new(HashMap::new())),
-            calls:       Arc::new(Mutex::new(HashMap::new())),
+            user_id: Mutex::new(0),
+            shards: Mutex::new(HashMap::new()),
+            pending: Arc::new(Mutex::new(HashMap::new())),
+            calls: Arc::new(Mutex::new(HashMap::new())),
             active_info: Arc::new(Mutex::new(HashMap::new())),
-            connecting:  Arc::new(Mutex::new(HashMap::new())),
+            connecting: Arc::new(Mutex::new(HashMap::new())),
+            last_channel: Arc::new(Mutex::new(HashMap::new())),
+            reconnect_count: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -131,6 +146,10 @@ impl SigilVoiceManager {
     /// Move the bot into `channel_id` in `guild_id`.
     /// Sends Gateway OP 4 via the shard's messenger.
     pub async fn join(&self, guild_id: GuildId, channel_id: ChannelId) {
+        // Track the channel for auto-reconnect
+        self.last_channel.lock().await.insert(guild_id, channel_id);
+        // Reset reconnect counter on fresh user-initiated join
+        self.reconnect_count.lock().await.remove(&guild_id);
         self.update_voice_state(guild_id, Some(channel_id)).await;
     }
 
@@ -138,6 +157,8 @@ impl SigilVoiceManager {
     pub async fn leave(&self, guild_id: GuildId) {
         self.update_voice_state(guild_id, None).await;
         self.teardown_guild(guild_id).await;
+        self.last_channel.lock().await.remove(&guild_id);
+        self.reconnect_count.lock().await.remove(&guild_id);
     }
 
     /// Retrieve the active `Call` for a guild, if one exists.
@@ -164,6 +185,7 @@ impl SigilVoiceManager {
             old_call.driver.request_shutdown();
             old_call.stop().await;
         }
+
         self.pending.lock().await.remove(&guild_id);
         self.active_info.lock().await.remove(&guild_id);
         self.connecting.lock().await.remove(&guild_id);
@@ -173,15 +195,15 @@ impl SigilVoiceManager {
     async fn update_voice_state(&self, guild_id: GuildId, channel_id: Option<ChannelId>) {
         let channel_val = match channel_id {
             Some(c) => serde_json::Value::String(c.get().to_string()),
-            None    => serde_json::Value::Null,
+            None => serde_json::Value::Null,
         };
         let payload = serde_json::json!({
             "op": 4,
             "d": {
-                "guild_id":   guild_id.get().to_string(),
+                "guild_id": guild_id.get().to_string(),
                 "channel_id": channel_val,
-                "self_mute":  false,
-                "self_deaf":  false
+                "self_mute": false,
+                "self_deaf": false
             }
         });
         let json = match serde_json::to_string(&payload) {
@@ -203,6 +225,50 @@ impl SigilVoiceManager {
                 tracing::warn!("Shard {} sender is closed", shard_id);
             }
         }
+    }
+
+    /// Force a reconnect by cycling OP 4: disconnect → brief pause → reconnect.
+    /// This makes Discord issue completely fresh voice credentials (new endpoint/token).
+    async fn request_rejoin(&self, guild_id: GuildId) {
+        let channel_id = self.last_channel.lock().await.get(&guild_id).copied();
+        let Some(ch) = channel_id else {
+            tracing::warn!("🔄 Cannot auto-reconnect guild={} — no last_channel recorded", guild_id);
+            return;
+        };
+
+        // Check reconnect attempt count
+        let attempt = {
+            let mut counts = self.reconnect_count.lock().await;
+            let count = counts.entry(guild_id).or_insert(0);
+            *count += 1;
+            *count
+        };
+
+        if attempt > MAX_RECONNECT_ATTEMPTS {
+            tracing::error!(
+                "❌ Giving up auto-reconnect for guild={} after {} attempts",
+                guild_id, MAX_RECONNECT_ATTEMPTS
+            );
+            self.reconnect_count.lock().await.remove(&guild_id);
+            self.last_channel.lock().await.remove(&guild_id);
+            return;
+        }
+
+        tracing::warn!(
+            "🔄 Auto-reconnect attempt {}/{} for guild={} — cycling OP 4",
+            attempt, MAX_RECONNECT_ATTEMPTS, guild_id
+        );
+
+        // Disconnect (OP 4 with null channel)
+        self.update_voice_state(guild_id, None).await;
+
+        // Brief pause so Discord processes the disconnect
+        tokio::time::sleep(std::time::Duration::from_millis(RECONNECT_GAP_MS)).await;
+
+        // Reconnect (OP 4 with the channel)
+        self.update_voice_state(guild_id, Some(ch)).await;
+        // Discord will now send fresh VoiceStateUpdate + VoiceServerUpdate
+        // which will trigger check_and_connect() automatically.
     }
 
     /// Once we have session_id + endpoint + token, bootstrap the CoreDriver.
@@ -237,11 +303,7 @@ impl SigilVoiceManager {
         let (endpoint, session_id, token) = args;
 
         // FIX #1: Set the connecting guard FIRST, before the active_info
-        // dedup check. Previously this was done AFTER, which left a TOCTOU
-        // window where two concurrent check_and_connect() calls (one from
-        // VoiceStateUpdate, one from VoiceServerUpdate) could both pass the
-        // dedup check before either had set the guard — producing two
-        // Identify (OP 0) payloads and causing Discord close code=4005.
+        // dedup check.
         {
             let mut conn = self.connecting.lock().await;
             if conn.get(&guild_id).copied().unwrap_or(false) {
@@ -253,36 +315,35 @@ impl SigilVoiceManager {
         // connecting lock is dropped here — guard is now set
 
         // ── Deduplicate: skip if already connected with same credentials ──
-        // FIX #2: This check now runs AFTER the connecting guard is set.
-        // Also: we drop the active_info lock before acquiring the calls lock
-        // to prevent potential lock-order deadlock.
-        {
+        // FIX #2: Drop active_info lock before acquiring calls lock to
+        // prevent potential lock-order deadlock.
+        let same_creds = {
             let active = self.active_info.lock().await;
             if let Some(info) = active.get(&guild_id) {
-                if info.endpoint == endpoint
+                info.endpoint == endpoint
                     && info.token == token
                     && info.session_id == session_id
-                {
-                    // Drop active_info lock before acquiring calls lock
-                    drop(active);
-                    let still_alive = self.calls.lock().await
-                        .get(&guild_id)
-                        .map(|c| c.driver.is_ws_alive())
-                        .unwrap_or(false);
-                    if still_alive {
-                        tracing::debug!(
-                            "Duplicate connect attempt with same credentials — skipping [guild={}]",
-                            guild_id
-                        );
-                        self.pending.lock().await.remove(&guild_id);
-                        // FIX: Clear the connecting guard we set above
-                        self.connecting.lock().await.remove(&guild_id);
-                        return;
-                    }
-                }
+            } else {
+                false
+            }
+        };
+        // active_info lock dropped
+
+        if same_creds {
+            let still_alive = self.calls.lock().await
+                .get(&guild_id)
+                .map(|c| c.driver.is_ws_alive())
+                .unwrap_or(false);
+            if still_alive {
+                tracing::debug!(
+                    "Duplicate connect attempt with same credentials — skipping [guild={}]",
+                    guild_id
+                );
+                self.pending.lock().await.remove(&guild_id);
+                self.connecting.lock().await.remove(&guild_id);
+                return;
             }
         }
-        // active_info lock is dropped here
 
         // Flush pending so duplicate events don't re-trigger a connect
         self.pending.lock().await.remove(&guild_id);
@@ -297,14 +358,19 @@ impl SigilVoiceManager {
         }
 
         let server_id_str = guild_id.get().to_string();
-        let user_id_str   = self.user_id.lock().await.to_string();
-        let calls_clone   = self.calls.clone();
-        let active_clone  = self.active_info.clone();
-        let conn_clone    = self.connecting.clone();
+        let user_id_str = self.user_id.lock().await.to_string();
+        let calls_clone = self.calls.clone();
+        let active_clone = self.active_info.clone();
+        let conn_clone = self.connecting.clone();
+        let last_ch_clone = self.last_channel.clone();
+        let reconnect_clone = self.reconnect_count.clone();
+        let shards_clone = self.shards.clone();
+        let pending_clone = self.pending.clone();
+        let connecting_outer = self.connecting.clone();
 
         let new_info = ActiveConnectionInfo {
-            endpoint:   endpoint.clone(),
-            token:      token.clone(),
+            endpoint: endpoint.clone(),
+            token: token.clone(),
             session_id: session_id.clone(),
         };
 
@@ -323,23 +389,93 @@ impl SigilVoiceManager {
                 Ok(Ok(driver)) => {
                     // FIX #3: Verify the WS is still alive before inserting
                     // the Call. The WS background task may have received a
-                    // close frame (e.g. 4005) during or immediately after
-                    // connect(). Inserting a dead Call causes start_mixing()
-                    // to immediately exit with 0 frames → silence.
+                    // close frame (e.g. 4005) during connect().
                     if !driver.is_ws_alive() {
                         tracing::error!(
-                            "❌ CoreDriver WS died immediately after connect [guild={}] — not inserting Call",
+                            "❌ CoreDriver WS died during connect [guild={}] — triggering auto-reconnect",
                             guild_id
                         );
                         driver.request_shutdown();
                         active_clone.lock().await.remove(&guild_id);
+
+                        // ══════════════════════════════════════════════════
+                        // AUTO-RECONNECT: The WS died immediately (likely
+                        // 4005 "Already authenticated" from a stale session).
+                        // Cycle OP 4 to get fresh credentials from Discord.
+                        // ══════════════════════════════════════════════════
+                        spawn_rejoin(
+                            guild_id,
+                            last_ch_clone,
+                            reconnect_clone,
+                            shards_clone,
+                            pending_clone,
+                            connecting_outer,
+                            calls_clone,
+                            active_clone.clone(),
+                        );
                         return;
                     }
+
                     tracing::info!("✅ CoreDriver ready for guild={}", guild_id);
                     let call = Arc::new(Call::new(driver));
-                    calls_clone.lock().await.insert(guild_id, call);
+                    calls_clone.lock().await.insert(guild_id, call.clone());
                     active_clone.lock().await.insert(guild_id, new_info);
                     tracing::info!("📞 Call inserted for guild={} — ready for playback", guild_id);
+
+                    // Reset reconnect counter on success
+                    reconnect_clone.lock().await.remove(&guild_id);
+
+                    // ── Spawn liveness watchdog ────────────────────────────
+                    // Catches the case where the WS dies milliseconds AFTER
+                    // the is_ws_alive() check above passed (race window).
+                    let calls_watch = calls_clone.clone();
+                    let active_watch = active_clone.clone();
+                    let last_ch_watch = last_ch_clone.clone();
+                    let reconnect_watch = reconnect_clone.clone();
+                    let shards_watch = shards_clone.clone();
+                    let pending_watch = pending_clone.clone();
+                    let connecting_watch = connecting_outer.clone();
+
+                    tokio::spawn(async move {
+                        tokio::time::sleep(
+                            std::time::Duration::from_millis(LIVENESS_CHECK_DELAY_MS)
+                        ).await;
+
+                        let needs_reconnect = {
+                            let calls = calls_watch.lock().await;
+                            if let Some(c) = calls.get(&guild_id) {
+                                !c.driver.is_ws_alive()
+                                    && c.driver.frames_sent.load(
+                                        std::sync::atomic::Ordering::Relaxed
+                                    ) == 0
+                            } else {
+                                false
+                            }
+                        };
+
+                        if needs_reconnect {
+                            tracing::warn!(
+                                "🔄 Liveness watchdog: driver died with 0 frames [guild={}] — auto-reconnecting",
+                                guild_id
+                            );
+                            // Tear down the dead call
+                            if let Some(dead) = calls_watch.lock().await.remove(&guild_id) {
+                                dead.driver.request_shutdown();
+                            }
+                            active_watch.lock().await.remove(&guild_id);
+
+                            spawn_rejoin(
+                                guild_id,
+                                last_ch_watch,
+                                reconnect_watch,
+                                shards_watch,
+                                pending_watch,
+                                connecting_watch,
+                                calls_watch,
+                                active_watch,
+                            );
+                        }
+                    });
                 }
                 Ok(Err(e)) => {
                     tracing::error!("❌ CoreDriver::connect failed for guild={}: {:?}", guild_id, e);
@@ -352,6 +488,117 @@ impl SigilVoiceManager {
             }
         });
     }
+}
+
+/// Spawn an async task that cycles OP 4 (disconnect → reconnect) to force
+/// Discord to issue fresh voice credentials.
+///
+/// This is extracted as a free function because it's called from multiple
+/// places inside spawned tasks where `&self` isn't available.
+fn spawn_rejoin(
+    guild_id: GuildId,
+    last_channel: Arc<Mutex<HashMap<GuildId, ChannelId>>>,
+    reconnect_count: Arc<Mutex<HashMap<GuildId, u8>>>,
+    shards: Mutex<HashMap<u32, UnboundedSender<ShardRunnerMessage>>>,
+    pending: Arc<Mutex<HashMap<GuildId, PendingConnection>>>,
+    connecting: Arc<Mutex<HashMap<GuildId, bool>>>,
+    calls: Arc<Mutex<HashMap<GuildId, Arc<Call>>>>,
+    active_info: Arc<Mutex<HashMap<GuildId, ActiveConnectionInfo>>>,
+) {
+    tokio::spawn(async move {
+        let channel_id = last_channel.lock().await.get(&guild_id).copied();
+        let Some(ch) = channel_id else {
+            tracing::warn!("🔄 Cannot auto-reconnect guild={} — no last_channel", guild_id);
+            return;
+        };
+
+        // Check attempt count
+        let attempt = {
+            let mut counts = reconnect_count.lock().await;
+            let count = counts.entry(guild_id).or_insert(0);
+            *count += 1;
+            *count
+        };
+
+        if attempt > MAX_RECONNECT_ATTEMPTS {
+            tracing::error!(
+                "❌ Giving up auto-reconnect for guild={} after {} attempts",
+                guild_id, MAX_RECONNECT_ATTEMPTS
+            );
+            reconnect_count.lock().await.remove(&guild_id);
+            last_channel.lock().await.remove(&guild_id);
+            // Clean up any stale state
+            calls.lock().await.remove(&guild_id);
+            active_info.lock().await.remove(&guild_id);
+            pending.lock().await.remove(&guild_id);
+            connecting.lock().await.remove(&guild_id);
+            return;
+        }
+
+        tracing::warn!(
+            "🔄 Auto-reconnect attempt {}/{} for guild={} — cycling OP 4",
+            attempt, MAX_RECONNECT_ATTEMPTS, guild_id
+        );
+
+        // Clean all stale state before reconnect
+        pending.lock().await.remove(&guild_id);
+        active_info.lock().await.remove(&guild_id);
+        connecting.lock().await.remove(&guild_id);
+
+        // Send OP 4 disconnect (null channel)
+        {
+            let payload = serde_json::json!({
+                "op": 4,
+                "d": {
+                    "guild_id": guild_id.get().to_string(),
+                    "channel_id": serde_json::Value::Null,
+                    "self_mute": false,
+                    "self_deaf": false
+                }
+            });
+            if let Ok(json) = serde_json::to_string(&payload) {
+                let s = shards.lock().await;
+                for (_, sender) in s.iter() {
+                    let msg = ShardRunnerMessage::Message(
+                        WsMessage::Text(json.clone().into())
+                    );
+                    let _ = sender.unbounded_send(msg);
+                }
+            }
+        }
+
+        tracing::info!("🔄 Sent OP 4 disconnect for guild={}, waiting {}ms...", guild_id, RECONNECT_GAP_MS);
+        tokio::time::sleep(std::time::Duration::from_millis(RECONNECT_GAP_MS)).await;
+
+        // Send OP 4 reconnect (with channel)
+        {
+            let payload = serde_json::json!({
+                "op": 4,
+                "d": {
+                    "guild_id": guild_id.get().to_string(),
+                    "channel_id": ch.get().to_string(),
+                    "self_mute": false,
+                    "self_deaf": false
+                }
+            });
+            if let Ok(json) = serde_json::to_string(&payload) {
+                let s = shards.lock().await;
+                for (_, sender) in s.iter() {
+                    let msg = ShardRunnerMessage::Message(
+                        WsMessage::Text(json.clone().into())
+                    );
+                    let _ = sender.unbounded_send(msg);
+                }
+            }
+        }
+
+        tracing::info!(
+            "🔄 Sent OP 4 reconnect for guild={} channel={} — waiting for fresh credentials",
+            guild_id, ch
+        );
+        // Discord will now send VoiceStateUpdate + VoiceServerUpdate which
+        // will flow through state_update() + server_update() → check_and_connect()
+    });
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -403,7 +650,7 @@ impl VoiceGatewayManager for SigilVoiceManager {
             let mut p = self.pending.lock().await;
             let entry = p.entry(guild_id).or_default();
             entry.endpoint = Some(ep.clone());
-            entry.token    = Some(token.to_string());
+            entry.token = Some(token.to_string());
         }
         // pending lock dropped before check_and_connect
 
@@ -430,6 +677,11 @@ impl VoiceGatewayManager for SigilVoiceManager {
             "VoiceStateUpdate [guild={}, channel={:?}, session={}]",
             guild_id, voice_state.channel_id, voice_state.session_id
         );
+
+        // Track the channel for auto-reconnect
+        if let Some(ch) = voice_state.channel_id {
+            self.last_channel.lock().await.insert(guild_id, ch);
+        }
 
         {
             let mut p = self.pending.lock().await;
