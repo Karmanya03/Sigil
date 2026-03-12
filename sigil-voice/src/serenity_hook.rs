@@ -279,8 +279,8 @@ impl SigilVoiceManager {
         {
             let mut conn = self.connecting.lock().await;
             if conn.get(&guild_id).copied().unwrap_or(false) {
-                tracing::warn!("Connect already in-flight for guild={} — skipping", guild_id);
-                return;
+            tracing::error!("🚨 DUPLICATE CONNECT BLOCKED for guild={} — connecting guard saved us", guild_id);
+            return;
             }
             conn.insert(guild_id, true);
         }
@@ -343,7 +343,7 @@ impl SigilVoiceManager {
         };
 
         tokio::spawn(async move {
-            tracing::info!("🚀 Bootstrapping CoreDriver for guild={}", guild_id);
+            tracing::warn!("🚀 Bootstrapping CoreDriver for guild={} — CONNECT ATTEMPT", guild_id);
 
             let result = tokio::time::timeout(
                 std::time::Duration::from_secs(30),
@@ -473,7 +473,8 @@ impl VoiceGatewayManager for SigilVoiceManager {
             }
         }
 
-        tracing::info!("VoiceServerUpdate [guild={}, endpoint={}]", guild_id, ep);
+         tracing::warn!("VoiceServerUpdate [guild={}, endpoint={}] — CALLER TRACE", guild_id, ep);
+    tracing::warn!("VoiceServerUpdate backtrace: {:?}", std::backtrace::Backtrace::force_capture());
 
         // FIX: Scope the pending lock so it drops BEFORE check_and_connect()
         {
