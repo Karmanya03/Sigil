@@ -26,3 +26,6 @@ openmls = "0.8.1"
 async-trait = "0.1"
 futures = "0.3"
 
+[dev-dependencies]
+proptest = "1.4"
+

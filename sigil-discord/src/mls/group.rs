@@ -325,4 +325,28 @@ impl DaveGroup {
     pub fn mls_group_mut(&mut self) -> &mut MlsGroup {
         &mut self.mls_group
     }
+
+    /// Extract all Discord user IDs from the current MLS group members.
+    ///
+    /// Each member's Basic credential encodes the user ID as a big-endian u64.
+    /// Members whose credentials cannot be decoded are silently skipped.
+    pub fn member_user_ids(&self) -> Vec<UserId> {
+        self.mls_group
+            .members()
+            .filter_map(|member| {
+                let identity = member.credential().serialized_content();
+                if identity.len() == 8 {
+                    let mut bytes = [0u8; 8];
+                    bytes.copy_from_slice(identity);
+                    Some(u64::from_be_bytes(bytes))
+                } else {
+                    tracing::warn!(
+                        "Skipping member with unexpected credential length: {} bytes",
+                        identity.len()
+                    );
+                    None
+                }
+            })
+            .collect()
+    }
 }

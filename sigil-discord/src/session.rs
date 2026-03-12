@@ -295,6 +295,17 @@ impl SigilSession {
         self.group.is_some()
     }
 
+    /// Returns the Discord user IDs of all current MLS group members.
+    ///
+    /// Used to export sender keys for ALL participants so incoming audio
+    /// from every user can be decrypted — not just the bot's own frames.
+    pub fn group_member_ids(&self) -> Vec<UserId> {
+        self.group
+            .as_ref()
+            .map(|g| g.member_user_ids())
+            .unwrap_or_default()
+    }
+
     pub fn has_own_key(&self) -> bool {
         self.own_key.is_some()
     }

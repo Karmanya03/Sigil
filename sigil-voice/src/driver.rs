@@ -399,18 +399,21 @@ impl CoreDriver {
                                                 Ok(pe) => {
                                                     info!("DAVE: ← OP 24 PrepareEpoch (epoch={}, proto={})",
                                                         pe.epoch, pe.protocol_version);
-                                                    if pe.epoch == 1 {
+                                                    // BUG FIX: Always send a KeyPackage for ANY epoch.
+                                                    // Discord can start a new MLS session at epoch > 1
+                                                    // (e.g. reconnects, channel resets). Checking for
+                                                    // epoch == 1 caused the bot to never join sessions
+                                                    // that began at a higher epoch number.
+                                                    {
                                                         let s = sigil_clone.lock().await;
                                                         match s.generate_key_package() {
                                                             Ok(kp) => {
-                                                                info!("DAVE: Generated KeyPackage ({} bytes)", kp.len());
+                                                                info!("DAVE: Generated KeyPackage ({} bytes) for epoch {}", kp.len(), pe.epoch);
                                                                 send_bin!(26, kp);
-                                                                info!("DAVE: → OP 26 KeyPackage sent");
+                                                                info!("DAVE: → OP 26 KeyPackage sent (epoch={})", pe.epoch);
                                                             }
                                                             Err(e) => error!("DAVE: KeyPackage generation failed: {:?}", e),
                                                         }
-                                                    } else {
-                                                        info!("DAVE: Skipping KeyPackage generation (epoch != 1)");
                                                     }
                                                 }
                                                 Err(e) => {
@@ -455,31 +458,23 @@ impl CoreDriver {
                                         info!("DAVE: Processing MlsExternalSender (credential {} bytes)", ext.credential.len());
                                         match s.set_external_sender(&ext.credential) {
                                             Ok(()) => {
-                                                info!("DAVE: ✅ MLS group created successfully");
-                                                let is_est = s.is_established();
-                                                info!("DAVE: Group established: {}", is_est);
+                                                info!("DAVE: ✅ MLS group created with external sender");
+                                                info!("DAVE: Group established (sole member): {}", s.is_established());
+                                                // BUG FIX: Do NOT call mark_dave_ready!() or
+                                                // send_encryption_ready!() here.
+                                                //
+                                                // At this point the bot is the ONLY member of its
+                                                // own local MLS group — no other peers have been
+                                                // added yet.  Emitting OP 12 here causes the server
+                                                // to think E2EE is live while no shared epoch key
+                                                // exists.  The correct place to emit these signals
+                                                // is in the OP 29 / OP 30 handlers, once the bot
+                                                // has actually joined the shared group.
                                             }
                                             Err(e) => {
                                                 error!("DAVE: ❌ set_external_sender failed: {:?}", e);
                                                 continue;
                                             }
-                                        }
-
-                                        let uid = s.user_id;
-                                        info!("DAVE: Attempting to export own key (user_id={})", uid);
-                                        match s.export_sender_keys(&[uid]) {
-                                            Ok(keys) if keys.contains_key(&uid) => {
-                                                info!("DAVE: ✅ Own key exported successfully (OP 25)");
-                                                mark_dave_ready!();
-                                                send_encryption_ready!();
-                                            }
-                                            Ok(keys) => {
-                                                error!("DAVE: ❌ export_sender_keys missing own key (got {} keys)", keys.len());
-                                                for (k, _) in keys.iter() {
-                                                    error!("DAVE: Available key for user_id={}", k);
-                                                }
-                                            }
-                                            Err(e) => error!("DAVE: ❌ export_sender_keys failed: {:?}", e),
                                         }
                                     }
 
@@ -487,7 +482,7 @@ impl CoreDriver {
                                     DaveEvent::MlsProposals { operation_type: _operation_type, proposals } => {
                                         info!("DAVE: Processing MlsProposals ({} proposals)", proposals.len());
                                         if proposals.is_empty() {
-                                            info!("DAVE: Empty proposal data, sending EncryptionReady");
+                                            info!("DAVE: Empty proposal data, acknowledging");
                                             send_encryption_ready!();
                                             continue;
                                         }
@@ -511,15 +506,20 @@ impl CoreDriver {
                                                             send_bin!(28, payload);
                                                             info!("DAVE: → OP 28 CommitWelcome sent");
 
-                                                            let uid = s.user_id;
-                                                            info!("DAVE: Exporting own key after commit (user_id={})", uid);
-                                                            match s.export_sender_keys(&[uid]) {
-                                                                Ok(keys) if keys.contains_key(&uid) => {
-                                                                    info!("DAVE: ✅ Own key exported (post-commit, new epoch)");
+                                                            // BUG FIX: Export keys for ALL group members,
+                                                            // not just the bot's own user ID.
+                                                            // Without this, decrypt_from_sender() returns
+                                                            // NoSenderKey for every other participant,
+                                                            // silently dropping all incoming audio.
+                                                            let member_ids = s.group_member_ids();
+                                                            info!("DAVE: Exporting keys for {} group members (post-commit)", member_ids.len());
+                                                            match s.export_sender_keys(&member_ids) {
+                                                                Ok(keys) if keys.contains_key(&s.user_id) => {
+                                                                    info!("DAVE: ✅ All member keys exported (post-commit, {} keys)", keys.len());
                                                                     mark_dave_ready!();
                                                                 }
                                                                 Ok(keys) => {
-                                                                    error!("DAVE: ❌ Missing own key after commit (got {} keys)", keys.len());
+                                                                    error!("DAVE: ❌ Missing own key after commit (exported {} keys)", keys.len());
                                                                 }
                                                                 Err(e) => error!("DAVE: ❌ Export failed after commit: {:?}", e),
                                                             }
@@ -549,8 +549,7 @@ impl CoreDriver {
                                         match s.join_group(&w.welcome_bytes) {
                                             Ok(()) => {
                                                 info!("DAVE: ✅ Joined group via Welcome");
-                                                let is_est = s.is_established();
-                                                info!("DAVE: Group established: {}", is_est);
+                                                info!("DAVE: Group established: {}", s.is_established());
                                             }
                                             Err(e) => {
                                                 error!("DAVE: ❌ join_group failed: {:?}", e);
@@ -558,15 +557,19 @@ impl CoreDriver {
                                             }
                                         }
 
-                                        let uid = s.user_id;
-                                        info!("DAVE: Exporting own key after Welcome (user_id={})", uid);
-                                        match s.export_sender_keys(&[uid]) {
-                                            Ok(keys) if keys.contains_key(&uid) => {
-                                                info!("DAVE: ✅ Own key exported (Welcome)");
+                                        // BUG FIX: Export keys for ALL group members, not just own.
+                                        // This is the primary fix for "no sound from Discord voice":
+                                        // every participant's sender key must be stored so that
+                                        // decrypt_from_sender(uid, frame) can succeed for each speaker.
+                                        let member_ids = s.group_member_ids();
+                                        info!("DAVE: Exporting keys for {} group members (Welcome)", member_ids.len());
+                                        match s.export_sender_keys(&member_ids) {
+                                            Ok(keys) if keys.contains_key(&s.user_id) => {
+                                                info!("DAVE: ✅ All member keys exported (Welcome, {} keys)", keys.len());
                                                 mark_dave_ready!();
                                             }
                                             Ok(keys) => {
-                                                error!("DAVE: ❌ Missing own key after welcome (got {} keys)", keys.len());
+                                                error!("DAVE: ❌ Missing own key after welcome (exported {} keys)", keys.len());
                                             }
                                             Err(e) => error!("DAVE: ❌ Export failed after welcome: {:?}", e),
                                         }
@@ -597,14 +600,18 @@ impl CoreDriver {
                                         ).unwrap_or_default());
                                         info!("DAVE: → OP 23 ReadyForTransition (commit tid={})", c.transition_id);
 
-                                        let uid = s.user_id;
-                                        info!("DAVE: Refreshing own key after epoch advance (user_id={})", uid);
-                                        if let Ok(keys) = s.export_sender_keys(&[uid]) {
-                                            if keys.contains_key(&uid) {
-                                                info!("DAVE: ✅ Own key refreshed (epoch advance)");
+                                        // BUG FIX: After an epoch advance, refresh keys for ALL
+                                        // group members. The old epoch's keys are now invalid;
+                                        // failing to rotate them for other users causes every
+                                        // subsequent decrypt_from_sender() to use a stale key and fail.
+                                        let member_ids = s.group_member_ids();
+                                        info!("DAVE: Refreshing keys for {} members after epoch advance", member_ids.len());
+                                        if let Ok(keys) = s.export_sender_keys(&member_ids) {
+                                            if keys.contains_key(&s.user_id) {
+                                                info!("DAVE: ✅ All member keys refreshed (epoch advance, {} keys)", keys.len());
                                                 mark_dave_ready!();
                                             } else {
-                                                error!("DAVE: ❌ Missing own key after epoch advance (got {} keys)", keys.len());
+                                                error!("DAVE: ❌ Missing own key after epoch advance (exported {} keys)", keys.len());
                                             }
                                         }
 

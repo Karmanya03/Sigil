@@ -66,15 +66,28 @@ async fn get_available_formats(query: &str) -> Result<Vec<serde_json::Value>, Bo
         "--no-playlist",
         "-F",
         "--no-warnings",
-        "--no-check-certificates",
-        // Add user-agent to avoid bot detection
-        "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        // Add referer for YouTube
+        // Add comprehensive headers to bypass bot detection
+        "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
         "--referer", "https://www.youtube.com/",
+        // Add additional headers that real browsers send
+        "--add-header", "Accept-Language:en-US,en;q=0.9",
+        "--add-header", "Accept:text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+        "--add-header", "Accept-Encoding:gzip, deflate, br",
+        "--add-header", "Sec-Fetch-Dest:document",
+        "--add-header", "Sec-Fetch-Mode:navigate",
+        "--add-header", "Sec-Fetch-Site:none",
+        "--add-header", "Sec-Fetch-User:?1",
+        "--add-header", "Upgrade-Insecure-Requests:1",
+        // Resilience and timeout settings
+        "--extractor-retries", "3",
+        "--socket-timeout", "30",
+        // YouTube-specific optimizations - use android client for better reliability
+        "--extractor-args", "youtube:player_client=android,web",
     ]);
 
     if let Some(cookie_path) = get_cookies_file_path() {
         cmd.arg("--cookies").arg(&cookie_path);
+        info!("Using cookies from: {}", cookie_path);
     }
     cmd.arg(query);
 
@@ -118,73 +131,157 @@ fn pick_best_audio(
     };
 
     if let Some(formats) = entry.get("formats").and_then(|f| f.as_array()) {
+        // Helper function to safely check if a format has a valid URL
+        let has_valid_url = |f: &serde_json::Value| -> bool {
+            f.get("url")
+                .and_then(|u| u.as_str())
+                .map(|u| !u.is_empty() && (u.starts_with("http://") || u.starts_with("https://")))
+                .unwrap_or(false)
+        };
+
+        // Helper function to check if format is audio-only
+        let is_audio_only = |f: &serde_json::Value| -> bool {
+            let vcodec = f.get("vcodec").and_then(|v| v.as_str()).unwrap_or("");
+            let acodec = f.get("acodec").and_then(|v| v.as_str()).unwrap_or("none");
+            
+            // Audio-only if: vcodec is "none" or missing/empty, AND acodec is not "none"
+            let no_video = vcodec == "none" || vcodec.is_empty();
+            let has_audio = acodec != "none" && !acodec.is_empty();
+            
+            no_video && has_audio
+        };
+
+        // Helper function to get bitrate for sorting
+        let get_bitrate = |f: &serde_json::Value| -> f64 {
+            // Try abr (audio bitrate) first, then tbr (total bitrate), then asr (audio sample rate as proxy)
+            f.get("abr")
+                .and_then(|v| v.as_f64())
+                .or_else(|| f.get("tbr").and_then(|v| v.as_f64()))
+                .or_else(|| f.get("asr").and_then(|v| v.as_f64()).map(|asr| asr / 1000.0))
+                .unwrap_or(0.0)
+        };
+
+        // Helper function to prefer webm/m4a formats
+        let format_preference_score = |f: &serde_json::Value| -> i32 {
+            let ext = f.get("ext").and_then(|e| e.as_str()).unwrap_or("");
+            let acodec = f.get("acodec").and_then(|a| a.as_str()).unwrap_or("");
+            
+            // Prefer webm (opus) and m4a (aac) for audio quality and compatibility
+            if ext == "webm" || acodec.contains("opus") {
+                return 3;
+            }
+            if ext == "m4a" || acodec.contains("aac") || acodec.contains("m4a") {
+                return 2;
+            }
+            if !ext.is_empty() {
+                return 1;
+            }
+            0
+        };
+
+        // First pass: Try to find audio-only formats (highest priority)
         let mut audio_only: Vec<&serde_json::Value> = formats
             .iter()
-            .filter(|f| {
-                let vcodec = f.get("vcodec").and_then(|v| v.as_str()).unwrap_or("");
-                let acodec = f.get("acodec").and_then(|v| v.as_str()).unwrap_or("none");
-                let has_url = f.get("url").and_then(|u| u.as_str())
-                    .map(|u| !u.is_empty() && u.starts_with("http"))
-                    .unwrap_or(false);
-                (vcodec == "none" || vcodec.is_empty()) && acodec != "none" && has_url
-            })
+            .filter(|f| has_valid_url(f) && is_audio_only(f))
             .collect();
 
-        audio_only.sort_by(|a, b| {
-            let abr_a = a.get("abr").and_then(|v| v.as_f64())
-                .or_else(|| a.get("tbr").and_then(|v| v.as_f64()))
-                .unwrap_or(0.0);
-            let abr_b = b.get("abr").and_then(|v| v.as_f64())
-                .or_else(|| b.get("tbr").and_then(|v| v.as_f64()))
-                .unwrap_or(0.0);
-            abr_b.partial_cmp(&abr_a).unwrap_or(std::cmp::Ordering::Equal)
-        });
+        if !audio_only.is_empty() {
+            // Sort by format preference, then by bitrate
+            audio_only.sort_by(|a, b| {
+                let pref_cmp = format_preference_score(b).cmp(&format_preference_score(a));
+                if pref_cmp != std::cmp::Ordering::Equal {
+                    return pref_cmp;
+                }
+                let abr_a = get_bitrate(a);
+                let abr_b = get_bitrate(b);
+                abr_b.partial_cmp(&abr_a).unwrap_or(std::cmp::Ordering::Equal)
+            });
 
-        if let Some(best) = audio_only.first() {
-            let url = best.get("url").unwrap().as_str().unwrap().to_string();
-            let headers = best.get("http_headers")
-                .or_else(|| entry.get("http_headers"))
-                .cloned()
-                .unwrap_or(serde_json::Value::Null);
-            return Some((url, headers));
+            if let Some(best) = audio_only.first() {
+                // Safe extraction with defensive checks
+                if let Some(url_str) = best.get("url").and_then(|u| u.as_str()) {
+                    let url = url_str.to_string();
+                    let headers = best.get("http_headers")
+                        .or_else(|| entry.get("http_headers"))
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+                    
+                    debug!("Selected audio-only format: ext={}, acodec={}, bitrate={}", 
+                        best.get("ext").and_then(|e| e.as_str()).unwrap_or("unknown"),
+                        best.get("acodec").and_then(|a| a.as_str()).unwrap_or("unknown"),
+                        get_bitrate(best));
+                    
+                    return Some((url, headers));
+                }
+            }
         }
 
+        // Second pass: Try formats with audio (may include video)
         let mut with_audio: Vec<&serde_json::Value> = formats
             .iter()
             .filter(|f| {
                 let acodec = f.get("acodec").and_then(|v| v.as_str()).unwrap_or("none");
-                let has_url = f.get("url").and_then(|u| u.as_str())
-                    .map(|u| !u.is_empty() && u.starts_with("http"))
-                    .unwrap_or(false);
-                acodec != "none" && has_url
+                let has_audio = acodec != "none" && !acodec.is_empty();
+                has_valid_url(f) && has_audio
             })
             .collect();
 
-        with_audio.sort_by(|a, b| {
-            let abr_a = a.get("abr").and_then(|v| v.as_f64())
-                .or_else(|| a.get("tbr").and_then(|v| v.as_f64()))
-                .unwrap_or(0.0);
-            let abr_b = b.get("abr").and_then(|v| v.as_f64())
-                .or_else(|| b.get("tbr").and_then(|v| v.as_f64()))
-                .unwrap_or(0.0);
-            abr_b.partial_cmp(&abr_a).unwrap_or(std::cmp::Ordering::Equal)
-        });
+        if !with_audio.is_empty() {
+            with_audio.sort_by(|a, b| {
+                let pref_cmp = format_preference_score(b).cmp(&format_preference_score(a));
+                if pref_cmp != std::cmp::Ordering::Equal {
+                    return pref_cmp;
+                }
+                let abr_a = get_bitrate(a);
+                let abr_b = get_bitrate(b);
+                abr_b.partial_cmp(&abr_a).unwrap_or(std::cmp::Ordering::Equal)
+            });
 
-        if let Some(best) = with_audio.first() {
-            let url = best.get("url").unwrap().as_str().unwrap().to_string();
-            let headers = best.get("http_headers")
-                .or_else(|| entry.get("http_headers"))
-                .cloned()
-                .unwrap_or(serde_json::Value::Null);
-            return Some((url, headers));
+            if let Some(best) = with_audio.first() {
+                if let Some(url_str) = best.get("url").and_then(|u| u.as_str()) {
+                    let url = url_str.to_string();
+                    let headers = best.get("http_headers")
+                        .or_else(|| entry.get("http_headers"))
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+                    
+                    warn!("Using format with video (no audio-only available): ext={}, acodec={}, vcodec={}", 
+                        best.get("ext").and_then(|e| e.as_str()).unwrap_or("unknown"),
+                        best.get("acodec").and_then(|a| a.as_str()).unwrap_or("unknown"),
+                        best.get("vcodec").and_then(|v| v.as_str()).unwrap_or("unknown"));
+                    
+                    return Some((url, headers));
+                }
+            }
+        }
+
+        // Third pass: Try any format with a valid URL (last resort)
+        for format in formats.iter() {
+            if has_valid_url(format) {
+                if let Some(url_str) = format.get("url").and_then(|u| u.as_str()) {
+                    let url = url_str.to_string();
+                    let headers = format.get("http_headers")
+                        .or_else(|| entry.get("http_headers"))
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null);
+                    
+                    warn!("Using fallback format (no audio codec info): ext={}", 
+                        format.get("ext").and_then(|e| e.as_str()).unwrap_or("unknown"));
+                    
+                    return Some((url, headers));
+                }
+            }
         }
     }
 
+    // Final fallback: Check if entry itself has a direct URL
     if let Some(url) = entry.get("url").and_then(|u| u.as_str()) {
-        if !url.is_empty() && url.starts_with("http") {
+        if !url.is_empty() && (url.starts_with("http://") || url.starts_with("https://")) {
             let headers = entry.get("http_headers")
                 .cloned()
                 .unwrap_or(serde_json::Value::Null);
+            
+            debug!("Using direct URL from entry");
             return Some((url.to_string(), headers));
         }
     }
@@ -222,17 +319,30 @@ impl YtDlpSource {
             "--no-playlist",
             "-J",
             "--no-warnings",
-            "--no-check-certificates",
-            // Add user-agent to avoid bot detection
-            "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            // Add referer for YouTube
+            // Add comprehensive headers to bypass bot detection
+            "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36",
             "--referer", "https://www.youtube.com/",
+            // Add additional headers that real browsers send
+            "--add-header", "Accept-Language:en-US,en;q=0.9",
+            "--add-header", "Accept:text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+            "--add-header", "Accept-Encoding:gzip, deflate, br",
+            "--add-header", "Sec-Fetch-Dest:document",
+            "--add-header", "Sec-Fetch-Mode:navigate",
+            "--add-header", "Sec-Fetch-Site:none",
+            "--add-header", "Sec-Fetch-User:?1",
+            "--add-header", "Upgrade-Insecure-Requests:1",
+            // Resilience and timeout settings
+            "--extractor-retries", "3",
+            "--socket-timeout", "30",
+            // YouTube-specific optimizations - use android client for better reliability
+            "--extractor-args", "youtube:player_client=android,web",
             // Extract audio format explicitly
             "-f", "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best",
         ]);
 
         if let Some(cookie_path) = get_cookies_file_path() {
             cmd.arg("--cookies").arg(&cookie_path);
+            info!("Using cookies from: {}", cookie_path);
         }
         cmd.arg(&resolved);
 

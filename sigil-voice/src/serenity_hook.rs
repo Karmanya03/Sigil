@@ -7,8 +7,16 @@
 /// # Setup
 ///
 /// ```rust,no_run
-/// use sigil_voice::serenity_hook::SigilVoiceManager;
+/// use sigil_voice::serenity_hook::{SigilVoiceManager, SigilVoiceManagerKey};
+/// use serenity::all::GatewayIntents;
+/// use serenity::async_trait;
+/// use serenity::prelude::*;
 /// use std::sync::Arc;
+///
+/// struct MyHandler;
+///
+/// #[async_trait]
+/// impl EventHandler for MyHandler {}
 ///
 /// #[tokio::main]
 /// async fn main() {
@@ -29,9 +37,15 @@
 /// # Joining/Leaving
 ///
 /// ```rust,no_run
-/// let data = ctx.data.read().await;
-/// let mgr = data.get::<SigilVoiceManagerKey>().unwrap();
-/// mgr.join(guild_id, channel_id).await;
+/// use sigil_voice::serenity_hook::SigilVoiceManagerKey;
+/// use serenity::all::{ChannelId, GuildId};
+/// use serenity::prelude::*;
+///
+/// async fn example(ctx: &Context, guild_id: GuildId, channel_id: ChannelId) {
+///     let data = ctx.data.read().await;
+///     let mgr = data.get::<SigilVoiceManagerKey>().unwrap();
+///     mgr.join(guild_id, channel_id).await;
+/// }
 /// ```
 use futures::channel::mpsc::UnboundedSender;
 use serenity::async_trait;
@@ -409,9 +423,15 @@ impl VoiceGatewayManager for SigilVoiceManager {
 /// Key for accessing `SigilVoiceManager` from `ctx.data`.
 ///
 /// ```rust,no_run
-/// let data = ctx.data.read().await;
-/// let mgr = data.get::<SigilVoiceManagerKey>().unwrap();
-/// mgr.join(guild_id, channel_id).await;
+/// use sigil_voice::serenity_hook::SigilVoiceManagerKey;
+/// use serenity::all::{ChannelId, GuildId};
+/// use serenity::prelude::*;
+///
+/// async fn example(ctx: &Context, guild_id: GuildId, channel_id: ChannelId) {
+///     let data = ctx.data.read().await;
+///     let mgr = data.get::<SigilVoiceManagerKey>().unwrap();
+///     mgr.join(guild_id, channel_id).await;
+/// }
 /// ```
 pub struct SigilVoiceManagerKey;
 impl serenity::prelude::TypeMapKey for SigilVoiceManagerKey {
