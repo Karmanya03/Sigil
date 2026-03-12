@@ -334,7 +334,7 @@ impl DaveGroup {
         self.mls_group
             .members()
             .filter_map(|member| {
-                let identity = member.credential().serialized_content();
+                let identity = member.credential.serialized_content();
                 if identity.len() == 8 {
                     let mut bytes = [0u8; 8];
                     bytes.copy_from_slice(identity);
