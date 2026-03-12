@@ -146,19 +146,26 @@ impl SigilVoiceManager {
     /// Move the bot into `channel_id` in `guild_id`.
     /// Sends Gateway OP 4 via the shard's messenger.
     pub async fn join(&self, guild_id: GuildId, channel_id: ChannelId) {
-        // ── Always disconnect first to nuke any stale Discord-side session ──
-        // Discord's voice SFU keeps sessions alive even after a bot crash/restart.
-        // If we Identify on a voice WS while Discord still holds a session for our
-        // user_id, it closes with 4005 "Already authenticated". Cycling OP 4
-        // (disconnect → wait → reconnect) forces Discord to tear down the stale
-        // session before we try to authenticate a new one.
+        // ── Disconnect-first: clear any stale Discord-side voice session ──
+        // Discord's voice SFU keeps sessions alive even after bot crash/restart.
+        // If we Identify on a voice WS while Discord still holds a session for
+        // our user_id, it closes with 4005 "Already authenticated".
+        // Cycling OP 4 (leave → wait → join) forces Discord to tear down the
+        // stale session before we authenticate a new one.
+        
+        // 1. Tear down any local state for this guild
         self.teardown_guild(guild_id).await;
+        
+        // 2. Tell Discord we're leaving (OP 4 with channel=null)
         self.update_voice_state(guild_id, None).await;
-        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
-
-        // Track the channel for auto-reconnect
+        
+        // 3. Wait for Discord to fully tear down the old voice session on the SFU.
+        //    500ms is NOT enough — Discord needs ~1.5s to propagate the disconnect
+        //    to the voice server and clean up the session entry.
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        
+        // 4. Now join fresh
         self.last_channel.lock().await.insert(guild_id, channel_id);
-        // Reset reconnect counter on fresh user-initiated join
         self.reconnect_count.lock().await.remove(&guild_id);
         self.update_voice_state(guild_id, Some(channel_id)).await;
     }
