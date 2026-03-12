@@ -118,13 +118,31 @@ impl DaveGroup {
     /// via `store_pending_proposal(provider.storage(), ...)` so that
     /// `has_pending_proposals()` returns `true` and
     /// `commit_to_pending_proposals()` actually has something to commit.
+    ///
+    /// # Return value
+    ///
+    /// Returns `Ok(true)` if Discord sent proposals that could not be
+    /// deserialized (e.g. custom type 16). The caller **must** respond with
+    /// an empty commit via [`Self::commit_empty`] so that the MLS epoch
+    /// advances and Discord delivers the epoch key. Without this commit,
+    /// Discord never sends the key and DAVE times out.
+    ///
+    /// Returns `Ok(false)` when every proposal was either processed
+    /// successfully or was genuinely empty/padding — no empty commit needed.
     pub fn process_proposals(
         &mut self,
         proposals_bytes: &[Vec<u8>],
         provider: &OpenMlsRustCrypto,
-    ) -> Result<(), SigilError> {
+    ) -> Result<bool, SigilError> {
         let mut processed_count = 0u32;
         let mut skipped_count = 0u32;
+        // Tracks non-empty proposals that failed to deserialize.
+        // These are Discord custom types (e.g. type 16) that OpenMLS does not
+        // know about. Even though we cannot store them as pending proposals,
+        // Discord still expects us to send a commit to advance the epoch and
+        // unlock the epoch key delivery. The caller uses this flag to decide
+        // whether to call commit_empty().
+        let mut had_unrecognized_nonempty = false;
 
         for (i, proposal_data) in proposals_bytes.iter().enumerate() {
             if proposal_data.is_empty() {
@@ -137,10 +155,16 @@ impl DaveGroup {
                 Ok(msg) => msg,
                 Err(e) => {
                     tracing::debug!(
-                        "Skipping unrecognized proposal at index {} (deserialize): {} [first bytes: {:02x?}]",
-                        i, e, &proposal_data[..proposal_data.len().min(8)]
+                        "Skipping unrecognized proposal at index {} (deserialize): {} \
+                         [first bytes: {:02x?}] — will need empty commit to unblock epoch",
+                        i,
+                        e,
+                        &proposal_data[..proposal_data.len().min(8)]
                     );
                     skipped_count += 1;
+                    // Non-empty but undeserializable → Discord custom type.
+                    // Signal to the caller that an empty commit is required.
+                    had_unrecognized_nonempty = true;
                     continue;
                 }
             };
@@ -150,6 +174,7 @@ impl DaveGroup {
                 Err(e) => {
                     tracing::debug!("Skipping non-protocol proposal at index {}: {}", i, e);
                     skipped_count += 1;
+                    had_unrecognized_nonempty = true;
                     continue;
                 }
             };
@@ -158,41 +183,59 @@ impl DaveGroup {
                 Ok(processed_msg) => {
                     match processed_msg.into_content() {
                         ProcessedMessageContent::ProposalMessage(staged_proposal) => {
-                            // OpenMLS 0.6.0 requires storage provider as first arg
-                            let _ = self.mls_group.store_pending_proposal(provider.storage(), *staged_proposal);
+                            // OpenMLS 0.6.0 requires storage provider as first arg.
+                            let _ = self
+                                .mls_group
+                                .store_pending_proposal(provider.storage(), *staged_proposal);
                             processed_count += 1;
                             tracing::debug!(
                                 "Stored pending proposal at index {} (total pending: {})",
-                                i, processed_count
+                                i,
+                                processed_count
                             );
                         }
                         ProcessedMessageContent::StagedCommitMessage(_) => {
                             tracing::debug!(
-                                "Received commit as proposal at index {} -- unexpected but not fatal", i
+                                "Received commit as proposal at index {} — unexpected but not fatal",
+                                i
                             );
                             processed_count += 1;
                         }
                         other => {
                             tracing::debug!(
-                                "Proposal at index {} yielded unexpected content type: {:?}", i,
+                                "Proposal at index {} yielded unexpected content type: {:?}",
+                                i,
                                 std::mem::discriminant(&other)
                             );
                         }
                     }
                 }
                 Err(e) => {
-                    tracing::debug!("Skipping proposal at index {} that failed processing: {}", i, e);
+                    tracing::debug!(
+                        "Skipping proposal at index {} that failed processing: {}",
+                        i,
+                        e
+                    );
                     skipped_count += 1;
+                    had_unrecognized_nonempty = true;
                     continue;
                 }
             }
         }
 
         tracing::info!(
-            "process_proposals: {} processed, {} skipped out of {} total",
-            processed_count, skipped_count, proposals_bytes.len()
+            "process_proposals: {} processed, {} skipped out of {} total \
+             (needs_empty_commit={})",
+            processed_count,
+            skipped_count,
+            proposals_bytes.len(),
+            had_unrecognized_nonempty && processed_count == 0,
         );
-        Ok(())
+
+        // Only signal "needs empty commit" when we have NO processable pending
+        // proposals AND Discord sent us something non-empty that we couldn't
+        // handle. If we stored real proposals, commit_pending() covers it.
+        Ok(had_unrecognized_nonempty && processed_count == 0)
     }
 
     /// Check if there are pending proposals waiting to be committed.
@@ -230,6 +273,58 @@ impl DaveGroup {
             .transpose()?;
 
         Ok((commit_bytes, welcome_bytes))
+    }
+
+    /// Create an **empty** commit (no pending proposals).
+    ///
+    /// Discord's DAVE handshake sends a custom proposal type (type 16) that
+    /// OpenMLS cannot deserialize. Because we skip it, no proposals are stored
+    /// and `commit_to_pending_proposals` would be a no-op.
+    ///
+    /// However, Discord still requires us to send *a* commit so that:
+    /// 1. The MLS epoch advances on both sides.
+    /// 2. Discord knows we have processed (or acknowledged) the proposal batch.
+    /// 3. Discord then delivers the epoch key, unblocking DAVE E2EE.
+    ///
+    /// Call this when `process_proposals` returns `Ok(true)` AND
+    /// `has_pending_proposals()` is `false`.
+    ///
+    /// After sending the commit bytes over the wire the caller must also call
+    /// `merge_own_pending_commit` to advance the local epoch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SigilError::Mls`] if the empty commit cannot be created or
+    /// serialized.
+    pub fn commit_empty(
+        &mut self,
+        provider: &OpenMlsRustCrypto,
+        signer: &openmls_basic_credential::SignatureKeyPair,
+    ) -> Result<Vec<u8>, SigilError> {
+        tracing::info!(
+            "DAVE: creating empty commit to advance epoch past unrecognized proposals \
+             (current epoch={})",
+            self.current_epoch
+        );
+
+        // commit_to_pending_proposals with an empty pending list produces a
+        // valid self-update commit — exactly what Discord needs to advance the
+        // epoch and deliver the key.
+        let (commit, _welcome, _group_info) = self
+            .mls_group
+            .commit_to_pending_proposals(provider, signer)
+            .map_err(|e| SigilError::Mls(format!("empty commit: {}", e)))?;
+
+        let commit_bytes = commit
+            .tls_serialize_detached()
+            .map_err(|e| SigilError::Mls(format!("empty commit serialize: {}", e)))?;
+
+        tracing::info!(
+            "DAVE: empty commit created ({} bytes) — merge after sending",
+            commit_bytes.len()
+        );
+
+        Ok(commit_bytes)
     }
 
     /// Process an incoming commit message and advance the epoch.
