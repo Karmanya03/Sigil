@@ -198,19 +198,14 @@ impl CoreDriver {
             }
 
             macro_rules! send_encryption_ready {
-                () => {{
-                    if !encryption_ready_sent {
-                        send_text!(12, serde_json::json!({
-                            "audio_ssrc": my_ssrc,
-                            "video_ssrc": 0,
-                            "rtx_ssrc": 0,
-                            "encryption_ready": true
-                        }));
-                        encryption_ready_sent = true;
-                        info!("DAVE: → OP 12 EncryptionReady");
-                    }
-                }};
-            }
+    () => {{
+        if !encryption_ready_sent {
+            send_text!(12, serde_json::json!({}));
+            encryption_ready_sent = true;
+            info!("DAVE: → OP 12 EncryptionReady");
+        }
+    }};
+}
 
             macro_rules! mark_dave_ready {
                 () => {{
