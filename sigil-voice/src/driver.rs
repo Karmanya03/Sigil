@@ -198,14 +198,19 @@ impl CoreDriver {
             }
 
             macro_rules! send_encryption_ready {
-    () => {{
-        if !encryption_ready_sent {
-            send_text!(12, serde_json::json!({}));
-            encryption_ready_sent = true;
-            info!("DAVE: → OP 12 EncryptionReady");
-        }
-    }};
-}
+                () => {{
+                    if !encryption_ready_sent {
+                        send_text!(12, serde_json::json!({
+                            "audio_ssrc": my_ssrc,
+                            "video_ssrc": 0,
+                            "rtx_ssrc": 0,
+                            "encryption_ready": true
+                        }));
+                        encryption_ready_sent = true;
+                        info!("DAVE: → OP 12 EncryptionReady");
+                    }
+                }};
+            }
 
             macro_rules! mark_dave_ready {
                 () => {{
@@ -478,7 +483,6 @@ impl CoreDriver {
                                         info!("DAVE: Processing MlsProposals ({} proposals, tid={})", proposals.len(), transition_id);
                                         if proposals.is_empty() {
                                             info!("DAVE: Empty proposal data, acknowledging");
-                                            send_encryption_ready!();
                                             continue;
                                         }
 
@@ -519,11 +523,9 @@ impl CoreDriver {
                                                                 Err(e) => error!("DAVE: ❌ Export failed after commit: {:?}", e),
                                                             }
 
-                                                            send_encryption_ready!();
                                                         }
                                                         Err(e) => {
                                                             error!("DAVE: ❌ commit_and_welcome failed: {:?}", e);
-                                                            send_encryption_ready!();
                                                         }
                                                     }
                                                 } else {
@@ -556,28 +558,23 @@ impl CoreDriver {
                                                                 Ok(keys) if keys.contains_key(&s.user_id) => {
                                                                     info!("DAVE: ✅ Keys exported after self-update ({} keys)", keys.len());
                                                                     mark_dave_ready!();
-                                                                    send_encryption_ready!();
                                                                 }
                                                                 Ok(keys) => {
                                                                     info!("DAVE: Keys exported ({} keys), waiting for OP 29", keys.len());
-                                                                    send_encryption_ready!();
                                                                 }
                                                                 Err(e) => {
                                                                     warn!("DAVE: Key export after self-update failed: {:?}", e);
-                                                                    send_encryption_ready!();
                                                                 }
                                                             }
                                                         }
                                                         Err(e) => {
                                                             warn!("DAVE: Self-update commit failed: {:?} — acknowledging anyway", e);
-                                                            send_encryption_ready!();
                                                         }
                                                     }
                                                 }
                                             }
                                             Err(e) => {
                                                 error!("DAVE: ❌ process_proposals failed: {:?}", e);
-                                                send_encryption_ready!();
                                             }
                                         }
                                     }
