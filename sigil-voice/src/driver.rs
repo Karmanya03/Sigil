@@ -485,44 +485,55 @@ impl CoreDriver {
                                                         }
                                                     }
                                                 } else {
-                                                    // No processable proposals: send self-update commit
-                                                    info!("DAVE: No processable proposals — sending self-update commit with tid={} to unblock epoch", transition_id);
+                                                    // ── All proposals skipped (MLS group ID mismatch) ────────
+                                                    //
+                                                    // The voice server sent us proposals that belong to a
+                                                    // DIFFERENT MLS group than the one we just created.
+                                                    // This happens when the server's DAVE state is out of sync
+                                                    // with our freshly-initialised SigilSession.
+                                                    //
+                                                    // CRITICAL FIX — do NOT send OP 28 to Discord:
+                                                    //   Previously we sent a self-update commit (OP 28) here to
+                                                    //   "unblock the epoch". But sending a commit that references
+                                                    //   the wrong MLS group corrupts the voice server's DAVE
+                                                    //   group state. Discord then closes the connection with 4006,
+                                                    //   and because the group state is now tainted on the server
+                                                    //   side, every subsequent reconnect attempt using the same
+                                                    //   gateway session_id also gets killed with 4006 — even with
+                                                    //   fresh tokens and multi-second delays.
+                                                    //
+                                                    //   By advancing our LOCAL MLS state (so sigil_discord stays
+                                                    //   consistent) but NOT sending OP 28 to the wire, we avoid
+                                                    //   poisoning the server's group state. We send only OP 23
+                                                    //   (ReadyForTransition) and do NOT send OP 12
+                                                    //   (EncryptionReady), signalling to Discord that we are not
+                                                    //   yet ready to encrypt. Discord will then either:
+                                                    //     a) Re-send OP 27 proposals for the correct group, or
+                                                    //     b) Send OP 24 PrepareEpoch to restart the handshake.
+                                                    info!("DAVE: All proposals skipped (group ID mismatch, tid={}) — \
+                                                           advancing local MLS state only, NOT sending OP 28", transition_id);
+
+                                                    // Advance sigil_discord's internal state to keep it consistent,
+                                                    // but discard the commit bytes — do NOT send them to Discord.
                                                     match s.commit_and_welcome() {
-                                                        Ok((commit, welcome)) => {
-                                                            let mut payload = (transition_id as u16)
-                                                                .to_le_bytes()
-                                                                .to_vec();
-                                                            payload.extend_from_slice(&commit);
-                                                            if let Some(w) = welcome {
-                                                                payload.extend_from_slice(&w);
-                                                            }
-                                                            info!("DAVE: Sending OP 28 self-update ({} bytes, tid={})", payload.len(), transition_id);
-                                                            send_bin!(28, &payload);
-                                                            info!("DAVE: → OP 28 self-update CommitWelcome sent (tid={})", transition_id);
-
-                                                            // Send OP 23 ReadyForTransition after self-update commit
-                                                            send_bin!(23, &(transition_id as u16).to_le_bytes());
-                                                            info!("DAVE: → OP 23 ReadyForTransition (binary, self-update tid={})", transition_id);
-
-                                                            let member_ids = s.group_member_ids();
-                                                            match s.export_sender_keys(&member_ids) {
-                                                                Ok(keys) if keys.contains_key(&s.user_id) => {
-                                                                    info!("DAVE: ✅ Keys exported after self-update ({} keys)", keys.len());
-                                                                    mark_dave_ready!();
-                                                                    send_encryption_ready!();
-                                                                }
-                                                                Ok(keys) => {
-                                                                    info!("DAVE: Keys exported ({} keys), waiting for OP 29", keys.len());
-                                                                }
-                                                                Err(e) => {
-                                                                    warn!("DAVE: Key export after self-update failed: {:?}", e);
-                                                                }
-                                                            }
+                                                        Ok((commit, _welcome)) => {
+                                                            info!("DAVE: ✅ Local MLS epoch advanced ({} commit bytes, kept local)", commit.len());
                                                         }
                                                         Err(e) => {
-                                                            warn!("DAVE: Self-update commit failed: {:?} — acknowledging anyway", e);
+                                                            warn!("DAVE: Local self-update failed: {:?} — continuing without epoch advance", e);
                                                         }
                                                     }
+
+                                                    // Send OP 23 to acknowledge the transition without committing.
+                                                    send_bin!(23, &(transition_id as u16).to_le_bytes());
+                                                    info!("DAVE: → OP 23 ReadyForTransition (no OP 28, awaiting correct group proposals, tid={})", transition_id);
+
+                                                    // Do NOT call send_encryption_ready!() here.
+                                                    // OP 12 (EncryptionReady) must only be sent once DAVE keys are
+                                                    // established via a proper group membership (OP 29 commit or
+                                                    // OP 30 Welcome). Sending it now with a mismatched group state
+                                                    // would trigger an immediate 4006 from the voice server.
+                                                    info!("DAVE: ⏳ Waiting for Discord to send correct group proposals or PrepareEpoch");
                                                 }
                                             }
                                             Err(e) => {
