@@ -1,7 +1,7 @@
 use futures_util::{SinkExt, StreamExt};
 use sigil_discord::SigilSession;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex, Notify};
 use tracing::{info, warn, error, debug};
@@ -45,6 +45,13 @@ pub struct CoreDriver {
     pub dave_ready: Arc<AtomicBool>,
     pub dave_notify: Arc<Notify>,
     pub ws_alive: Arc<AtomicBool>,
+    /// The WS close code received from Discord (0 = not yet closed / no close frame).
+    /// Used by the liveness watchdog to decide whether to auto-reconnect:
+    ///   4006 = session expired          → recoverable, re-send OP4
+    ///   4014 = disconnected by server   → recoverable, re-send OP4
+    ///   4015 = voice server crashed     → recoverable, re-send OP4
+    ///   4005 = already authenticated    → NOT recoverable without full leave/join cycle
+    pub ws_close_code: Arc<AtomicU16>,
     pub frames_sent: Arc<AtomicU64>,
     pub shutdown: Arc<AtomicBool>,
 }
@@ -71,6 +78,7 @@ impl CoreDriver {
         let dave_ready = Arc::new(AtomicBool::new(false));
         let dave_notify = Arc::new(Notify::new());
         let ws_alive = Arc::new(AtomicBool::new(true));
+        let ws_close_code = Arc::new(AtomicU16::new(0));
         let shutdown = Arc::new(AtomicBool::new(false));
         info!("✅ 1/7 SigilSession created");
 
@@ -150,6 +158,7 @@ impl CoreDriver {
         let dave_ready_clone = dave_ready.clone();
         let dave_notify_clone = dave_notify.clone();
         let ws_alive_clone = ws_alive.clone();
+        let ws_close_code_clone = ws_close_code.clone();
         let shutdown_clone = shutdown.clone();
         let my_ssrc = ready.ssrc;
 
@@ -593,7 +602,13 @@ impl CoreDriver {
 
                             tokio_tungstenite::tungstenite::Message::Close(frame) => {
                                 if let Some(f) = frame {
-                                    warn!("Voice WS closed: code={}, reason={}", f.code, f.reason);
+                                    // FIX: Store the numeric close code atomically so the
+                                    // liveness watchdog in serenity_hook can read it and
+                                    // decide whether to auto-reconnect (4006/4014/4015) or
+                                    // require a manual $join (4005 / unexpected codes).
+                                    let code: u16 = u16::from(f.code);
+                                    warn!("Voice WS closed: code={}, reason={}", code, f.reason);
+                                    ws_close_code_clone.store(code, Ordering::Release);
                                 } else {
                                     warn!("Voice WS closed (no close frame)");
                                 }
@@ -626,6 +641,7 @@ impl CoreDriver {
             dave_ready,
             dave_notify,
             ws_alive,
+            ws_close_code,
             frames_sent: Arc::new(AtomicU64::new(0)),
             shutdown,
         })
@@ -651,6 +667,12 @@ impl CoreDriver {
 
     pub fn is_ws_alive(&self) -> bool {
         self.ws_alive.load(Ordering::Acquire)
+    }
+
+    /// Returns the WS close code last received from Discord.
+    /// 0 means the connection is still open or closed without a close frame.
+    pub fn ws_close_code(&self) -> u16 {
+        self.ws_close_code.load(Ordering::Acquire)
     }
 
     /// Audio engine loop — 20ms tick.

@@ -52,7 +52,7 @@ use serenity::async_trait;
 use serenity::all::{ChannelId, GuildId, ShardRunnerMessage, UserId};
 use serenity::gateway::VoiceGatewayManager;
 use serenity::model::voice::VoiceState;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio_tungstenite::tungstenite::Message as WsMessage;
@@ -114,6 +114,13 @@ pub struct SigilVoiceManager {
     last_channel: Arc<Mutex<HashMap<GuildId, ChannelId>>>,
     /// guild_id → number of consecutive reconnect attempts
     reconnect_count: Arc<Mutex<HashMap<GuildId, u8>>>,
+    /// guilds currently in the leave→join transition window.
+    ///
+    /// While a guild is in this set, `check_and_connect` is suppressed so that
+    /// stale VOICE_SERVER_UPDATEs arriving during the leave→sleep→join cycle
+    /// cannot trigger a connection with a soon-to-be-invalidated session_id,
+    /// which is what causes the 4006 "Session is no longer valid" close.
+    transitioning: Arc<Mutex<HashSet<GuildId>>>,
 }
 
 /// Maximum consecutive auto-reconnect attempts before giving up.
@@ -124,6 +131,14 @@ const RECONNECT_GAP_MS: u64 = 500;
 
 /// How long to wait after Call insertion to check if driver died immediately.
 const LIVENESS_CHECK_DELAY_MS: u64 = 300;
+
+/// How long to wait after sending OP4 leave before sending OP4 join.
+///
+/// Discord needs time to tear down the old SFU session and stop sending
+/// VOICE_SERVER_UPDATEs for it. 500ms was too short — transitional VSVUs
+/// would arrive during the sleep and trigger a connect with a stale session,
+/// causing a 4006. 1500ms gives the SFU enough time to fully clean up.
+const JOIN_TRANSITION_DELAY_MS: u64 = 1500;
 
 impl Default for SigilVoiceManager {
     fn default() -> Self {
@@ -136,6 +151,7 @@ impl Default for SigilVoiceManager {
             connecting: Arc::new(Mutex::new(HashMap::new())),
             last_channel: Arc::new(Mutex::new(HashMap::new())),
             reconnect_count: Arc::new(Mutex::new(HashMap::new())),
+            transitioning: Arc::new(Mutex::new(HashSet::new())),
         }
     }
 }
@@ -152,19 +168,30 @@ impl SigilVoiceManager {
         // our user_id, it closes with 4005 "Already authenticated".
         // Cycling OP 4 (leave → wait → join) forces Discord to tear down the
         // stale session before we authenticate a new one.
-        
+
         // 1. Tear down any local state for this guild
         self.teardown_guild(guild_id).await;
-        
+
         // 2. Tell Discord we're leaving (OP 4 with channel=null)
         self.update_voice_state(guild_id, None).await;
-        
-        // 3. Wait for Discord to fully tear down the old voice session on the SFU.
+
+        // 3. FIX: Set the transitioning guard BEFORE the sleep so any
+        //    VOICE_SERVER_UPDATEs that arrive during the leave→join window are
+        //    suppressed in check_and_connect(). Without this guard, a stale VSVU
+        //    could trigger a connection using the old (about-to-be-invalidated)
+        //    session_id, which Discord then closes with 4006.
+        self.transitioning.lock().await.insert(guild_id);
+
+        // 4. Wait for Discord to fully tear down the old voice session on the SFU.
         //    500ms is NOT enough — Discord needs ~1.5s to propagate the disconnect
         //    to the voice server and clean up the session entry.
-        tokio::time::sleep(std::time::Duration::from_millis(8000)).await;
-        
-        // 4. Now join fresh
+        tokio::time::sleep(std::time::Duration::from_millis(JOIN_TRANSITION_DELAY_MS)).await;
+
+        // 5. Clear the transitioning guard BEFORE sending the join OP4 so that
+        //    the real VSU + VSVU from the fresh join are allowed to proceed.
+        self.transitioning.lock().await.remove(&guild_id);
+
+        // 6. Now join fresh
         self.last_channel.lock().await.insert(guild_id, channel_id);
         self.reconnect_count.lock().await.remove(&guild_id);
         self.update_voice_state(guild_id, Some(channel_id)).await;
@@ -176,6 +203,8 @@ impl SigilVoiceManager {
         self.teardown_guild(guild_id).await;
         self.last_channel.lock().await.remove(&guild_id);
         self.reconnect_count.lock().await.remove(&guild_id);
+        // Ensure no stale transitioning entry lingers after an explicit leave
+        self.transitioning.lock().await.remove(&guild_id);
     }
 
     /// Retrieve the active `Call` for a guild, if one exists.
@@ -195,6 +224,8 @@ impl SigilVoiceManager {
     // ── Internal helpers ────────────────────────────────────────────────────
 
     /// Full teardown for a guild — stops tracks, removes call, clears state.
+    /// NOTE: does NOT touch `transitioning` — that is managed exclusively by
+    /// `join()` and `leave()` so the guard isn't inadvertently cleared.
     async fn teardown_guild(&self, guild_id: GuildId) {
         // Stop and remove the active call
         if let Some(old_call) = self.calls.lock().await.remove(&guild_id) {
@@ -261,12 +292,28 @@ impl SigilVoiceManager {
     /// Once we have session_id + endpoint + token, bootstrap the CoreDriver.
     ///
     /// FIXES APPLIED:
-    /// 1. Pending lock is scoped in a block and dropped before any further locks.
-    /// 2. Connecting guard is set FIRST, before the active_info dedup check (TOCTOU fix).
-    /// 3. active_info lock is dropped before calls lock (lock-order deadlock fix).
-    /// 4. WS liveness is verified before inserting the Call (dead-call guard).
-    /// 5. Liveness watchdog tears down dead calls but does NOT auto-reconnect.
+    /// 1. Transitioning guard: suppresses connects during the leave→join window
+    ///    to prevent stale VSVUs from triggering a 4006-doomed connection.
+    /// 2. Pending lock is scoped in a block and dropped before any further locks.
+    /// 3. Connecting guard is set FIRST, before the active_info dedup check (TOCTOU fix).
+    /// 4. active_info lock is dropped before calls lock (lock-order deadlock fix).
+    /// 5. WS liveness is verified before inserting the Call (dead-call guard).
+    /// 6. Liveness watchdog auto-reconnects on 4006/4014/4015 by re-sending OP4,
+    ///    and requires manual $join only for 4005 and other non-recoverable codes.
     async fn check_and_connect(&self, guild_id: GuildId) {
+        // FIX: Suppress connections during the leave→join transition window.
+        // Without this guard, a VOICE_SERVER_UPDATE that arrives while join()
+        // is sleeping between the leave OP4 and the join OP4 would race ahead
+        // and connect using a session_id that Discord is about to invalidate.
+        // The resulting connection is immediately killed with code 4006.
+        if self.transitioning.lock().await.contains(&guild_id) {
+            tracing::debug!(
+                "check_and_connect suppressed — guild={} is in leave→join transition",
+                guild_id
+            );
+            return;
+        }
+
         // ── Extract pending args (and drop the lock immediately) ───────────
         let args = {
             let p = self.pending.lock().await;
@@ -296,8 +343,8 @@ impl SigilVoiceManager {
         {
             let mut conn = self.connecting.lock().await;
             if conn.get(&guild_id).copied().unwrap_or(false) {
-            tracing::error!("🚨 DUPLICATE CONNECT BLOCKED for guild={} — connecting guard saved us", guild_id);
-            return;
+                tracing::error!("🚨 DUPLICATE CONNECT BLOCKED for guild={} — connecting guard saved us", guild_id);
+                return;
             }
             conn.insert(guild_id, true);
         }
@@ -352,6 +399,9 @@ impl SigilVoiceManager {
         let active_clone = self.active_info.clone();
         let conn_clone = self.connecting.clone();
         let reconnect_clone = self.reconnect_count.clone();
+        // Cloned for the liveness watchdog auto-reconnect path
+        let shards_clone = self.shards.clone();
+        let last_channel_clone = self.last_channel.clone();
 
         let new_info = ActiveConnectionInfo {
             endpoint: endpoint.clone(),
@@ -401,36 +451,124 @@ impl SigilVoiceManager {
                     // ── Spawn liveness watchdog ────────────────────────────
                     // Catches the case where the WS dies milliseconds AFTER
                     // the is_ws_alive() check above passed (race window).
+                    // FIX: Also reads ws_close_code so recoverable closes
+                    // (4006/4014/4015) auto-reconnect via a fresh OP4 rather
+                    // than requiring a manual $join command.
                     let calls_watch = calls_clone.clone();
                     let active_watch = active_clone.clone();
+                    let shards_watch = shards_clone.clone();
+                    let last_channel_watch = last_channel_clone.clone();
 
                     tokio::spawn(async move {
                         tokio::time::sleep(
                             std::time::Duration::from_millis(LIVENESS_CHECK_DELAY_MS)
                         ).await;
 
-                        let needs_teardown = {
+                        // Read liveness + close code before we potentially remove the call
+                        let (needs_teardown, close_code) = {
                             let calls = calls_watch.lock().await;
                             if let Some(c) = calls.get(&guild_id) {
-                                !c.driver.is_ws_alive()
+                                let dead = !c.driver.is_ws_alive()
                                     && c.driver.frames_sent.load(
                                         std::sync::atomic::Ordering::Relaxed
-                                    ) == 0
+                                    ) == 0;
+                                let code = c.driver.ws_close_code();
+                                (dead, code)
                             } else {
-                                false
+                                (false, 0u16)
                             }
                         };
 
                         if needs_teardown {
                             tracing::error!(
-                                "❌ Liveness watchdog: driver died with 0 frames [guild={}] — tearing down (use $join to retry)",
-                                guild_id
+                                "❌ Liveness watchdog: driver died with 0 frames [guild={}, close_code={}] — tearing down",
+                                guild_id, close_code
                             );
-                            // Tear down the dead call — NO auto-reconnect
+
+                            // Remove and shut down the dead call
                             if let Some(dead) = calls_watch.lock().await.remove(&guild_id) {
                                 dead.driver.request_shutdown();
                             }
                             active_watch.lock().await.remove(&guild_id);
+
+                            // FIX: Discriminate between recoverable and non-recoverable closes.
+                            //
+                            //   4006 = Session is no longer valid  → re-send OP4, Discord
+                            //          will issue fresh VSU+VSVU credentials automatically.
+                            //   4014 = Disconnected                → same recovery path.
+                            //   4015 = Voice server crashed        → same recovery path.
+                            //
+                            //   4005 = Already authenticated       → NOT recoverable here;
+                            //          the stale-session root cause must be fixed by the
+                            //          full leave→sleep→join cycle in join(). Require $join.
+                            //
+                            // Re-sending OP4 is safe for 4006/4014/4015 because Discord will
+                            // immediately issue new credentials without needing a disconnect
+                            // first — the old session is already dead on their side.
+                            match close_code {
+                                4006 | 4014 | 4015 => {
+                                    tracing::warn!(
+                                        "🔄 WS closed with {} — requesting fresh credentials via OP4 [guild={}]",
+                                        close_code, guild_id
+                                    );
+
+                                    if let Some(channel_id) = last_channel_watch.lock().await.get(&guild_id).copied() {
+                                        let channel_val = serde_json::Value::String(channel_id.get().to_string());
+                                        let payload = serde_json::json!({
+                                            "op": 4,
+                                            "d": {
+                                                "guild_id": guild_id.get().to_string(),
+                                                "channel_id": channel_val,
+                                                "self_mute": false,
+                                                "self_deaf": false
+                                            }
+                                        });
+
+                                        if let Ok(json) = serde_json::to_string(&payload) {
+                                            let shards = shards_watch.lock().await;
+                                            let num_shards = shards.len() as u64;
+                                            let shard_id = if num_shards <= 1 {
+                                                0u32
+                                            } else {
+                                                ((guild_id.get() >> 22) % num_shards) as u32
+                                            };
+
+                                            if let Some(sender) = shards.get(&shard_id) {
+                                                let msg = ShardRunnerMessage::Message(
+                                                    WsMessage::Text(json.into())
+                                                );
+                                                if sender.unbounded_send(msg).is_ok() {
+                                                    tracing::info!(
+                                                        "📡 Re-sent OP4 join after {} — Discord will issue fresh credentials [guild={}]",
+                                                        close_code, guild_id
+                                                    );
+                                                } else {
+                                                    tracing::warn!(
+                                                        "Shard {} sender closed — cannot auto-reconnect [guild={}]",
+                                                        shard_id, guild_id
+                                                    );
+                                                }
+                                            } else {
+                                                tracing::error!(
+                                                    "No shard {} sender found for auto-reconnect [guild={}]",
+                                                    shard_id, guild_id
+                                                );
+                                            }
+                                        }
+                                    } else {
+                                        tracing::warn!(
+                                            "No last_channel stored — cannot auto-reconnect after {} [guild={}]. Use $join.",
+                                            close_code, guild_id
+                                        );
+                                    }
+                                }
+                                _ => {
+                                    tracing::error!(
+                                        "Non-recoverable close code {} — use $join to retry [guild={}]",
+                                        close_code, guild_id
+                                    );
+                                }
+                            }
                         }
                     });
                 }
@@ -490,8 +628,8 @@ impl VoiceGatewayManager for SigilVoiceManager {
             }
         }
 
-         tracing::warn!("VoiceServerUpdate [guild={}, endpoint={}] — CALLER TRACE", guild_id, ep);
-    tracing::warn!("VoiceServerUpdate backtrace: {:?}", std::backtrace::Backtrace::force_capture());
+        tracing::warn!("VoiceServerUpdate [guild={}, endpoint={}] — CALLER TRACE", guild_id, ep);
+        tracing::warn!("VoiceServerUpdate backtrace: {:?}", std::backtrace::Backtrace::force_capture());
 
         // Scope the pending lock so it drops BEFORE check_and_connect()
         {
