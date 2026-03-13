@@ -172,7 +172,7 @@ impl CoreDriver {
                     buf[0..2].copy_from_slice(&binary_seq.to_be_bytes());
                     binary_seq = binary_seq.wrapping_add(1);
                     buf[2] = $op;
-                    buf.extend_from_slice(&$data);
+                    buf.extend_from_slice($data);
                     if ws_tx.send(
                         tokio_tungstenite::tungstenite::Message::Binary(buf.into())
                     ).await.is_err() {
@@ -182,37 +182,20 @@ impl CoreDriver {
                 }};
             }
 
-            macro_rules! send_text {
-                ($op:expr, $val:expr) => {{
-                    let mut pkt = VoicePacket { op: $op, d: Some($val), s: None, t: None, seq_ack: None };
-                    pkt.seq_ack = seq_ack;
-                    if let Ok(txt) = serde_json::to_string(&pkt) {
-                        if ws_tx.send(
-                            tokio_tungstenite::tungstenite::Message::Text(txt.into())
-                        ).await.is_err() {
-                            warn!("Text send failed — WS dropped");
-                            break;
-                        }
-                    }
-                }};
-            }
-
             macro_rules! send_encryption_ready {
-                () => {{
-                    if !encryption_ready_sent {
-                        send_text!(12, serde_json::json!({
-                            "audio_ssrc": my_ssrc,
-                            "video_ssrc": 0,
-                            "rtx_ssrc": 0,
-                            "encryption_ready": true
-                        }));
-                        encryption_ready_sent = true;
-                       info!("DAVE: → OP 12 EncryptionReady (delaying 8s to test...)");
-tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
-info!("DAVE: → OP 12 EncryptionReady (sending now)");
-                    }
-                }};
-            }
+                        () => {
+                            if !encryption_ready_sent {
+                                // OP 12 EncryptionReady — MUST be binary DAVE frame
+                                // Wire format: [seq_hi][seq_lo][12][payload...]
+                                // Payload: little-endian audio_ssrc (4 bytes)
+                                let mut er_buf: Vec<u8> = Vec::new();
+                                er_buf.extend_from_slice(&(my_ssrc as u32).to_le_bytes());
+                                send_bin!(12, &er_buf);
+                                encryption_ready_sent = true;
+                                info!("DAVE: → OP 12 EncryptionReady (binary, ssrc={})", my_ssrc);
+                            }
+                        }}
+
 
             macro_rules! mark_dave_ready {
                 () => {{
@@ -343,15 +326,15 @@ info!("DAVE: → OP 12 EncryptionReady (sending now)");
                                     // ── OP 21: PrepareTransition (JSON) ───
                                     21 => {
                                         if let Some(d) = pkt.d {
-                                            use sigil_discord::gateway::opcodes::{PrepareTransition, ReadyForTransition};
+                                            use sigil_discord::gateway::opcodes::PrepareTransition;
                                             match serde_json::from_value::<PrepareTransition>(d) {
                                                 Ok(pt) => {
                                                     info!("DAVE: ← OP 21 PrepareTransition (tid={}, proto={})",
                                                         pt.transition_id, pt.protocol_version);
-                                                    send_text!(23, serde_json::to_value(
-                                                        ReadyForTransition { transition_id: pt.transition_id }
-                                                    ).unwrap_or_default());
-                                                    info!("DAVE: → OP 23 ReadyForTransition (tid={})", pt.transition_id);
+                                                    // OP 23 ReadyForTransition — MUST be binary DAVE frame
+                                                    // Wire format: [seq_hi][seq_lo][23][tid_lo][tid_hi] (2-byte LE transition_id)
+                                                    send_bin!(23, &(pt.transition_id as u16).to_le_bytes());
+                                                    info!("DAVE: → OP 23 ReadyForTransition (binary, tid={})", pt.transition_id);
                                                 }
                                                 Err(e) => {
                                                     error!("DAVE: Failed to parse PrepareTransition: {:?}", e);
@@ -391,7 +374,7 @@ info!("DAVE: → OP 12 EncryptionReady (sending now)");
                                                         match s.generate_key_package() {
                                                             Ok(kp) => {
                                                                 info!("DAVE: Generated KeyPackage ({} bytes) for epoch reset", kp.len());
-                                                                send_bin!(26, kp);
+                                                                send_bin!(26, &kp);
                                                                 info!("DAVE: → OP 26 KeyPackage sent (epoch=1 reset)");
                                                             }
                                                             Err(e) => error!("DAVE: KeyPackage generation failed: {:?}", e),
@@ -475,7 +458,7 @@ info!("DAVE: → OP 12 EncryptionReady (sending now)");
                                                                 payload.extend_from_slice(&w);
                                                             }
                                                             info!("DAVE: Generated commit ({} bytes, welcome={}, tid={})", payload.len(), has_welcome, transition_id);
-                                                            send_bin!(28, payload);
+                                                            send_bin!(28, &payload);
                                                             info!("DAVE: → OP 28 CommitWelcome sent (tid={})", transition_id);
 
                                                             let member_ids = s.group_member_ids();
@@ -508,22 +491,18 @@ info!("DAVE: → OP 12 EncryptionReady (sending now)");
                                                                 payload.extend_from_slice(&w);
                                                             }
                                                             info!("DAVE: Sending OP 28 self-update ({} bytes, tid={})", payload.len(), transition_id);
-                                                            send_bin!(28, payload);
+                                                            send_bin!(28, &payload);
                                                             info!("DAVE: → OP 28 self-update CommitWelcome sent (tid={})", transition_id);
 
-                                                            // FIX: Send OP 23 ReadyForTransition after self-update commit
-                                                            use sigil_discord::gateway::opcodes::ReadyForTransition;
-                                                            send_text!(23, serde_json::to_value(
-                                                                ReadyForTransition { transition_id }
-                                                            ).unwrap_or_default());
-                                                            info!("DAVE: → OP 23 ReadyForTransition (self-update tid={})", transition_id);
+                                                            // Send OP 23 ReadyForTransition after self-update commit
+                                                            send_bin!(23, &(transition_id as u16).to_le_bytes());
+                                                            info!("DAVE: → OP 23 ReadyForTransition (binary, self-update tid={})", transition_id);
 
                                                             let member_ids = s.group_member_ids();
                                                             match s.export_sender_keys(&member_ids) {
                                                                 Ok(keys) if keys.contains_key(&s.user_id) => {
                                                                     info!("DAVE: ✅ Keys exported after self-update ({} keys)", keys.len());
                                                                     mark_dave_ready!();
-                                                                    // FIX: Send OP 12 EncryptionReady after self-update
                                                                     send_encryption_ready!();
                                                                 }
                                                                 Ok(keys) => {
@@ -573,11 +552,8 @@ info!("DAVE: → OP 12 EncryptionReady (sending now)");
                                             Err(e) => error!("DAVE: ❌ Export failed after welcome: {:?}", e),
                                         }
 
-                                        use sigil_discord::gateway::opcodes::ReadyForTransition;
-                                        send_text!(23, serde_json::to_value(
-                                            ReadyForTransition { transition_id: w.transition_id }
-                                        ).unwrap_or_default());
-                                        info!("DAVE: → OP 23 ReadyForTransition (welcome tid={})", w.transition_id);
+                                        send_bin!(23, &(w.transition_id as u16).to_le_bytes());
+                                        info!("DAVE: → OP 23 ReadyForTransition (binary, welcome tid={})", w.transition_id);
 
                                         send_encryption_ready!();
                                     }
@@ -593,11 +569,8 @@ info!("DAVE: → OP 12 EncryptionReady (sending now)");
                                             }
                                         }
 
-                                        use sigil_discord::gateway::opcodes::ReadyForTransition;
-                                        send_text!(23, serde_json::to_value(
-                                            ReadyForTransition { transition_id: c.transition_id }
-                                        ).unwrap_or_default());
-                                        info!("DAVE: → OP 23 ReadyForTransition (commit tid={})", c.transition_id);
+                                        send_bin!(23, &(c.transition_id as u16).to_le_bytes());
+                                        info!("DAVE: → OP 23 ReadyForTransition (binary, commit tid={})", c.transition_id);
 
                                         let member_ids = s.group_member_ids();
                                         info!("DAVE: Refreshing keys for {} members after epoch advance", member_ids.len());
