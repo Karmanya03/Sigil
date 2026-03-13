@@ -27,7 +27,7 @@ pub struct DaveGroup {
 }
 
 /// The group ID used for all Sigil DAVE groups.
-const GROUP_ID: &[u8] = b"sigil-dave";
+const GROUP_ID: &[u8] = b"";
 
 impl DaveGroup {
     /// Merge our own pending commit so the local group state advances
