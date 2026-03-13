@@ -159,7 +159,6 @@ impl CoreDriver {
             );
             interval.tick().await;
             let mut seq_ack: Option<u64> = None;
-            let mut binary_seq: u16 = 0;
             let mut hb_nonce: u64 = 0;
             let mut hb_acked = true;
             let mut missed_acks: u8 = 0;
@@ -168,10 +167,8 @@ impl CoreDriver {
 
             macro_rules! send_bin {
                 ($op:expr, $data:expr) => {{
-                    let mut buf = vec![0u8; 3];
-                    buf[0..2].copy_from_slice(&binary_seq.to_be_bytes());
-                    binary_seq = binary_seq.wrapping_add(1);
-                    buf[2] = $op;
+                    let mut buf = Vec::new();
+                    buf.push($op);
                     buf.extend_from_slice($data);
                     if ws_tx.send(
                         tokio_tungstenite::tungstenite::Message::Binary(buf.into())
