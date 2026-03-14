@@ -169,33 +169,48 @@ impl SigilSession {
             );
         }
 
-        // Validate P-256 key length
-        if signature_key.len() != 65 && signature_key.len() != 33 {
-            tracing::warn!(
-                "⚠️  External sender public key has unexpected length: {} bytes \
-                 (expected 65 for uncompressed or 33 for compressed P-256)",
-                signature_key.len()
+        // ── FIX: Discord sends 64-byte raw P-256 keys (X || Y without prefix) ──
+        // OpenMLS expects either:
+        // - 65 bytes: 0x04 || X || Y (uncompressed)
+        // - 33 bytes: 0x02/0x03 || X (compressed)
+        // Discord sends 64 bytes (just X || Y), so we need to prepend 0x04
+        let fixed_signature_key = if signature_key.len() == 64 {
+            tracing::info!(
+                "🔧 Fixing 64-byte raw P-256 key from Discord:\n\
+                 - Prepending 0x04 to create valid uncompressed format\n\
+                 - Original: 64 bytes (X || Y)\n\
+                 - Fixed: 65 bytes (0x04 || X || Y)"
             );
-        }
-
-        // Validate key format prefix
-        if signature_key.len() == 65 && signature_key.first() != Some(&0x04) {
+            
+            let mut fixed_key = Vec::with_capacity(65);
+            fixed_key.push(0x04); // Uncompressed point marker
+            fixed_key.extend_from_slice(&signature_key);
+            
+            tracing::info!(
+                "✅ Key format fixed: {} bytes → {} bytes",
+                signature_key.len(),
+                fixed_key.len()
+            );
+            
+            fixed_key
+        } else if signature_key.len() == 65 && signature_key.first() == Some(&0x04) {
+            tracing::debug!("✅ Key already in correct uncompressed format (65 bytes with 0x04 prefix)");
+            signature_key
+        } else if signature_key.len() == 33 && matches!(signature_key.first(), Some(&0x02) | Some(&0x03)) {
+            tracing::debug!("✅ Key already in correct compressed format (33 bytes with 0x02/0x03 prefix)");
+            signature_key
+        } else {
             tracing::warn!(
-                "⚠️  65-byte key does not start with 0x04 (uncompressed marker), \
-                 got 0x{:02x}",
+                "⚠️  Unexpected key format: {} bytes, first byte: 0x{:02x}\n\
+                 - Expected: 64 bytes (raw), 65 bytes (0x04 prefix), or 33 bytes (0x02/0x03 prefix)\n\
+                 - Using key as-is, but signature verification may fail",
+                signature_key.len(),
                 signature_key.first().unwrap_or(&0)
             );
-        } else if signature_key.len() == 33 
-            && !matches!(signature_key.first(), Some(&0x02) | Some(&0x03)) 
-        {
-            tracing::warn!(
-                "⚠️  33-byte key does not start with 0x02/0x03 (compressed marker), \
-                 got 0x{:02x}",
-                signature_key.first().unwrap_or(&0)
-            );
-        }
+            signature_key
+        };
 
-        self.pending_external_sender = Some((credential, signature_key));
+        self.pending_external_sender = Some((credential, fixed_signature_key));
         tracing::info!("✅ External sender credential and key stored for deferred group creation");
         Ok(())
     }
