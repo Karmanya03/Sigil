@@ -97,6 +97,16 @@ impl SigilSession {
     /// when the Discord-assigned group ID is available.
     pub fn set_external_sender(&mut self, payload: &[u8]) -> Result<(), SigilError> {
         use openmls::prelude::tls_codec::Deserialize;
+        
+        // ── DEBUG: Log full OP 25 payload for analysis ──
+        tracing::error!(
+            "🔍 RAW OP 25 PAYLOAD ANALYSIS:\n\
+             - Total length: {} bytes\n\
+             - Full hex dump: {:02x?}",
+            payload.len(),
+            payload
+        );
+        
         let mut cursor = std::io::Cursor::new(payload);
 
         let credential = Credential::tls_deserialize(&mut cursor)
@@ -184,11 +194,53 @@ impl SigilSession {
         }
 
         // ── FIX: Discord sends 64-byte raw P-256 keys (X || Y without prefix) ──
+        // BUT: The last 4 bytes might be TLS structure padding/metadata
         // OpenMLS expects either:
         // - 65 bytes: 0x04 || X || Y (uncompressed)
         // - 33 bytes: 0x02/0x03 || X (compressed)
-        // Discord sends 64 bytes (just X || Y), so we need to prepend 0x04
+        // Discord sends 64 bytes, but we need to check if the last 4 bytes are metadata
+        
         let fixed_signature_key = if signature_key.len() == 64 {
+            // Check if last 4 bytes look like TLS metadata (all zeros or specific pattern)
+            let last_4 = &signature_key[60..64];
+            tracing::debug!(
+                "🔍 Analyzing last 4 bytes of 64-byte key: {:02x?}",
+                last_4
+            );
+            
+            // If last 4 bytes are [00, 01, 01, 00] or similar metadata pattern,
+            // they're likely not part of the actual P-256 key
+            // P-256 keys are 32 bytes X + 32 bytes Y = 64 bytes total
+            // But if we see padding/metadata, we should use only the first 60 bytes
+            
+            if last_4 == [0x00, 0x01, 0x01, 0x00] {
+                tracing::warn!(
+                    "⚠️  Detected TLS metadata in last 4 bytes: {:02x?}\n\
+                     - This is NOT part of the P-256 key\n\
+                     - Using only first 60 bytes as key data\n\
+                     - This will result in INVALID key - need to investigate OP 25 structure",
+                    last_4
+                );
+                
+                // This is actually a problem - we can't just truncate to 60 bytes
+                // A P-256 key MUST be exactly 64 bytes (32 + 32)
+                // The issue is that we're extracting the wrong bytes from OP 25
+                
+                // Let's try a different approach: maybe the signature key starts earlier
+                // Let me log the full payload to understand the structure
+                tracing::error!(
+                    "🚨 CRITICAL: OP 25 payload structure analysis needed\n\
+                     - Total payload: {} bytes\n\
+                     - Credential consumed: {} bytes\n\
+                     - Remaining bytes: {} bytes\n\
+                     - Full remaining bytes: {:02x?}",
+                    payload.len(),
+                    pos,
+                    signature_key.len(),
+                    signature_key
+                );
+            }
+            
             tracing::info!(
                 "🔧 Fixing 64-byte raw P-256 key from Discord:\n\
                  - Prepending 0x04 to create valid uncompressed format\n\
