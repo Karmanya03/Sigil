@@ -106,36 +106,41 @@ impl SigilSession {
         tracing::info!(
             "📋 External sender credential from OP 25:\n\
              - Credential type: {:?}\n\
-             - Identity length: {} bytes",
+             - Identity length: {} bytes\n\
+             - Cursor position after credential: {}",
             credential.credential_type(),
-            credential.serialized_content().len()
+            credential.serialized_content().len(),
+            cursor.position()
         );
 
         let pos = cursor.position() as usize;
         
         // ── INVESTIGATION: Try TLS deserialization of SignaturePublicKey ──
-        // Discord may be sending the signature key as a TLS-serialized SignaturePublicKey
-        // rather than raw bytes. Let's try both approaches.
+        // Discord sends the signature key as TLS-serialized VLBytes (variable-length bytes)
+        // Format: length_prefix || key_bytes
+        // We need to deserialize it properly to get just the key bytes
         
-        let signature_key_result = SignaturePublicKey::tls_deserialize(&mut cursor);
+        // Try to deserialize as VLBytes first (TLS variable-length byte vector)
+        use openmls::prelude::tls_codec::VLBytes;
+        let signature_key_result = VLBytes::tls_deserialize(&mut cursor);
         
         let signature_key = match signature_key_result {
-            Ok(sig_key) => {
+            Ok(vl_bytes) => {
+                let key_bytes = vl_bytes.as_slice().to_vec();
                 tracing::info!(
-                    "✅ Successfully TLS-deserialized SignaturePublicKey from OP 25\n\
-                     - Consumed {} bytes from position {} to {}",
+                    "✅ Successfully TLS-deserialized signature key as VLBytes from OP 25\n\
+                     - Consumed {} bytes from position {} to {}\n\
+                     - Extracted key length: {} bytes",
                     cursor.position() as usize - pos,
                     pos,
-                    cursor.position()
+                    cursor.position(),
+                    key_bytes.len()
                 );
-                
-                // Convert back to Vec<u8> for storage
-                // We need to store the raw bytes, not the TLS-serialized form
-                sig_key.as_slice().to_vec()
+                key_bytes
             }
             Err(e) => {
                 tracing::warn!(
-                    "⚠️  TLS deserialization of SignaturePublicKey failed: {}\n\
+                    "⚠️  TLS deserialization of signature key as VLBytes failed: {}\n\
                      - Falling back to raw bytes extraction",
                     e
                 );
