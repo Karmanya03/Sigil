@@ -26,12 +26,17 @@ pub fn generate_key_package(
     identity: &DaveIdentity,
     provider: &OpenMlsRustCrypto,
 ) -> Result<KeyPackage, SigilError> {
+    // ── FIX: Accept all credential types to support Discord's custom credential type 16449 ──
+    // Discord sends credential type Other(16449) for external senders, not Basic.
+    // OpenMLS will reject proposals if the sender's credential type is not in the
+    // accepted credential types list. By setting this to None (default), we accept
+    // all credential types, which allows Discord's external sender proposals to be verified.
     let capabilities = Capabilities::new(
         None,                           // protocol versions (default)
         Some(&[DAVE_CIPHERSUITE]),      // only ciphersuite 2
         None,                           // extensions (default)
         None,                           // proposals (default)
-        Some(&[CredentialType::Basic]), // only Basic credentials
+        None,                           // accept all credential types (was: Some(&[CredentialType::Basic]))
     );
 
     let extensions = Extensions::default();

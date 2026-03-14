@@ -102,6 +102,15 @@ impl SigilSession {
         let credential = Credential::tls_deserialize(&mut cursor)
             .map_err(|e| SigilError::Mls(format!("credential deserialize: {}", e)))?;
 
+        // ── LOG: Credential type from Discord OP 25 ──
+        tracing::info!(
+            "📋 External sender credential from OP 25:\n\
+             - Credential type: {:?}\n\
+             - Identity length: {} bytes",
+            credential.credential_type(),
+            credential.serialized_content().len()
+        );
+
         let pos = cursor.position() as usize;
         
         // ── INVESTIGATION: Try TLS deserialization of SignaturePublicKey ──
