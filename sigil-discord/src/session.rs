@@ -103,9 +103,100 @@ impl SigilSession {
             .map_err(|e| SigilError::Mls(format!("credential deserialize: {}", e)))?;
 
         let pos = cursor.position() as usize;
-        let signature_key = payload[pos..].to_vec();
+        
+        // ── INVESTIGATION: Try TLS deserialization of SignaturePublicKey ──
+        // Discord may be sending the signature key as a TLS-serialized SignaturePublicKey
+        // rather than raw bytes. Let's try both approaches.
+        
+        let signature_key_result = SignaturePublicKey::tls_deserialize(&mut cursor);
+        
+        let signature_key = match signature_key_result {
+            Ok(sig_key) => {
+                tracing::info!(
+                    "✅ Successfully TLS-deserialized SignaturePublicKey from OP 25\n\
+                     - Consumed {} bytes from position {} to {}",
+                    cursor.position() as usize - pos,
+                    pos,
+                    cursor.position()
+                );
+                
+                // Convert back to Vec<u8> for storage
+                // We need to store the raw bytes, not the TLS-serialized form
+                sig_key.as_slice().to_vec()
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "⚠️  TLS deserialization of SignaturePublicKey failed: {}\n\
+                     - Falling back to raw bytes extraction",
+                    e
+                );
+                
+                // Fallback: treat remaining bytes as raw signature key
+                payload[pos..].to_vec()
+            }
+        };
+
+        // ── DEBUG LOGGING: External sender public key format ──
+        tracing::debug!(
+            "🔍 External sender public key extracted from OP 25:\n\
+             - Total payload size: {} bytes\n\
+             - Credential size: {} bytes\n\
+             - Signature key size: {} bytes\n\
+             - Key format: {}",
+            payload.len(),
+            pos,
+            signature_key.len(),
+            match signature_key.len() {
+                65 if signature_key.first() == Some(&0x04) => 
+                    "Uncompressed P-256 (0x04 || X || Y)",
+                33 if matches!(signature_key.first(), Some(&0x02) | Some(&0x03)) => 
+                    "Compressed P-256",
+                _ => "Unknown/Invalid (expected 65 or 33 bytes)",
+            }
+        );
+
+        if !signature_key.is_empty() {
+            let preview_len = signature_key.len().min(8);
+            tracing::debug!(
+                "   - First {} bytes: {:02x?}",
+                preview_len,
+                &signature_key[..preview_len]
+            );
+            tracing::debug!(
+                "   - Last {} bytes: {:02x?}",
+                preview_len,
+                &signature_key[signature_key.len().saturating_sub(preview_len)..]
+            );
+        }
+
+        // Validate P-256 key length
+        if signature_key.len() != 65 && signature_key.len() != 33 {
+            tracing::warn!(
+                "⚠️  External sender public key has unexpected length: {} bytes \
+                 (expected 65 for uncompressed or 33 for compressed P-256)",
+                signature_key.len()
+            );
+        }
+
+        // Validate key format prefix
+        if signature_key.len() == 65 && signature_key.first() != Some(&0x04) {
+            tracing::warn!(
+                "⚠️  65-byte key does not start with 0x04 (uncompressed marker), \
+                 got 0x{:02x}",
+                signature_key.first().unwrap_or(&0)
+            );
+        } else if signature_key.len() == 33 
+            && !matches!(signature_key.first(), Some(&0x02) | Some(&0x03)) 
+        {
+            tracing::warn!(
+                "⚠️  33-byte key does not start with 0x02/0x03 (compressed marker), \
+                 got 0x{:02x}",
+                signature_key.first().unwrap_or(&0)
+            );
+        }
 
         self.pending_external_sender = Some((credential, signature_key));
+        tracing::info!("✅ External sender credential and key stored for deferred group creation");
         Ok(())
     }
 

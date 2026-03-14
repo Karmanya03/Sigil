@@ -284,6 +284,61 @@ impl DaveGroup {
                 }
             };
 
+            // ── PRE-VERIFICATION DEBUGGING: Log group's external senders before process_message() ──
+            // This helps diagnose whether external senders are properly registered
+            let group_context = self.mls_group.export_group_context();
+            let external_senders = group_context
+                .extensions()
+                .iter()
+                .find_map(|ext| {
+                    if let Extension::ExternalSenders(senders) = ext {
+                        Some(senders)
+                    } else {
+                        None
+                    }
+                });
+            
+            if let Some(senders) = external_senders {
+                tracing::debug!(
+                    "🔍 Pre-verification check for proposal at index {}:\n\
+                     - Registered external senders in group: {}\n\
+                     - Group has external senders extension: YES",
+                    i,
+                    senders.len()
+                );
+                
+                // Log each registered external sender (serialize to see contents)
+                for (idx, ext_sender) in senders.iter().enumerate() {
+                    // Serialize the external sender to inspect its contents
+                    use openmls::prelude::tls_codec::Serialize as TlsSerialize;
+                    match ext_sender.tls_serialize_detached() {
+                        Ok(serialized) => {
+                            tracing::debug!(
+                                "   - External sender [{}]:\n\
+                                 - Serialized length: {} bytes\n\
+                                 - First 16 bytes: {:02x?}",
+                                idx,
+                                serialized.len(),
+                                &serialized[..serialized.len().min(16)]
+                            );
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                "   - External sender [{}]: Failed to serialize: {}",
+                                idx,
+                                e
+                            );
+                        }
+                    }
+                }
+            } else {
+                tracing::debug!(
+                    "🔍 Pre-verification check for proposal at index {}:\n\
+                     - Group has NO external senders extension",
+                    i
+                );
+            }
+
             match self.mls_group.process_message(provider, protocol_message) {
                 Ok(processed_msg) => {
                     match processed_msg.into_content() {
@@ -315,11 +370,120 @@ impl DaveGroup {
                     }
                 }
                 Err(e) => {
-                    tracing::debug!(
-                        "Skipping proposal at index {} that failed processing: {}",
-                        i,
-                        e
-                    );
+                    // ── ENHANCED ERROR LOGGING for signature verification failures ──
+                    let error_msg = format!("{}", e);
+                    
+                    if error_msg.contains("Verifying the signature failed") 
+                        || error_msg.contains("signature") 
+                    {
+                        tracing::error!(
+                            "❌ SIGNATURE VERIFICATION FAILED at proposal index {}:\n\
+                             - Error: {}\n\
+                             - Proposal data length: {} bytes\n\
+                             - First 16 bytes: {:02x?}\n\
+                             - This is the BUG CONDITION: external sender proposal signature verification failure",
+                            i,
+                            e,
+                            proposal_data.len(),
+                            &proposal_data[..proposal_data.len().min(16)]
+                        );
+                        
+                        // Log current group state for debugging
+                        tracing::error!(
+                            "   - Current MLS group epoch: {}\n\
+                             - Group ID: {:02x?}\n\
+                             - Number of group members: {}",
+                            self.current_epoch,
+                            self.mls_group.group_id().as_slice(),
+                            self.mls_group.members().count()
+                        );
+                        
+                        // ── DETAILED SIGNATURE DEBUGGING ──
+                        tracing::error!(
+                            "   🔍 SIGNATURE VERIFICATION DETAILS:\n\
+                             - Extracting external sender information for comparison..."
+                        );
+                        
+                        // Log the group's external senders for comparison
+                        let group_context = self.mls_group.export_group_context();
+                        if let Some(Extension::ExternalSenders(senders)) = group_context
+                            .extensions()
+                            .iter()
+                            .find(|ext| matches!(ext, Extension::ExternalSenders(_)))
+                        {
+                            tracing::error!(
+                                "   - Expected external sender(s) registered in group: {}",
+                                senders.len()
+                            );
+                            
+                            // Serialize each external sender to inspect contents
+                            use openmls::prelude::tls_codec::Serialize as TlsSerialize;
+                            for (idx, ext_sender) in senders.iter().enumerate() {
+                                match ext_sender.tls_serialize_detached() {
+                                    Ok(serialized) => {
+                                        tracing::error!(
+                                            "   - Expected external sender [{}]:\n\
+                                             - Serialized length: {} bytes\n\
+                                             - Full serialized data: {:02x?}",
+                                            idx,
+                                            serialized.len(),
+                                            serialized
+                                        );
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(
+                                            "   - Expected external sender [{}]: Failed to serialize: {}",
+                                            idx,
+                                            e
+                                        );
+                                    }
+                                }
+                            }
+                        } else {
+                            tracing::error!(
+                                "   ⚠️  NO external senders registered in group context!\n\
+                                 - This means set_external_sender() was not called or failed\n\
+                                 - Or the external senders extension was not properly applied"
+                            );
+                        }
+                        
+                        // Log the ciphersuite and signature algorithm
+                        tracing::error!(
+                            "   - Ciphersuite: {:?}\n\
+                             - Signature algorithm: {:?}\n\
+                             - Expected signature scheme: ECDSA P-256 with SHA-256",
+                            self.mls_group.ciphersuite(),
+                            self.mls_group.ciphersuite().signature_algorithm()
+                        );
+                        
+                        // Log diagnostic information about the proposal message
+                        tracing::error!(
+                            "   📋 PROPOSAL MESSAGE DIAGNOSTICS:\n\
+                             - Message type: Protocol Message\n\
+                             - Proposal data (first 64 bytes hex): {}",
+                            proposal_data.iter()
+                                .take(64)
+                                .map(|b| format!("{:02x}", b))
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        );
+                        
+                        tracing::error!(
+                            "   🔧 DEBUGGING RECOMMENDATIONS:\n\
+                             - Check if external sender public key format is correct (65 bytes uncompressed or 33 bytes compressed)\n\
+                             - Verify credential in OP 25 matches credential in OP 27 proposal\n\
+                             - Confirm SignaturePublicKey conversion in set_external_sender() is correct\n\
+                             - Verify no serenity/poise interference with DAVE opcodes\n\
+                             - Check if TLS deserialization of SignaturePublicKey in set_external_sender() succeeded"
+                        );
+                    } else {
+                        tracing::debug!(
+                            "Skipping proposal at index {} that failed processing: {}",
+                            i,
+                            e
+                        );
+                    }
+                    
                     skipped_count += 1;
                     had_unrecognized_nonempty = true;
                     continue;
