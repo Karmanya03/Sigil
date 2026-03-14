@@ -43,12 +43,13 @@ pub fn build_group_config(
     );
 
     // Register the gateway as an allowed external sender via group context extensions
+    let extensions = Extensions::single(Extension::ExternalSenders(vec![
+        external_sender,
+    ])).map_err(|e| SigilError::Mls(format!("group context extensions: {}", e)))?;
+
     let config = MlsGroupCreateConfig::builder()
         .ciphersuite(DAVE_CIPHERSUITE)
-        .with_group_context_extensions(Extensions::single(Extension::ExternalSenders(vec![
-            external_sender,
-        ])))
-        .map_err(|e| SigilError::Mls(format!("group context extensions: {}", e)))?
+        .with_group_context_extensions(extensions)
         .build();
 
     Ok(config)

@@ -4,7 +4,8 @@
 //! to 96-bit by prepending 8 zero bytes) and 8-byte truncated authentication
 //! tags (from the full 16-byte GCM tag).
 
-use aes_gcm::aead::{Aead, KeyInit, Payload};
+use aes_gcm::aead::{AeadInPlace, KeyInit, Payload};
+use aes_gcm::aead::Aead;
 use aes_gcm::{Aes128Gcm, Key, Nonce};
 
 use crate::error::SigilError;
@@ -20,30 +21,14 @@ pub fn expand_nonce(truncated: u32) -> [u8; NONCE_LENGTH] {
 }
 
 /// Extract the generation number from a 32-bit truncated nonce.
-///
-/// The generation is the most-significant byte of the nonce value.
-/// This means after 2^24 frames, the generation increments.
 pub fn generation_from_nonce(truncated_nonce: u32) -> u32 {
     truncated_nonce >> 24
 }
 
 /// Encrypt a plaintext frame with AES-128-GCM.
 ///
-/// # Arguments
-///
-/// * `key` — 16-byte AES-128 key
-/// * `truncated_nonce` — 32-bit nonce (will be expanded to 96-bit)
-/// * `plaintext` — the data to encrypt
-/// * `aad` — additional authenticated data (unencrypted ranges joined)
-///
-/// # Returns
-///
-/// A tuple of `(ciphertext, truncated_tag)` where the tag is the first
-/// 8 bytes of the full 16-byte GCM authentication tag.
-///
-/// # Errors
-///
-/// Returns [`SigilError::DecryptionFailed`] if encryption fails internally.
+/// Returns `(ciphertext, truncated_tag)` where the tag is the first 8 bytes
+/// of the full 16-byte GCM authentication tag.
 pub fn encrypt_frame(
     key: &[u8; KEY_LENGTH],
     truncated_nonce: u32,
@@ -54,16 +39,11 @@ pub fn encrypt_frame(
     let nonce_bytes = expand_nonce(truncated_nonce);
     let nonce = Nonce::from_slice(&nonce_bytes);
 
-    let payload = Payload {
-        msg: plaintext,
-        aad,
-    };
-
+    let payload = Payload { msg: plaintext, aad };
     let ciphertext_with_tag = cipher
         .encrypt(nonce, payload)
         .map_err(|_| SigilError::DecryptionFailed)?;
 
-    // AES-GCM appends the 16-byte tag to the ciphertext
     let ct_len = ciphertext_with_tag.len() - FULL_TAG_LENGTH;
     let ciphertext = ciphertext_with_tag[..ct_len].to_vec();
     let mut truncated_tag = [0u8; TRUNCATED_TAG_LENGTH];
@@ -74,21 +54,13 @@ pub fn encrypt_frame(
 
 /// Decrypt a ciphertext frame with AES-128-GCM using a truncated tag.
 ///
-/// The truncated 8-byte tag is zero-padded to reconstruct a full 16-byte
-/// tag for the GCM verification (note: this means the last 8 bytes of the
-/// tag are zeroed, which is consistent with how the protocol truncation works).
+/// Reconstructs the full 16-byte GCM tag by re-deriving it from the plaintext:
+/// 1. Decrypt the ciphertext using AES-CTR (via `encrypt_in_place_detached` on
+///    the ciphertext, which XORs with the same keystream to recover plaintext).
+/// 2. Re-encrypt the recovered plaintext to get the full GCM tag.
+/// 3. Verify the first TRUNCATED_TAG_LENGTH bytes match `truncated_tag`.
 ///
-/// # Arguments
-///
-/// * `key` — 16-byte AES-128 key
-/// * `truncated_nonce` — 32-bit nonce (will be expanded to 96-bit)
-/// * `ciphertext` — the encrypted data (without tag)
-/// * `truncated_tag` — 8-byte truncated authentication tag
-/// * `aad` — additional authenticated data
-///
-/// # Errors
-///
-/// Returns [`SigilError::DecryptionFailed`] if authentication fails.
+/// This correctly implements DAVE's 8-byte truncated tag scheme.
 pub fn decrypt_frame(
     key: &[u8; KEY_LENGTH],
     truncated_nonce: u32,
@@ -100,21 +72,34 @@ pub fn decrypt_frame(
     let nonce_bytes = expand_nonce(truncated_nonce);
     let nonce = Nonce::from_slice(&nonce_bytes);
 
-    // Reconstruct the full 16-byte tag by zero-padding the truncated tag
-    let mut full_tag = [0u8; FULL_TAG_LENGTH];
-    full_tag[..TRUNCATED_TAG_LENGTH].copy_from_slice(truncated_tag);
+    // Step 1: Recover plaintext by XOR-ing ciphertext with the AES-CTR keystream.
+    // AES-GCM uses CTR mode: ciphertext = plaintext XOR keystream.
+    // encrypt_in_place_detached(ciphertext) = ciphertext XOR keystream = plaintext.
+    let mut plaintext = ciphertext.to_vec();
+    let _dummy_tag = cipher
+        .encrypt_in_place_detached(nonce, aad, &mut plaintext)
+        .map_err(|_| SigilError::DecryptionFailed)?;
+    // plaintext now holds: ciphertext XOR keystream = original plaintext ✓
 
-    // Combine ciphertext + full tag for aes-gcm decryption
-    let mut ct_with_tag = Vec::with_capacity(ciphertext.len() + FULL_TAG_LENGTH);
-    ct_with_tag.extend_from_slice(ciphertext);
-    ct_with_tag.extend_from_slice(&full_tag);
+    // Step 2: Re-encrypt the recovered plaintext to get the authentic full tag.
+    let payload = Payload { msg: &plaintext, aad };
+    let ct_with_tag = cipher
+        .encrypt(nonce, payload)
+        .map_err(|_| SigilError::DecryptionFailed)?;
 
-    let payload = Payload {
-        msg: &ct_with_tag,
-        aad,
-    };
+    // Step 3: Verify the truncated tag matches the first 8 bytes of the real tag.
+    let ct_len = ct_with_tag.len() - FULL_TAG_LENGTH;
+    let real_truncated = &ct_with_tag[ct_len..ct_len + TRUNCATED_TAG_LENGTH];
 
-    cipher
-        .decrypt(nonce, payload)
-        .map_err(|_| SigilError::DecryptionFailed)
+    // Constant-time comparison to prevent timing attacks
+    use std::hint::black_box;
+    let mut diff = 0u8;
+    for (a, b) in truncated_tag.iter().zip(real_truncated.iter()) {
+        diff |= black_box(a ^ b);
+    }
+    if diff != 0 {
+        return Err(SigilError::DecryptionFailed);
+    }
+
+    Ok(plaintext)
 }

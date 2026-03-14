@@ -15,7 +15,7 @@ use crate::gateway::handler::{DaveEvent, dispatch};
 use crate::gateway::session::{DaveSession, SessionState};
 use crate::mls::config::{build_group_config, crypto_provider};
 use crate::mls::credential::DaveIdentity;
-use crate::mls::group::DaveGroup;
+use crate::mls::group::{DaveGroup, extract_group_id_from_proposals};
 use crate::types::{Epoch, KEY_LENGTH, UserId};
 
 use openmls::prelude::*;
@@ -32,6 +32,10 @@ pub struct SigilSession {
     identity: DaveIdentity,
     /// The MLS group (None until joined/created).
     group: Option<DaveGroup>,
+    /// Pending external sender credential and key, stored by set_external_sender()
+    /// and consumed by the first process_proposals() call to create the MLS group
+    /// with the correct Discord-assigned group ID.
+    pending_external_sender: Option<(Credential, Vec<u8>)>,
     /// The underlying gateway session state machine.
     gateway_session: DaveSession,
     /// Per-sender encryption keys for the current epoch.
@@ -51,6 +55,7 @@ impl SigilSession {
             provider,
             identity,
             group: None,
+            pending_external_sender: None,
             gateway_session: DaveSession::new(user_id),
             sender_keys: HashMap::new(),
             own_key: None,
@@ -64,9 +69,10 @@ impl SigilSession {
         &mut self,
         gateway_credential: Credential,
         gateway_pubkey: Vec<u8>,
+        group_id: &[u8],
     ) -> Result<(), SigilError> {
         let config = build_group_config(gateway_credential, gateway_pubkey)?;
-        let group = DaveGroup::create(&self.identity, &self.provider, &config)?;
+        let group = DaveGroup::create(&self.identity, &self.provider, &config, group_id)?;
         self.group = Some(group);
         Ok(())
     }
@@ -85,6 +91,10 @@ impl SigilSession {
     }
 
     /// Set the external sender credentials received from the Voice Gateway (OP 25).
+    ///
+    /// Stores the credential and key in `pending_external_sender` for deferred
+    /// group creation. The group is created on the first `process_proposals` call
+    /// when the Discord-assigned group ID is available.
     pub fn set_external_sender(&mut self, payload: &[u8]) -> Result<(), SigilError> {
         use openmls::prelude::tls_codec::Deserialize;
         let mut cursor = std::io::Cursor::new(payload);
@@ -95,12 +105,17 @@ impl SigilSession {
         let pos = cursor.position() as usize;
         let signature_key = payload[pos..].to_vec();
 
-        self.create_group(credential, signature_key)
+        self.pending_external_sender = Some((credential, signature_key));
+        Ok(())
     }
 
     /// Process incoming OP 27 proposals (Append / Revoke) from the Voice server.
     ///
     /// `operations` is a slice of raw MLS proposal byte vectors.
+    ///
+    /// On the first call when no group exists yet, extracts the group ID from
+    /// the proposals and creates the MLS group using the pending external sender
+    /// credential stored by `set_external_sender`.
     ///
     /// Returns `Ok(true)` when Discord sent non-empty proposals that could not
     /// be deserialized (e.g. custom type 16) AND none were stored as pending.
@@ -110,6 +125,20 @@ impl SigilSession {
     ///   self-update commit (OP 28) with the correct transition_id so Discord
     ///   advances the epoch and delivers the epoch key.
     pub fn process_proposals(&mut self, operations: &[Vec<u8>]) -> Result<bool, SigilError> {
+        if self.group.is_none() {
+            if let Some((cred, key)) = self.pending_external_sender.take() {
+                let group_id = extract_group_id_from_proposals(operations)
+                    .ok_or(SigilError::GroupNotEstablished)?;
+                let config = build_group_config(cred, key)?;
+                let group = DaveGroup::create(
+                    &self.identity,
+                    &self.provider,
+                    &config,
+                    group_id.as_slice(),
+                )?;
+                self.group = Some(group);
+            }
+        }
         let group = self.group.as_mut().ok_or(SigilError::GroupNotEstablished)?;
         let needs_commit = group.process_proposals(operations, &self.provider)?;
         Ok(needs_commit)
@@ -352,5 +381,6 @@ impl SigilSession {
         self.sender_keys.clear();
         self.own_key = None;
         self.group = None;
+        self.pending_external_sender = None;
     }
 }

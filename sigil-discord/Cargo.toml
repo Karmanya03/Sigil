@@ -11,9 +11,9 @@ categories = ["cryptography", "multimedia"]
 
 [dependencies]
 # ── MLS Protocol (RFC 9420) ──
-openmls = { version = "0.6", features = ["test-utils"] }
-openmls_rust_crypto = "0.3"
-openmls_basic_credential = "0.3"
+openmls = { version = "0.8", features = ["test-utils"] }
+openmls_rust_crypto = "0.5"
+openmls_basic_credential = "0.5"
 
 # ── Frame Encryption ──
 aes-gcm = "0.10"
@@ -43,6 +43,7 @@ voice-gateway = ["songbird", "serenity"]
 tokio-test = "0.4"
 criterion = { version = "0.5", features = ["html_reports"] }
 pretty_assertions = "1"
+proptest = "1.4"
 
 [[bench]]
 name = "frame_crypto"

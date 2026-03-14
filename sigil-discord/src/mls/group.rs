@@ -7,11 +7,52 @@ use openmls::prelude::tls_codec::{
     DeserializeBytes as TlsDeserializeBytes, Serialize as TlsSerialize,
 };
 use openmls::prelude::*;
+use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::OpenMlsRustCrypto;
 
 use crate::error::SigilError;
 use crate::mls::credential::DaveIdentity;
 use crate::types::{Epoch, KEY_LENGTH, SENDER_KEY_LABEL, UserId};
+
+// ── GROUP_ID const removed ── //
+// Discord embeds its own group ID inside every OP 27 proposal. We must
+// extract it from the proposal bytes and pass it to `DaveGroup::create()`.
+// See `extract_group_id_from_proposals()` below.
+
+// ---------------------------------------------------------------------------
+// Free-standing helper
+// ---------------------------------------------------------------------------
+
+/// Parse the MLS group ID out of the first parseable non-empty proposal.
+///
+/// Discord's SFU creates the group ID and embeds it in every MLS message
+/// header. We must read it from the OP 27 payload and use it when
+/// constructing our local `MlsGroup`; otherwise every `process_message()`
+/// call fails with a group-ID mismatch error.
+///
+/// # Returns
+///
+/// `Some(GroupId)` from the first proposal that deserialises successfully,
+/// or `None` if the slice is empty or no message can be parsed.
+pub fn extract_group_id_from_proposals(proposals_bytes: &[Vec<u8>]) -> Option<GroupId> {
+    for data in proposals_bytes {
+        if data.is_empty() {
+            continue;
+        }
+        if let Ok(msg) = MlsMessageIn::tls_deserialize_exact_bytes(data) {
+            // In openmls 0.8, MlsMessageIn does not have group_id() directly.
+            // Convert to ProtocolMessage first, which does expose group_id().
+            if let Ok(pm) = msg.try_into_protocol_message() {
+                return Some(pm.group_id().clone());
+            }
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// DaveGroup
+// ---------------------------------------------------------------------------
 
 /// An MLS group for a DAVE voice session.
 ///
@@ -26,24 +67,17 @@ pub struct DaveGroup {
     identity_user_id: UserId,
 }
 
-/// The group ID used for all Sigil DAVE groups.
-const GROUP_ID: &[u8] = b"";
-
 impl DaveGroup {
-    /// Merge our own pending commit so the local group state advances
-    /// to the new epoch.
-    pub fn merge_own_pending_commit(
-        &mut self,
-        provider: &OpenMlsRustCrypto,
-    ) -> Result<(), SigilError> {
-        self.mls_group
-            .merge_pending_commit(provider)
-            .map_err(|e| SigilError::Mls(format!("merge_pending_commit: {:?}", e)))?;
-        self.current_epoch = self.mls_group.epoch().as_u64();
-        Ok(())
-    }
+    // -----------------------------------------------------------------------
+    // Construction
+    // -----------------------------------------------------------------------
 
     /// Create a new MLS group as the initial member.
+    ///
+    /// `group_id` **must** be extracted from Discord's OP 27 proposal bytes
+    /// via [`extract_group_id_from_proposals`] before calling this.  Passing
+    /// an arbitrary or empty ID will cause every subsequent
+    /// `process_message()` call to fail with a group-ID mismatch.
     ///
     /// # Errors
     ///
@@ -52,8 +86,14 @@ impl DaveGroup {
         identity: &DaveIdentity,
         provider: &OpenMlsRustCrypto,
         config: &MlsGroupCreateConfig,
+        group_id: &[u8], // ← Discord's actual group ID, extracted from OP 27
     ) -> Result<Self, SigilError> {
-        let group_id = GroupId::from_slice(GROUP_ID);
+        let group_id = GroupId::from_slice(group_id);
+
+        tracing::info!(
+            "DAVE: creating MLS group with group_id = {:02x?}",
+            group_id.as_slice()
+        );
 
         let mls_group = MlsGroup::new_with_group_id(
             provider,
@@ -106,6 +146,71 @@ impl DaveGroup {
             identity_user_id: identity.user_id,
         })
     }
+
+    // -----------------------------------------------------------------------
+    // Group-ID recovery (quick-hack path)
+    // -----------------------------------------------------------------------
+
+    /// Tear down and recreate the local MLS group using `group_id`.
+    ///
+    /// Use this as a last-resort recovery when `process_proposals` detects
+    /// that Discord's group ID does not match the one we created the group
+    /// with.  Prefer the deferred-creation path in `driver.rs` (call
+    /// `extract_group_id_from_proposals` before `DaveGroup::create`) instead
+    /// of relying on this method.
+    ///
+    /// After calling this, retry `process_proposals` with the same data.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SigilError::Mls`] if recreating the group fails.
+    pub fn recreate_with_group_id(
+        &mut self,
+        identity: &DaveIdentity,
+        provider: &OpenMlsRustCrypto,
+        config: &MlsGroupCreateConfig,
+        group_id: GroupId,
+    ) -> Result<(), SigilError> {
+        tracing::warn!(
+            "DAVE: recreating MLS group — old={:02x?}  new={:02x?}",
+            self.mls_group.group_id().as_slice(),
+            group_id.as_slice()
+        );
+
+        let new_group = MlsGroup::new_with_group_id(
+            provider,
+            &identity.signature_keys,
+            config,
+            group_id,
+            identity.credential_with_key.clone(),
+        )
+        .map_err(|e| SigilError::Mls(format!("recreate group: {}", e)))?;
+
+        self.mls_group = new_group;
+        self.current_epoch = self.mls_group.epoch().as_u64();
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Epoch management
+    // -----------------------------------------------------------------------
+
+    /// Merge our own pending commit so the local group state advances
+    /// to the new epoch.
+    pub fn merge_own_pending_commit(
+        &mut self,
+        provider: &OpenMlsRustCrypto,
+    ) -> Result<(), SigilError> {
+        self.mls_group
+            .merge_pending_commit(provider)
+            .map_err(|e| SigilError::Mls(format!("merge_pending_commit: {:?}", e)))?;
+        self.current_epoch = self.mls_group.epoch().as_u64();
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Proposals
+    // -----------------------------------------------------------------------
 
     /// Process incoming proposals from the delivery service.
     ///
@@ -183,7 +288,6 @@ impl DaveGroup {
                 Ok(processed_msg) => {
                     match processed_msg.into_content() {
                         ProcessedMessageContent::ProposalMessage(staged_proposal) => {
-                            // OpenMLS 0.6.0 requires storage provider as first arg.
                             let _ = self
                                 .mls_group
                                 .store_pending_proposal(provider.storage(), *staged_proposal);
@@ -243,6 +347,10 @@ impl DaveGroup {
         self.mls_group.pending_proposals().next().is_some()
     }
 
+    // -----------------------------------------------------------------------
+    // Commits
+    // -----------------------------------------------------------------------
+
     /// Create a commit for pending proposals.
     ///
     /// Returns the serialized commit message and an optional Welcome message
@@ -254,7 +362,7 @@ impl DaveGroup {
     pub fn commit_pending(
         &mut self,
         provider: &OpenMlsRustCrypto,
-        signer: &openmls_basic_credential::SignatureKeyPair,
+        signer: &SignatureKeyPair,
     ) -> Result<(Vec<u8>, Option<Vec<u8>>), SigilError> {
         let (commit, welcome, _group_info) = self
             .mls_group
@@ -299,7 +407,7 @@ impl DaveGroup {
     pub fn commit_empty(
         &mut self,
         provider: &OpenMlsRustCrypto,
-        signer: &openmls_basic_credential::SignatureKeyPair,
+        signer: &SignatureKeyPair,
     ) -> Result<Vec<u8>, SigilError> {
         tracing::info!(
             "DAVE: creating empty commit to advance epoch past unrecognized proposals \
@@ -355,11 +463,15 @@ impl DaveGroup {
             self.mls_group
                 .merge_staged_commit(provider, *staged_commit)
                 .map_err(|e| SigilError::Mls(format!("merge commit: {}", e)))?;
+            self.current_epoch = self.mls_group.epoch().as_u64();
         }
 
-        self.current_epoch = self.mls_group.epoch().as_u64();
         Ok(())
     }
+
+    // -----------------------------------------------------------------------
+    // Key export
+    // -----------------------------------------------------------------------
 
     /// Export the per-sender encryption key for a given sender user ID.
     ///
@@ -383,13 +495,17 @@ impl DaveGroup {
 
         let exported = self
             .mls_group
-            .export_secret(provider, label, &context, KEY_LENGTH)
+            .export_secret(provider.crypto(), label, &context, KEY_LENGTH)
             .map_err(|e| SigilError::Mls(format!("export sender key: {}", e)))?;
 
         let mut key = [0u8; KEY_LENGTH];
         key.copy_from_slice(&exported[..KEY_LENGTH]);
         Ok(key)
     }
+
+    // -----------------------------------------------------------------------
+    // Accessors
+    // -----------------------------------------------------------------------
 
     /// Returns the current MLS epoch number.
     pub fn epoch(&self) -> Epoch {

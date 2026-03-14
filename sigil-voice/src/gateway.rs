@@ -63,6 +63,8 @@ pub struct Ready {
 pub struct SessionDescription {
     pub mode: String,
     pub secret_key: Vec<u8>,
+    #[serde(default)]
+    pub dave_protocol_version: Option<u8>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

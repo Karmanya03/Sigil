@@ -1,7 +1,7 @@
 use futures_util::{SinkExt, StreamExt};
 use sigil_discord::SigilSession;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicU8, Ordering};
 use tokio::net::UdpSocket;
 use tokio::sync::{mpsc, Mutex, Notify};
 use tracing::{info, warn, error, debug};
@@ -54,6 +54,11 @@ pub struct CoreDriver {
     pub ws_close_code: Arc<AtomicU16>,
     pub frames_sent: Arc<AtomicU64>,
     pub shutdown: Arc<AtomicBool>,
+    /// Discord user IDs currently connected to the voice channel.
+    /// Populated by OP 11 (clients_connect), cleared by OP 13 (client_disconnect).
+    pub connected_users: Arc<Mutex<std::collections::HashSet<u64>>>,
+    /// The DAVE protocol version confirmed by the server in OP 4.
+    pub dave_protocol_version: Arc<AtomicU8>,
 }
 
 impl CoreDriver {
@@ -80,6 +85,8 @@ impl CoreDriver {
         let ws_alive = Arc::new(AtomicBool::new(true));
         let ws_close_code = Arc::new(AtomicU16::new(0));
         let shutdown = Arc::new(AtomicBool::new(false));
+        let connected_users = Arc::new(Mutex::new(std::collections::HashSet::<u64>::new()));
+        let dave_protocol_version = Arc::new(AtomicU8::new(0));
         info!("✅ 1/7 SigilSession created");
 
         // ── 2. WS connect + handshake ─────────────────────────────────────
@@ -146,6 +153,11 @@ impl CoreDriver {
         }
         info!("✅ 6/7 SessionDescription [mode={}, key=32 bytes]", session_desc.mode);
 
+        if let Some(v) = session_desc.dave_protocol_version {
+            info!("DAVE: server confirmed protocol version {}", v);
+            dave_protocol_version.store(v, Ordering::Relaxed);
+        }
+
         let mode = Some(session_desc.mode);
         let secret_key = Some(session_desc.secret_key);
 
@@ -160,6 +172,7 @@ impl CoreDriver {
         let ws_alive_clone = ws_alive.clone();
         let ws_close_code_clone = ws_close_code.clone();
         let shutdown_clone = shutdown.clone();
+        let connected_users_clone = connected_users.clone();
         let my_ssrc = ready.ssrc;
 
         tokio::spawn(async move {
@@ -337,10 +350,17 @@ impl CoreDriver {
                                                 Ok(pt) => {
                                                     info!("DAVE: ← OP 21 PrepareTransition (tid={}, proto={})",
                                                         pt.transition_id, pt.protocol_version);
-                                                    // OP 23 ReadyForTransition — MUST be binary DAVE frame
-                                                    // Wire format: [seq_hi][seq_lo][23][tid_lo][tid_hi] (2-byte LE transition_id)
-                                                    send_bin!(23, &(pt.transition_id as u16).to_le_bytes());
-                                                    info!("DAVE: → OP 23 ReadyForTransition (binary, tid={})", pt.transition_id);
+                                                    let rft = serde_json::json!({
+                                                        "op": 23,
+                                                        "d": { "transition_id": pt.transition_id }
+                                                    });
+                                                    if let Ok(txt) = serde_json::to_string(&rft) {
+                                                        if ws_tx.send(tokio_tungstenite::tungstenite::Message::Text(txt.into())).await.is_err() {
+                                                            warn!("OP 23 send failed — WS dropped");
+                                                            break;
+                                                        }
+                                                    }
+                                                    info!("DAVE: → OP 23 ReadyForTransition (JSON text, tid={})", pt.transition_id);
                                                 }
                                                 Err(e) => {
                                                     error!("DAVE: Failed to parse PrepareTransition: {:?}", e);
@@ -397,7 +417,31 @@ impl CoreDriver {
                                     }
 
                                     9 => { info!("Voice WS resumed"); }
-                                    13 => { debug!("Client connected (OP 13)"); }
+                                    11 => {
+                                        if let Some(d) = pkt.d {
+                                            if let Some(ids) = d.get("user_ids").and_then(|v| v.as_array()) {
+                                                let mut cu = connected_users_clone.lock().await;
+                                                for id_val in ids {
+                                                    if let Some(uid_str) = id_val.as_str() {
+                                                        if let Ok(uid) = uid_str.parse::<u64>() {
+                                                            cu.insert(uid);
+                                                            debug!("OP 11: user {} connected", uid);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                    13 => {
+                                        if let Some(d) = pkt.d {
+                                            if let Some(uid_str) = d.get("user_id").and_then(|v| v.as_str()) {
+                                                if let Ok(uid) = uid_str.parse::<u64>() {
+                                                    connected_users_clone.lock().await.remove(&uid);
+                                                    debug!("OP 13: user {} disconnected", uid);
+                                                }
+                                            }
+                                        }
+                                    }
                                     18 => { debug!("Client disconnected (OP 18)"); }
                                     _ => debug!("Text OP {}", pkt.op),
                                 }
@@ -455,15 +499,11 @@ impl CoreDriver {
                                                     info!("DAVE: Committing proposals...");
                                                     match s.commit_and_welcome() {
                                                         Ok((commit, welcome)) => {
-                                                            let mut payload = (transition_id as u16)
-                                                                .to_le_bytes()
-                                                                .to_vec();
-                                                            payload.extend_from_slice(&commit);
-                                                            let has_welcome = welcome.is_some();
+                                                            let mut payload = commit.clone();
                                                             if let Some(w) = welcome {
                                                                 payload.extend_from_slice(&w);
                                                             }
-                                                            info!("DAVE: Generated commit ({} bytes, welcome={}, tid={})", payload.len(), has_welcome, transition_id);
+                                                            info!("DAVE: Generated commit ({} bytes, tid={})", payload.len(), transition_id);
                                                             send_bin!(28, &payload);
                                                             info!("DAVE: → OP 28 CommitWelcome sent (tid={})", transition_id);
 
@@ -655,6 +695,8 @@ impl CoreDriver {
             ws_close_code,
             frames_sent: Arc::new(AtomicU64::new(0)),
             shutdown,
+            connected_users,
+            dave_protocol_version,
         })
     }
 

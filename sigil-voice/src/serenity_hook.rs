@@ -421,6 +421,7 @@ impl SigilVoiceManager {
 
                         match close_code {
                             4006 | 4014 | 4015 => {
+
                                 // ── Reconnect budget ───────────────────────
                                 let attempt = {
                                     let mut rc = reconnect_w.lock().await;
@@ -568,6 +569,15 @@ impl SigilVoiceManager {
                                 // Fresh VoiceStateUpdate + VoiceServerUpdate will
                                 // now flow through state_update → server_update →
                                 // check_and_connect, completing the reconnect.
+                            }
+                            4017 => {
+                                tracing::error!(
+                                    "DAVE: Voice gateway rejected client with close code 4017 — \
+                                     DAVE protocol is required. Ensure max_dave_protocol_version=1 \
+                                     is set in Identify. Use $join to retry [guild={}]",
+                                    guild_id
+                                );
+                                // Do NOT attempt auto-reconnect — 4017 is non-recoverable
                             }
                             _ => {
                                 tracing::error!(

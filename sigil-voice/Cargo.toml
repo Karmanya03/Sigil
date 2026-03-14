@@ -22,7 +22,7 @@ aes-gcm = "0.10"
 
 # Discord Framework Integration
 serenity = { version = "0.12", default-features = false, features = ["client", "gateway", "model", "rustls_backend", "voice"] }
-openmls = "0.8.1"
+openmls = "0.8"
 async-trait = "0.1"
 futures = "0.3"
 
