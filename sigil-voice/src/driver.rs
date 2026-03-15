@@ -884,7 +884,13 @@ impl CoreDriver {
                         let mut s = self.sigil.lock().await;
                         if s.has_own_key() {
                             match s.encrypt_own_frame(&OPUS_SILENCE, sigil_discord::crypto::codec::Codec::Opus) {
-                                Ok(ct) => ct,
+                                Ok(ct) => {
+                                    // Prepend codec byte 0x78 (Opus) to DAVE encrypted silence frame
+                                    let mut payload = Vec::with_capacity(1 + ct.len());
+                                    payload.push(0x78);
+                                    payload.extend_from_slice(&ct);
+                                    payload
+                                }
                                 Err(_) => OPUS_SILENCE.to_vec(),
                             }
                         } else {
@@ -914,7 +920,13 @@ impl CoreDriver {
                     let mut s = self.sigil.lock().await;
                     if s.has_own_key() {
                         match s.encrypt_own_frame(&OPUS_SILENCE, sigil_discord::crypto::codec::Codec::Opus) {
-                            Ok(ct) => ct,
+                            Ok(ct) => {
+                                // Prepend codec byte 0x78 (Opus) to DAVE encrypted silence frame
+                                let mut payload = Vec::with_capacity(1 + ct.len());
+                                payload.push(0x78);
+                                payload.extend_from_slice(&ct);
+                                payload
+                            }
                             Err(_) => OPUS_SILENCE.to_vec(),
                         }
                     } else {
@@ -994,7 +1006,11 @@ impl CoreDriver {
                     match s.encrypt_own_frame(opus, sigil_discord::crypto::codec::Codec::Opus) {
                         Ok(ct) => {
                             dave_failures = 0;
-                            ct
+                            // Prepend codec byte 0x78 (Opus) to DAVE encrypted frame
+                            let mut payload = Vec::with_capacity(1 + ct.len());
+                            payload.push(0x78);
+                            payload.extend_from_slice(&ct);
+                            payload
                         }
                         Err(e) => {
                             dave_failures += 1;
