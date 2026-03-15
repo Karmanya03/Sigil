@@ -336,8 +336,8 @@ impl YtDlpSource {
             "--socket-timeout", "30",
             // YouTube-specific optimizations - use android client for better reliability
             "--extractor-args", "youtube:player_client=android,web",
-            // Use pot-bgutilhttp proxy to bypass YouTube restrictions
-            "--extractor-args", "youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416",
+            // DISABLED: bgutil PO token provider (causing timeouts)
+            // "--extractor-args", "youtubepot-bgutilhttp:base_url=http://127.0.0.1:4416",
             // Extract audio format explicitly
             "-f", "bestaudio[ext=webm]/bestaudio[ext=m4a]/bestaudio/best",
         ]);

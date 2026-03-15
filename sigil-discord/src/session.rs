@@ -99,7 +99,7 @@ impl SigilSession {
         use openmls::prelude::tls_codec::Deserialize;
         
         // ── DEBUG: Log full OP 25 payload for analysis ──
-        tracing::error!(
+        tracing::debug!(
             "🔍 RAW OP 25 PAYLOAD ANALYSIS:\n\
              - Total length: {} bytes\n\
              - Full hex dump: {:02x?}",
