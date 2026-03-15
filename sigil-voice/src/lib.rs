@@ -15,4 +15,4 @@ pub mod call;
 /// 
 /// **To enable DAVE**: Change this to `true` and rebuild with `cargo build --release`
 /// **To disable DAVE**: Change this to `false` and rebuild with `cargo build --release`
-pub const ENABLE_DAVE: bool = false;
+pub const ENABLE_DAVE: bool = true;
