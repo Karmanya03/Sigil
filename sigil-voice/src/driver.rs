@@ -1026,22 +1026,6 @@ impl CoreDriver {
                     opus.to_vec()
                 }
             };
-                            payload.push(0x78);
-                            payload.extend_from_slice(&ct);
-                            payload
-                        }
-                        Err(e) => {
-                            dave_failures += 1;
-                            if dave_failures == 1 || dave_failures % DAVE_FAIL_LOG_INTERVAL == 0 {
-                                warn!("DAVE encrypt failed ({}×): {:?}", dave_failures, e);
-                            }
-                            opus.to_vec()
-                        }
-                    }
-                } else {
-                    opus.to_vec()
-                }
-            };
 
             // ── 4. Transport encrypt (AES-256-GCM rtpsize) ────────────────
             // Debug: Log first few bytes of audio_payload to verify codec byte
