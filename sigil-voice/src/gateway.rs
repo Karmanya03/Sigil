@@ -173,7 +173,7 @@ impl VoiceGatewayClient {
             user_id: user_id.to_string(),
             session_id: session_id.to_string(),
             token: token.to_string(),
-            max_dave_protocol_version: Some(1), // We support DAVE v1.1
+            max_dave_protocol_version: if crate::ENABLE_DAVE { Some(1) } else { None },
         };
         
         // Log the serialized Identify payload to verify max_dave_protocol_version is included
@@ -182,7 +182,11 @@ impl VoiceGatewayClient {
         }
         
         self.send_packet(0, identify).await?;
-        info!("Sent Identify with max_dave_protocol_version=1");
+        if crate::ENABLE_DAVE {
+            info!("Sent Identify with max_dave_protocol_version=1 (DAVE ENABLED)");
+        } else {
+            info!("Sent Identify with max_dave_protocol_version=None (DAVE DISABLED - regular audio)");
+        }
 
         // 3. Wait for Ready (OP 2)
         let ready_msg = self

@@ -1026,6 +1026,15 @@ impl CoreDriver {
             };
 
             // ── 4. Transport encrypt (AES-256-GCM rtpsize) ────────────────
+            // Debug: Log first few bytes of audio_payload to verify codec byte
+            if frames_sent < 5 {
+                debug!("🔍 Audio payload (frame {}): len={}, first_bytes={:02X?}", 
+                    frames_sent, 
+                    audio_payload.len(),
+                    &audio_payload[..audio_payload.len().min(8)]
+                );
+            }
+            
             let rtp_hdr = crate::udp::build_rtp_header(seq, timestamp, self.ssrc);
             let udp_pkt = match crate::udp::transport_encrypt_rtpsize(
                 &secret_key, &rtp_hdr, &audio_payload, nonce_counter,
