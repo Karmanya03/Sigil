@@ -882,7 +882,7 @@ impl CoreDriver {
                     let rtp_hdr = crate::udp::build_rtp_header(seq, timestamp, self.ssrc);
                     let payload = {
                         let mut s = self.sigil.lock().await;
-                        if s.has_own_key() {
+                        if crate::ENABLE_DAVE && s.has_own_key() {
                             match s.encrypt_own_frame(&OPUS_SILENCE, sigil_discord::crypto::codec::Codec::Opus) {
                                 Ok(ct) => {
                                     // Prepend codec byte 0x78 (Opus) to DAVE encrypted silence frame
@@ -918,7 +918,7 @@ impl CoreDriver {
                 let rtp_hdr = crate::udp::build_rtp_header(seq, timestamp, self.ssrc);
                 let payload = {
                     let mut s = self.sigil.lock().await;
-                    if s.has_own_key() {
+                    if crate::ENABLE_DAVE && s.has_own_key() {
                         match s.encrypt_own_frame(&OPUS_SILENCE, sigil_discord::crypto::codec::Codec::Opus) {
                             Ok(ct) => {
                                 // Prepend codec byte 0x78 (Opus) to DAVE encrypted silence frame
@@ -1002,12 +1002,30 @@ impl CoreDriver {
             // ── 3. DAVE encrypt (or raw fallback) ──────────────────────────
             let audio_payload: Vec<u8> = {
                 let mut s = self.sigil.lock().await;
-                if s.has_own_key() {
+                // Check if DAVE is enabled AND we have a key
+                if crate::ENABLE_DAVE && s.has_own_key() {
                     match s.encrypt_own_frame(opus, sigil_discord::crypto::codec::Codec::Opus) {
                         Ok(ct) => {
                             dave_failures = 0;
                             // Prepend codec byte 0x78 (Opus) to DAVE encrypted frame
                             let mut payload = Vec::with_capacity(1 + ct.len());
+                            payload.push(0x78);
+                            payload.extend_from_slice(&ct);
+                            payload
+                        }
+                        Err(e) => {
+                            dave_failures += 1;
+                            if dave_failures == 1 || dave_failures % DAVE_FAIL_LOG_INTERVAL == 0 {
+                                warn!("DAVE encrypt failed ({}×): {:?}", dave_failures, e);
+                            }
+                            opus.to_vec()
+                        }
+                    }
+                } else {
+                    // DAVE disabled or no key - send raw Opus
+                    opus.to_vec()
+                }
+            };
                             payload.push(0x78);
                             payload.extend_from_slice(&ct);
                             payload
