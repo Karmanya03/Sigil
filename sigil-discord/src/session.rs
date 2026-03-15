@@ -107,56 +107,60 @@ impl SigilSession {
             payload
         );
         
+        // ── HYPOTHESIS: Maybe the order is SignaturePublicKey THEN Credential ──
+        // Let's try parsing SignaturePublicKey first
         let mut cursor = std::io::Cursor::new(payload);
-
-        let credential = Credential::tls_deserialize(&mut cursor)
-            .map_err(|e| SigilError::Mls(format!("credential deserialize: {}", e)))?;
-
-        // ── LOG: Credential type from Discord OP 25 ──
-        tracing::info!(
-            "📋 External sender credential from OP 25:\n\
-             - Credential type: {:?}\n\
-             - Identity length: {} bytes\n\
-             - Cursor position after credential: {}",
-            credential.credential_type(),
-            credential.serialized_content().len(),
-            cursor.position()
-        );
-
-        let pos = cursor.position() as usize;
         
-        // ── INVESTIGATION: Try TLS deserialization of SignaturePublicKey ──
-        // Discord sends the signature key as TLS-serialized VLBytes (variable-length bytes)
-        // Format: length_prefix || key_bytes
-        // We need to deserialize it properly to get just the key bytes
+        let signature_key_result = SignaturePublicKey::tls_deserialize(&mut cursor);
         
-        // Try to deserialize as VLBytes first (TLS variable-length byte vector)
-        use openmls::prelude::tls_codec::VLBytes;
-        let signature_key_result = VLBytes::tls_deserialize(&mut cursor);
-        
-        let signature_key = match signature_key_result {
-            Ok(vl_bytes) => {
-                let key_bytes = vl_bytes.as_slice().to_vec();
+        let (signature_key, credential) = match signature_key_result {
+            Ok(sig_key) => {
+                let sig_key_bytes = sig_key.as_slice().to_vec();
+                let pos_after_key = cursor.position() as usize;
+                
                 tracing::info!(
-                    "✅ Successfully TLS-deserialized signature key as VLBytes from OP 25\n\
-                     - Consumed {} bytes from position {} to {}\n\
-                     - Extracted key length: {} bytes",
-                    cursor.position() as usize - pos,
-                    pos,
-                    cursor.position(),
-                    key_bytes.len()
+                    "✅ TLS-deserialized SignaturePublicKey FIRST from OP 25\n\
+                     - Key length: {} bytes\n\
+                     - Cursor position after key: {}",
+                    sig_key_bytes.len(),
+                    pos_after_key
                 );
-                key_bytes
+                
+                // Now try to deserialize the credential
+                let credential_result = Credential::tls_deserialize(&mut cursor);
+                
+                match credential_result {
+                    Ok(cred) => {
+                        tracing::info!(
+                            "✅ Successfully parsed OP 25 as: SignaturePublicKey → Credential\n\
+                             - Credential type: {:?}\n\
+                             - Credential identity length: {} bytes",
+                            cred.credential_type(),
+                            cred.serialized_content().len()
+                        );
+                        (sig_key_bytes, cred)
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            "❌ Failed to parse credential after SignaturePublicKey: {}\n\
+                             - Falling back to original parsing order",
+                            e
+                        );
+                        
+                        // Fall back to original order: Credential then SignaturePublicKey
+                        return self.parse_credential_then_key(payload);
+                    }
+                }
             }
             Err(e) => {
                 tracing::warn!(
-                    "⚠️  TLS deserialization of signature key as VLBytes failed: {}\n\
-                     - Falling back to raw bytes extraction",
+                    "⚠️  TLS deserialization of SignaturePublicKey FIRST failed: {}\n\
+                     - Trying original order: Credential → SignaturePublicKey",
                     e
                 );
                 
-                // Fallback: treat remaining bytes as raw signature key
-                payload[pos..].to_vec()
+                // Fall back to original order
+                return self.parse_credential_then_key(payload);
             }
         };
 
@@ -164,11 +168,9 @@ impl SigilSession {
         tracing::debug!(
             "🔍 External sender public key extracted from OP 25:\n\
              - Total payload size: {} bytes\n\
-             - Credential size: {} bytes\n\
              - Signature key size: {} bytes\n\
              - Key format: {}",
             payload.len(),
-            pos,
             signature_key.len(),
             match signature_key.len() {
                 65 if signature_key.first() == Some(&0x04) => 
@@ -192,6 +194,39 @@ impl SigilSession {
                 &signature_key[signature_key.len().saturating_sub(preview_len)..]
             );
         }
+
+        // Store the parsed data
+        self.pending_external_sender = Some((credential, signature_key));
+        tracing::info!("✅ External sender credential and key stored for deferred group creation");
+        Ok(())
+    }
+    
+    // Helper function for original parsing order
+    fn parse_credential_then_key(&mut self, payload: &[u8]) -> Result<(), SigilError> {
+        use openmls::prelude::tls_codec::Deserialize;
+        let mut cursor = std::io::Cursor::new(payload);
+
+        let credential = Credential::tls_deserialize(&mut cursor)
+            .map_err(|e| SigilError::Mls(format!("credential deserialize: {}", e)))?;
+
+        tracing::info!(
+            "📋 External sender credential from OP 25 (original order):\n\
+             - Credential type: {:?}\n\
+             - Identity length: {} bytes\n\
+             - Cursor position after credential: {}",
+            credential.credential_type(),
+            credential.serialized_content().len(),
+            cursor.position()
+        );
+
+        let pos = cursor.position() as usize;
+        let signature_key = payload[pos..].to_vec();
+
+        tracing::debug!(
+            "🔍 External sender public key (original order):\n\
+             - Signature key size: {} bytes",
+            signature_key.len()
+        );
 
         // ── FIX: Discord sends 64-byte raw P-256 keys (X || Y without prefix) ──
         // BUT: The last 4 bytes might be TLS structure padding/metadata
